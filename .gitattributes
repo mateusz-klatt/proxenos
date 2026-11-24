@@ -1,0 +1,12 @@
+# Proxenos is LF everywhere, on every system. The source types are named so that a stray CR
+# cannot make a file look binary and escape the rule.
+* text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+*.png binary
