@@ -1,0 +1,18 @@
+[package]
+name = "proxenos"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.100"
+description = "MCP delegation between coding-agent CLIs"
+license = "Apache-2.0"
+repository = "https://github.com/mateusz-klatt/proxenos"
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+print_stdout = "deny"
+todo = "deny"
