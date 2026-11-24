@@ -33,3 +33,18 @@ fn anything_else_is_a_usage_error_and_leaves_stdout_empty() {
         assert!(!output.stderr.is_empty(), "args: {args:?}");
     }
 }
+
+#[test]
+fn a_version_that_cannot_be_written_is_a_failure() {
+    // Nobody reads this pipe, so the write to it fails.
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+
+    let status = proxenos()
+        .arg("--version")
+        .stdout(writer)
+        .status()
+        .expect("the binary runs");
+
+    assert_eq!(status.code(), Some(1));
+}
