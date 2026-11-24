@@ -68,16 +68,18 @@ The answer is a JSON object sent as the text of the result, because MCP clients 
 text; whether any of them also shows structured content has not been measured (section 5). It
 carries a schema version from the first release, and it keeps three kinds of statement apart:
 
-- **What Proxenos observed**: the state (finished, failed, cancelled, still running), the kind of
-  a failure, the provider, the settings requested and the settings actually passed, the access
+- **What Proxenos observed**: the state (finished, failed, cancelled, still running), a failure of
+  a kind it can see for itself (not found, launch, timeout, cancellation, a memory limit, abnormal
+  exit), the provider, the settings requested and the settings actually passed, the access
   mechanism Proxenos selected, the duration, the exit status, how much output there was and when
   the last of it arrived, memory and CPU with the way they were measured (D18), and, where it
   could look, the commit before and after and the changed and untracked paths it saw, also after
   a timeout.
 - **What the provider reported**: the `thread_id`, the content, and where it says so the model it
   ran and the tokens it used.
-- **What is not claimed**: that `advisory` was obeyed, that a changed path was changed by this
-  delegation and nobody else, which instruction files the CLI loaded, or what a review concluded.
+- **What is not claimed**: that `advisory` was obeyed, which instruction files the CLI loaded, or
+  what a review concluded. Snapshots of git cannot establish who changed a path, and do not show
+  every edit made during the run.
 
 A failure has a kind: not found, launch, authentication, a trust prompt, a refusal, quota, timeout,
 cancellation, a memory limit, abnormal exit, or unknown. Authentication, a trust prompt, a refusal
@@ -279,10 +281,11 @@ except in the platform modules of D6.
 Role texts are written for Proxenos, model-neutral, one per role. A call may also name no role and
 carry only `instructions`.
 
-Which roles ship is not decided. Two families, in three answers, agreed in vote 2 on code review,
-debugging, verification of claims, architecture, security and plan review, on a redesigned
-cross-discipline role, and on shipping the code reviewer and the debugger first. They did not
-agree on a scope analyst, a challenger or a separate test role.
+Which roles ship is not decided. Three families, in four answers, agreed in vote 2 on code review,
+debugging, verification of claims, architecture, security and plan review, and on a redesigned
+cross-discipline role. The strongest model of each family would ship the code reviewer, the
+debugger and the claim verifier first. They did not agree on a scope analyst, a challenger or a
+separate test role.
 
 A role's text says what `implementation` allows it, and tells a role whose worth is its
 independence, such as one that verifies a claim, to stay advisory. That is an instruction: under
@@ -316,8 +319,10 @@ opaque, that puts the whole answer into the context, and that dies with the sess
   cancelled, or unknown. Reading a result does not consume it.
 - `cancel` asks for one delegation to be stopped. Cancelling an `await` only stops the waiting.
 - A handle is not a `thread_id`. It belongs to one server process and means nothing to another.
-- A delegation is stopped, as D6 describes and within D6's limits, on its own deadline, on
-  `cancel`, on a memory limit (D18), or when the client closes the connection.
+- On a delegation's deadline, on `cancel`, or when the client closes the connection, the
+  supervisor starts the stop that D6 describes, within D6's limits. On Linux and macOS a sampled
+  crossing of a memory limit starts it too. On Windows the system refuses an allocation above the
+  job's limit instead, and the CLI may carry on (D18).
 - Finished results are kept in memory, bounded in number, size and time.
 - At most three delegations run at once in a server.
 
@@ -332,15 +337,15 @@ Proxenos uses plain tool calls, which all of them do.
 
 Memory grows in the delegated CLIs, not in Proxenos, so Proxenos accounts for the memory and CPU
 time of each delegation and returns them with the result, saying how they were measured: totals of
-the job on Windows, samples of the session's processes on Linux and macOS.
+the job on Windows, samples of the supervised process group on Linux and macOS.
 
 - **Windows**: the job object of D6 reports the peak of committed memory and the CPU time of the
   job. With a limit set, the system refuses an allocation that would exceed it. The CLI may fail
   on that refusal or carry on.
-- **Linux and macOS**: the processes of the delegation's session are sampled. Samples can miss a
-  peak and a short-lived child, and a process that leaves the session is not seen. With a limit
-  set, a sample above it starts the stop that D6 describes. That is a threshold checked between
-  samples, not a ceiling.
+- **Linux and macOS**: the processes of the supervised process group are sampled. Samples can
+  miss a peak, a short-lived child, and a descendant that has left the group. With a limit set, a
+  sample above it starts the stop that D6 describes. That is a threshold checked between samples,
+  not a ceiling.
 
 No memory limit applies unless the user sets one.
 
