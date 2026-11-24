@@ -57,10 +57,10 @@ Each voter wrote its own roster before reading the proposal.
 | Kimi | Not yet asked: no quota until late that evening. | |
 | xAI | Absent: no quota, directly or through Cursor. | |
 
-**Agreed by all three.** Code review, debugging, verification of claims, architecture, security
-and plan review. A cross-discipline role is kept but redesigned: at most three candidates and
-possibly none, each tied to the repository, each saying where the analogy breaks and naming one
-cheap experiment. No role per thinking technique. Code Reviewer and Debugger ship first.
+**Agreed by all three answers, from two families.** Code review, debugging, verification of
+claims, architecture, security and plan review. A cross-discipline role is kept but redesigned: a
+few candidates and possibly none, each tied to the repository, each saying where the analogy
+breaks and naming one cheap experiment. Code Reviewer and Debugger ship first.
 
 **Differed.** Whether Scope Analyst survives without anyone to answer its questions; whether
 Challenger is a role or a duty of Plan Reviewer; whether testing is a role; the names.
@@ -92,9 +92,11 @@ and CPU are always accounted; a memory limit is opt-in; a floor of free host mem
 happens above the limit of three (an immediate refusal, or a short queue).
 
 **What each reported about its own CLI as a client.** These come from reading source or
-documentation and were not run. Codex: tool calls of one turn overlap only when a tool declares
-itself read-only or the registration opts in, and a call is limited to between 60 and 300
-seconds. Antigravity: tool calls of one turn run in parallel, with a limit of 180 seconds.
+documentation and were not run. Codex: tool calls of one turn may overlap when a tool declares
+itself read-only or the server's registration opts in, and otherwise run one at a time. Its limit
+for one call is configurable; its guide gave 60 seconds as the default and the source of release
+0.172.0 used 300. Antigravity: tool calls of one turn run in parallel, with a default limit of
+180 seconds that can be changed.
 
 **Users.** All seven sessions that answered the question in vote 5 asked for this.
 
@@ -116,12 +118,13 @@ the first milestone should contain. Asked because vote 1 had run on weaker model
 
 - D13 had the order wrong. Supervision and the result contract are proven on three operating
   systems before the remaining providers are ported.
-- D2's result is too thin. It becomes a versioned envelope that separates what Proxenos observed
-  from what the provider reported, with typed failures.
+- D2's result is too thin. It separates what Proxenos observed from what the provider reported,
+  and carries typed failures.
 - D5 needs a declaration of what each provider supports.
 - D16: an Iris message that a provider has finished is a cue to collect, not proof. `await` is
-  the authority, and the message does not repeat the answer.
-- A reply inherits the settings of its start.
+  the authority, and the reporting contract asks for a status line without the answer.
+- A reply inherits the settings of its start. When the session is not known, Proxenos fails and
+  does not guess.
 - `usage` takes a filter and returns a short summary.
 - A throwaway worktree for reviews comes later and is not called read-only.
 - Not Proxenos's job: switching provider automatically, prompt templates, fan-out, refusing a
@@ -131,10 +134,16 @@ the first milestone should contain. Asked because vote 1 had run on weaker model
 
 | Point | GPT (Astra) | Gemini (Neon) | Taken for now |
 |---|---|---|---|
-| MCP layer | Keep `rmcp`. | Replace it with an owned module of about 300 lines, or hold the first milestone until real clients have been tested. | `rmcp`, by the owner: "rmcp narazie" (for now). Both asked that it stay behind one module with tests on raw frames. |
-| Where a session's settings are remembered | In the server's memory, for 24 hours. | In a file per session, for 7 days. | A file, chosen by Claude (Fable 5.2, max): a reply often comes after the client has restarted. On a miss, Proxenos asks for the settings and guesses nothing, as GPT required. |
+| MCP layer | Keep `rmcp`, with both lifecycles covered through the compiled binary. | Replace it with an owned module of about 300 lines, or hold the first milestone until real clients have been tested. If it stays: behind one internal boundary, with tests on raw frames. | `rmcp`, by the owner: "rmcp narazie" (for now). |
+| Where a session's settings are remembered | In the server's memory, until 24 hours idle or the server exits. | In a file per session, for 7 days. | A file, chosen by Claude (Fable 5.2, max): a reply often comes after the client has restarted. |
 | Providers in the first milestone | Codex only. | Codex and Antigravity. | Both, chosen by Claude (Fable 5.2, max): GPT also asked for two unlike reply contracts before the provider interface is fixed. |
 | A long answer | A bounded preview, the rest read in pages. | A bounded excerpt, the rest in a file. | A file, chosen by Claude (Fable 5.2, max). |
+| How the result may change | A schema version from the first release. | Additive changes only, without a version field. | A version field, chosen by Claude (Fable 5.2, max). |
+| A warning before starting on a provider at its quota | First version, from a fresh reading. | Later. | Later, chosen by Claude (Fable 5.2, max). |
+| The strongest model as each provider's default | Not Proxenos's business to choose everyone's default. | First version. | The strongest, chosen by Claude (Fable 5.2, max), as one user also asked. |
+| Named file inputs | Later. | Not Proxenos's job. | Later, chosen by Claude (Fable 5.2, max). |
+
+Every "chosen by Claude" above is provisional and goes to the next vote.
 
 **Owner.** "idziemy z tym co mamy teraz, pozniej robimy konsensus" (we go with what we have now
 and reach consensus later).
@@ -154,16 +163,19 @@ few times a week and sixty times a night.
 | Typed failures, quota exhaustion with its reset time first | 6 | First version (D2). |
 | Replies inherit the start's model, effort and directory | 6 | First version (D19). |
 | A result that says what was passed, what ran, and what git shows changed | 5 | First version (D2). |
-| A quota check before dispatch; a compact `usage` | 6 | Compact `usage` first (D9). A check before dispatch later. |
+| A quota check before dispatch; a compact `usage` | 6 | Compact `usage` first (D9). A warning before dispatch later, provisionally. |
 | A read-only that a reviewer can build and test in | 4 | Later. The first version states what `read-only` enforces on each provider. |
 | Less text in the caller's context | 3 | First version (D2): an excerpt, and the rest in a file. |
 | Iris claims blocking callers and sibling delegates | 3 | Iris's business. |
-| File inputs, prompt templates, standing constraints per repository, fan-out | 3 | Not Proxenos's job. |
-| The strongest model as the default | 1 | First version (D8). |
+| Prompt templates, standing constraints per repository, fan-out | 3 | Not Proxenos's job. |
+| One delegate's result handed to the next as a file | 1 | Later, provisionally. |
+| The strongest model as the default | 1 | First version (D8), provisionally. |
 | A reply that can change the mode | 1 | First version (D19): an explicit override. |
 
 ## Waiting for another vote
 
-- **Kimi**, when its quota window reopens: votes 2 and 4.
-- **xAI**, when its quota returns: every vote above. In particular the MCP layer, the ninth role
-  and where session settings are kept.
+- **Kimi**, when its quota window reopens: votes 1 to 4. It has answered none of them.
+- **xAI**, when its quota returns: votes 1 to 4. In particular the MCP layer, the ninth role and
+  every provisional choice of vote 4.
+
+Vote 5 is a survey of users and is not reopened.

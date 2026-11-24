@@ -64,24 +64,31 @@ snake_case:
 | `wait` | `true` by default. With `false` the call returns a handle at once (D17). |
 | `coordination` | Optional progress reporting through Iris (D16). |
 
-The answer is a JSON object sent as the text of the result, because MCP clients show a model only
-the text. It carries a schema version from the first release, and it keeps three kinds of
-statement apart:
+The answer is a JSON object sent as the text of the result, because MCP clients show a model the
+text; whether any of them also shows structured content has not been measured (section 5). It
+carries a schema version from the first release, and it keeps three kinds of statement apart:
 
-- **What Proxenos observed**: the state (finished, failed, cancelled, still running), a typed
-  reason for a failure, the provider, the settings requested and the settings actually passed,
-  how `read-only` is enforced on this provider, the duration, the exit status, how much output
-  there was and when the last of it arrived, and, in a git repository, the commit before and
-  after and the paths that changed while the delegation ran.
+- **What Proxenos observed**: the state (finished, failed, cancelled, still running), the kind of
+  a failure, the provider, the settings requested and the settings actually passed, the access
+  mechanism Proxenos selected, the duration, the exit status, how much output there was and when
+  the last of it arrived, memory and CPU with the way they were measured (D18), and, where it
+  could look, the commit before and after and the changed and untracked paths it saw, also after
+  a timeout.
 - **What the provider reported**: the `thread_id`, the content, and where it says so the model it
   ran and the tokens it used.
 - **What is not claimed**: that `advisory` was obeyed, that a changed path was changed by this
   delegation and nobody else, which instruction files the CLI loaded, or what a review concluded.
 
 A failure has a kind: not found, launch, authentication, a trust prompt, a refusal, quota, timeout,
-cancellation, abnormal exit, or unknown. Quota carries the reset time when the provider gives one.
-A CLI that exits with success without having run a turn is a failure. A long answer is returned as
-an excerpt with the path of a file that holds all of it.
+cancellation, a memory limit, abnormal exit, or unknown. Authentication, a trust prompt, a refusal
+and quota are read from what the provider printed, so they are a classification and not an
+observation. Quota carries the reset time when the provider gives one. A CLI that exits with
+success without having run a turn is a failure. A long answer is returned as an excerpt with the
+path of a file that holds what was captured, up to the capture limit.
+
+Two points here are provisional choices made by Claude (Fable 5.2, max) in vote 4, where the
+reviewers differed: the version field, where one preferred additive change without one, and the
+file for a long answer, where one preferred reading the rest in pages.
 
 The same object as MCP structured content is left out until it has been measured on the seven
 clients: sent twice, a long answer could cost its reader twice.
@@ -94,8 +101,9 @@ only that the turn had failed.
 ### D3. Tokio, and a supervisor that owns each child
 
 Every delegation has a deadline and a cancellation token. A separate task owns the child process,
-its pipes and its temporary files, so that a request handler that goes away cannot leave a child
-running.
+its pipes and its temporary files. A background delegation (D17) therefore outlives the request
+that started it, and is still stopped and reaped on its deadline, on `cancel`, or when the client
+closes the connection.
 
 ### D4. MCP through `rmcp`, pinned and kept behind one module
 
@@ -148,7 +156,8 @@ validation are both derived from that declaration. A provider says a delegation 
 evidence that a turn completed, not on a plausible answer or a zero exit status.
 
 The interface is fixed only after two providers with unlike reply rules, Codex and Antigravity,
-have been built against it.
+have been built against it. Building both in the first milestone is a provisional choice made by
+Claude (Fable 5.2, max) in vote 4; one reviewer would start with Codex alone.
 
 Where providers differ, each one's tests assert its own behaviour through the compiled binary.
 Antigravity's reply must name a model; Cursor's must not. A shared test could assert neither.
@@ -193,7 +202,9 @@ roster therefore needs no release. A user adds a role by adding a file.
 - What `refresh` generated and what the user wrote are kept apart, and `refresh` replaces only
   the first. An overlay carries a schema version and the time it was generated, so that an old
   one does not hide a newer catalogue in the binary without `doctor` saying so.
-- The default model of each provider is the strongest one it offers.
+- The default model of each provider is the strongest one it offers. This is a provisional choice
+  made by Claude (Fable 5.2, max) in vote 4: one reviewer held that choosing everyone's default
+  is not Proxenos's business.
 - A catalogue entry never widens what a provider is declared to enforce (D5).
 
 ### D9. Usage is read, never spent
@@ -251,7 +262,8 @@ The order of work:
 6. The four hosts, one at a time.
 
 The first version of this section ported all seven providers before the contract was proven. Both
-reviewers of vote 4 called that the wrong order: every provider would have been written twice.
+reviewers of vote 4 wanted the contract tested before the remaining providers are ported; one
+added that otherwise every provider would be written twice.
 
 While both projects run on one host, Proxenos reads and sets claude-delegator's delegation-depth
 variables as well as its own, so that a chain passing through both still stops.
@@ -267,13 +279,14 @@ except in the platform modules of D6.
 Role texts are written for Proxenos, model-neutral, one per role. A call may also name no role and
 carry only `instructions`.
 
-Which roles ship is not decided. Three families agreed in vote 2 on code review, debugging,
-verification of claims, architecture, security and plan review, on a redesigned cross-discipline
-role, and on shipping the code reviewer and the debugger first. They did not agree on a scope
-analyst, a challenger or a separate test role.
+Which roles ship is not decided. Two families, in three answers, agreed in vote 2 on code review,
+debugging, verification of claims, architecture, security and plan review, on a redesigned
+cross-discipline role, and on shipping the code reviewer and the debugger first. They did not
+agree on a scope analyst, a challenger or a separate test role.
 
-A role states what `implementation` allows it. A role whose worth is its independence, such as one
-that verifies a claim, stays advisory.
+A role's text says what `implementation` allows it, and tells a role whose worth is its
+independence, such as one that verifies a claim, to stay advisory. That is an instruction: under
+full access nothing prevents the write.
 
 ### D16. Progress is reported through Iris, when the caller asks
 
@@ -285,8 +298,9 @@ needs no knowledge of Proxenos.
 
 A provider's message that it has finished is a cue to collect the result, not proof of it: a
 provider can send it before it exits, or die without sending it. The result comes from Proxenos
-(D17). The message carries a line of status and not the answer, so the answer does not reach the
-caller twice.
+(D17). The reporting contract asks for a line of status without the answer, so that the answer
+need not reach the caller twice. A provider may still omit the message, or repeat the answer in
+it.
 
 ### D17. A delegation can run in the background
 
@@ -297,48 +311,54 @@ opaque, that puts the whole answer into the context, and that dies with the sess
 
 - A start or a reply with `wait: false` returns a handle at once. `wait` is true by default, so
   one consultation is still one call.
-- `await` takes handles and a condition, any or all, and waits up to a limit that is shorter than
-  the shortest tool-call limit among the clients. It returns the state of every handle: running,
-  finished, failed, cancelled, or unknown. Reading a result does not consume it.
-- `cancel` stops one delegation. Cancelling an `await` only stops the waiting.
+- `await` takes handles and a condition, any or all, and waits up to a limit set by the server. A
+  client may give up sooner. It returns the state of every handle: running, finished, failed,
+  cancelled, or unknown. Reading a result does not consume it.
+- `cancel` asks for one delegation to be stopped. Cancelling an `await` only stops the waiting.
 - A handle is not a `thread_id`. It belongs to one server process and means nothing to another.
-- A delegation ends on its own deadline, on `cancel`, or when the client closes the connection.
+- A delegation is stopped, as D6 describes and within D6's limits, on its own deadline, on
+  `cancel`, on a memory limit (D18), or when the client closes the connection.
 - Finished results are kept in memory, bounded in number, size and time.
 - At most three delegations run at once in a server.
 
-What this cannot do: a result does not survive the server process, and nothing wakes a client that
-neither waits nor has Iris (D16).
+What this cannot do: when the server exits, its handles and the results it held are gone. Nothing
+reliably wakes a client that does not call `await`: an Iris message that a provider has finished
+(D16) is voluntary.
 
 MCP defines a task mechanism of its own for long calls. Not every client implements it, so
 Proxenos uses plain tool calls, which all of them do.
 
 ### D18. What a delegation used is accounted, and may be limited
 
-Memory grows in the delegated CLIs, not in Proxenos, so Proxenos measures the process tree of each
-delegation and returns its peak memory and CPU time with the result, saying how they were measured.
+Memory grows in the delegated CLIs, not in Proxenos, so Proxenos accounts for the memory and CPU
+time of each delegation and returns them with the result, saying how they were measured: totals of
+the job on Windows, samples of the session's processes on Linux and macOS.
 
-- **Windows**: the job object of D6 reports both, and can hold the job to a memory limit that the
-  system enforces.
-- **Linux and macOS**: the processes of the delegation's session are sampled. A limit there is a
-  threshold checked between samples. It is not a ceiling: a burst between two samples passes, and
-  a process that leaves the session is not seen.
+- **Windows**: the job object of D6 reports the peak of committed memory and the CPU time of the
+  job. With a limit set, the system refuses an allocation that would exceed it. The CLI may fail
+  on that refusal or carry on.
+- **Linux and macOS**: the processes of the delegation's session are sampled. Samples can miss a
+  peak and a short-lived child, and a process that leaves the session is not seen. With a limit
+  set, a sample above it starts the stop that D6 describes. That is a threshold checked between
+  samples, not a ceiling.
 
-No memory limit applies unless the user sets one. A delegation over its limit is stopped as D6
-describes and fails with that reason.
+No memory limit applies unless the user sets one.
 
 ### D19. A session remembers how it was started
 
-A reply continues a session with the model, effort, directory, access, role and mode of its start,
-unless the reply says otherwise. With claude-delegator each provider needed different settings
-repeated, and a forgotten one silently changed the model.
+A reply is started with those settings of its start that the provider's reply command accepts
+(D5): model, effort, directory, access, role and mode, unless the reply says otherwise. Proxenos
+reapplies what it passed at the start. Which model actually ran is what the provider reports.
+With claude-delegator each provider needed different settings repeated, and a forgotten one
+silently changed the model.
 
 The settings of a session are kept in a file in the user's state directory, without secrets, for a
-limited time. When a session is not found there, Proxenos asks for the settings and guesses
-nothing: a miss never widens access or changes the model. A reply may change the mode, since a
-session that advised may be asked to implement.
+limited time. When a session is not found there, Proxenos asks for the settings and supplies no
+defaults of its own. It cannot check that the settings a caller then gives match the forgotten
+start. A reply may change the mode, since a session that advised may be asked to implement.
 
-Provisional on one point: one reviewer in vote 4 would keep the settings only in the server's
-memory.
+Provisional on one point, chosen by Claude (Fable 5.2, max) in vote 4: one reviewer would keep the
+settings only in the server's memory.
 
 ## 3. Later, and not at all
 
@@ -368,6 +388,7 @@ scope of Iris claims.
 - How Grok and Cursor treat a Claude Code plugin they load by themselves, and whether that offers
   them their own provider.
 - How the seven clients run several tool calls from one message. Two of them described their own
-  CLI in vote 3, from source and documentation: one runs them one by one unless a tool declares
-  itself read-only, the other in parallel. None has been measured.
+  CLI in vote 3, from source and documentation: one lets them overlap only when a tool declares
+  itself read-only or the registration opts in, the other runs them in parallel. None has been
+  measured.
 - Whether a client shows a model the structured content of a result as well as its text.

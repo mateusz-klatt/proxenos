@@ -12,8 +12,9 @@ its own design did not get that treatment consistently:
   not.
 - Two consultations ran on the bridges' default models, which were not the strongest ones those
   providers offered.
-- Three of the seven families had no quota left that day, so waiting for all of them would have
-  stopped the work.
+- Seven CLIs are supported, and they stand for fewer model families than that. On that day three
+  of the CLIs had no quota left, which took one family out entirely, and a fourth ran out in the
+  middle of its answer. Waiting for all of them would have stopped the work.
 
 ## Direction
 
@@ -42,8 +43,7 @@ everything, with who the author was, to keep the context.
    own answer before it reads the proposal.
 2. A family without quota does not hold a decision up. The decision is taken on the positions
    that exist, and the record names the families that were absent.
-3. When an absent family returns, the recorded decisions are put to it. A decision it contests
-   is voted on again.
+3. When an absent family returns, the design votes it missed are reopened, and it votes.
 4. `docs/votes.md` records each question: who proposed, who answered and on which model and
    effort, where they agreed, where they differed, and what the owner decided. A vote informs.
    The owner decides.
