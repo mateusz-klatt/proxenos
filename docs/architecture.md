@@ -61,7 +61,7 @@ snake_case:
 | `access` | `full` or `read-only`. What `read-only` enforces differs by provider and is stated in each tool's schema. |
 | `cwd`, `model`, `effort`, `timeout_ms` | As named. Which of them a provider accepts differs. |
 | `thread_id` | On a reply: the session to continue. The reply inherits the settings of its start (D19). |
-| `wait` | `true` by default. With `false` the call returns a handle at once (D17). |
+| `wait` | `true` by default. With `false` a call that is admitted returns a handle at once (D17). |
 | `coordination` | Optional progress reporting through Iris (D16). |
 
 The answer is a JSON object sent as the text of the result, because MCP clients show a model the
@@ -97,7 +97,8 @@ more. Voters of vote 6 raised both limits.
 The version field was a provisional choice of vote 4, and vote 6 backed it: eight of nine
 positions are for it, and one is for additive change without a version. The file for a long answer
 is still provisional. Claude (Fable 5.2, max) chose it in vote 4; over votes 4 and 6 six of nine
-positions are for it, two would have the rest read in pages, and one would keep the file only if a
+positions are for it, one of them only if D2 defines a retention that is secure and stable, which
+it does not do yet. Two would have the rest read in pages, and one would keep the file only if a
 tool of Proxenos can read it back.
 
 The same object as MCP structured content is left out until it has been measured on the seven
@@ -213,13 +214,18 @@ roster therefore needs no release. A user adds a role by adding a file.
 - What `refresh` generated and what the user wrote are kept apart, and `refresh` replaces only
   the first. An overlay carries a schema version and the time it was generated, so that an old
   one does not hide a newer catalogue in the binary without `doctor` saying so.
-- Proxenos chooses no model. It passes one to a provider only when the call names it or the
-  user's own overlay sets one for that provider. Otherwise it passes none and the provider's CLI
-  runs its own default. The result shows that none was passed and, where the provider reports
-  it, which model ran (D2). This took the place of "the strongest one it offers", a provisional
-  choice of vote 4, after vote 6: seven of nine positions held that choosing a default is not
-  Proxenos's business.
+- Proxenos chooses no model. On a start it passes the model that the call names, or else the one
+  that the user's own overlay sets for that provider, and otherwise none. A CLI that is given no
+  model runs its own default or refuses to start, and Proxenos chooses for it in neither case. A
+  reply follows D19. The result shows what was passed and, where the provider reports it, which
+  model ran (D2).
 - A catalogue entry never widens what a provider is declared to enforce (D5).
+
+The point on the model is written to the proposal of
+[ADR 002](adr/002-proxenos-chooses-no-model.md), which the owner has not decided. Until vote 6 it
+read "the default model of each provider is the strongest one it offers", a provisional choice of
+vote 4. In vote 6 seven of nine positions opposed that default. Five of them said to pass no model
+unless one is named, and three of those let the user's configuration name it.
 
 ### D9. Usage is read, never spent
 
@@ -326,12 +332,13 @@ three waits in a row, or a subagent for each that does nothing but wait. Claude 
 call that runs past two minutes to the background by itself, but as a task that its users found
 opaque, that puts the whole answer into the context, and that dies with the session.
 
-- A start or a reply with `wait: false` returns a handle at once. `wait` is true by default, so
-  that one consultation can still be one call.
+- A start or a reply with `wait: false` returns a handle at once, if it is admitted. One that
+  waits gives no handle while it runs. `wait` is true by default, so that one consultation can
+  still be one call.
 - `await` takes handles and a condition, any or all, and waits up to a limit set by the server:
-  20 seconds. A client may give up sooner. A wait that ends leaves every delegation running, so
-  waiting longer is another call. It returns the state of every handle: running, finished,
-  failed, cancelled, or unknown. Reading a result does not consume it.
+  20 seconds. A client may give up sooner. When a wait runs out, no unfinished delegation is
+  cancelled, and waiting longer is another call. It returns the state of every handle: running,
+  finished, failed, cancelled, or unknown. Reading a result does not consume it.
 - `cancel` asks for one delegation to be stopped. Cancelling an `await` only stops the waiting.
 - A handle is not a `thread_id`. It belongs to one server process and means nothing to another.
 - On a delegation's deadline, on `cancel`, or when the client closes the connection, the
@@ -345,21 +352,22 @@ opaque, that puts the whole answer into the context, and that dies with the sess
 
 The refusal follows the count over votes 3 and 6: eight of nine positions chose it, and one a
 short queue. The 20 seconds are provisional, taken by Claude (Fable 5.2, max) on the count of vote
-6. Four of nine positions chose 20 seconds, three a figure from 45 to 60, and two up to 120. Seven
-of the nine keep one wait at or under 60 seconds by default, which is the shortest default limit
-for one call that a client's documentation gives. The limit starts at the low end because raising
-it later breaks no caller.
+6. Four positions chose 20 seconds. Gemini (Hydrogen) proposed 45 by default and at most 60,
+Gemini (Argon) 55 by default and at most 120, DeepSeek 60, and Gemini (Carbon) and Zhipu up to
+120. The limit starts at the low end because a longer wait can run past the limit that a client
+is configured with for one call. The shortest default that a client's documentation gives is 60
+seconds.
 
 What this cannot do: when the server exits, its handles and the results it held are gone. Nothing
 reliably wakes a client that does not call `await`: an Iris message that a provider has finished
 (D16) is voluntary.
 
-A call that waits gives the client no handle while it runs. A client that limits the time of one
-call ends it at that limit, and the caller then has nothing to give to `await` or `cancel`. Kimi
-Code documents a default of 60 seconds, as Kimi pointed out in vote 6. What becomes of the
-delegation depends on whether the client also sends a cancellation, which has not been measured
-for any of the seven (section 5). Not decided: what to do about it. Kimi's proposals were a handle
-before a bounded wait, or a larger limit for the server, set in the client's registration (D10).
+A client that limits the time of one call ends a call that waits at that limit, and the caller,
+who was given no handle, then has nothing to give to `await` or `cancel`. Kimi Code documents a
+default of 60 seconds, as Kimi pointed out in vote 6. What becomes of the delegation depends on
+whether the client also sends a cancellation, which has not been measured for any of the seven
+(section 5). Not decided: what to do about it. Kimi's proposals were a handle before a bounded
+wait, or a larger limit for the server, set in the client's registration (D10).
 
 MCP defines a task mechanism of its own for long calls. Not every client implements it, so
 Proxenos uses plain tool calls, which all of them do.
@@ -388,11 +396,10 @@ reapplies what it passed at the start. Which model actually ran is what the prov
 With claude-delegator each provider needed different settings repeated, and a forgotten one
 silently changed the model.
 
-Where the start passed no model (D8), there is none to reapply. Not decided: what a reply then
-does on a provider whose reply must name a model, because its resumed session keeps none (D5). It
-could pass none and run whatever that CLI's default has become, repeat the model the provider
-reported for the start, or be refused until the caller names one. The revision of D8 in vote 6
-opened this question, and no voter was asked it.
+Where the start passed no model (D8), there is none to reapply. Not decided: what a reply does
+when it must name a model (D5) and its start passed none. It could repeat the model that the
+provider reported for the start, where the provider reported one, or ask the caller for one. The
+proposal of ADR 002 opened this question, and no voter was asked it.
 
 The settings of a session are kept in a file in the user's state directory, without secrets, for a
 limited time. When a session is not found there, Proxenos asks for the settings and supplies no
@@ -407,9 +414,9 @@ kept is not fixed: three positions named seven days, and one 24 hours without us
 
 Later, each when it can be shown to work: a warning before a delegation starts on a provider that
 is at its quota; a throwaway worktree for reviews, which is not read-only and will not be called
-that; file inputs; checks for a stale daemon of a provider. File inputs stand here provisionally:
-over votes 4 and 6, five of nine positions would leave them out altogether and four would add them
-later.
+that; file inputs; checks for a stale daemon of a provider. File inputs stay here provisionally.
+Over votes 4 and 6, four families are for adding them later and three for leaving them out
+altogether; counted by answers it is four to five.
 
 Not Proxenos's job: choosing another provider when one fails; prompt templates and fan-out, which
 a caller composes from starts and `await`; refusing a review by the family that wrote the code; the
@@ -425,9 +432,11 @@ scope of Iris claims.
   another CLI by itself.
 - Some CLIs load instruction files from the working directory with no way to turn that off.
   Delegating into a repository you do not trust exposes the provider to what is written there.
-- When neither the call nor the user's overlay names a model, the provider's own default answers
-  (D8). Proxenos does not choose it, and it can change with a release of the CLI or with the
-  user's configuration of it. The result names a model only where the provider reports one.
+- When neither the call nor the user's overlay names a model, Proxenos passes none (D8). The
+  provider's CLI then runs its own default or refuses to start. Proxenos does not choose that
+  default, and it can change with a release of the CLI or with the user's configuration of it. A
+  model that is named is a request: the result names the one that ran only where the provider
+  reports it.
 - A call with `wait: true` lasts as long as its delegation. A client that limits the time of one
   call may end it first and leave the caller without a handle (D17).
 
