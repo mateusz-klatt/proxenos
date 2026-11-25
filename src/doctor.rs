@@ -1,0 +1,581 @@
+//! Diagnostic checks for `proxenos doctor` (D10).
+
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use serde::Serialize;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdout, Command};
+use tokio_util::sync::CancellationToken;
+
+use crate::discovery::{self, CliStatus};
+use crate::integrate::{ENABLED_PLUGIN_KEY, MARKETPLACE_NAME, MCP_SERVER_NAME, PLUGIN_NAME};
+use crate::mcp::Activity;
+use crate::providers::{self, Provider};
+use crate::state;
+
+const REPORT_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl Status {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Check {
+    pub name: String,
+    pub status: Status,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+impl Check {
+    fn new(
+        name: impl Into<String>,
+        status: Status,
+        message: impl Into<String>,
+        details: Option<Value>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status,
+            message: message.into(),
+            details,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub schema_version: u32,
+    pub ok: bool,
+    pub checks: Vec<Check>,
+}
+
+struct RegisteredCommand {
+    settings_path: PathBuf,
+    marketplace_dir: PathBuf,
+    command: PathBuf,
+    args: Vec<String>,
+}
+
+enum HandshakeError {
+    Io(io::Error),
+    Protocol(String),
+    TimedOut(Duration),
+}
+
+impl From<io::Error> for HandshakeError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "MCP handshake I/O error: {error}"),
+            Self::Protocol(message) => f.write_str(message),
+            Self::TimedOut(limit) => write!(
+                f,
+                "MCP handshake exceeded its {} ms deadline.",
+                limit.as_millis()
+            ),
+        }
+    }
+}
+
+struct HandshakeInfo {
+    server_name: Option<String>,
+    server_version: Option<String>,
+    tools: Vec<String>,
+}
+
+fn handshake_timeout() -> Duration {
+    #[cfg(feature = "test-tools")]
+    if let Some(ms) = std::env::var("PROXENOS_TEST_HANDSHAKE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+    {
+        return Duration::from_millis(ms);
+    }
+    DEFAULT_HANDSHAKE_TIMEOUT
+}
+
+fn read_json(path: &Path) -> Result<Value, String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("Could not read {}: {err}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| format!("Could not parse {}: {err}", path.display()))
+}
+
+fn read_registration(settings_path: &Path) -> Result<RegisteredCommand, String> {
+    let settings = read_json(settings_path)?;
+    let marketplace_str = settings["extraKnownMarketplaces"][MARKETPLACE_NAME]["source"]
+        .as_object()
+        .filter(|source| source.get("source").and_then(Value::as_str) == Some("directory"))
+        .and_then(|source| source.get("path").and_then(Value::as_str))
+        .filter(|path| !path.is_empty());
+    let enabled = settings["enabledPlugins"][ENABLED_PLUGIN_KEY].as_bool() == Some(true);
+    let (Some(marketplace_str), true) = (marketplace_str, enabled) else {
+        return Err(format!(
+            "Proxenos is not registered and enabled in {}.",
+            settings_path.display()
+        ));
+    };
+
+    let marketplace_dir = PathBuf::from(marketplace_str);
+    let marketplace = read_json(
+        &marketplace_dir
+            .join(".claude-plugin")
+            .join("marketplace.json"),
+    )?;
+    let plugin_source = marketplace["plugins"]
+        .as_array()
+        .and_then(|plugins| plugins.iter().find(|entry| entry["name"] == PLUGIN_NAME))
+        .filter(|_| marketplace["name"] == MARKETPLACE_NAME)
+        .and_then(|entry| entry["source"].as_str())
+        .filter(|source| !source.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Invalid marketplace manifest under {}.",
+                marketplace_dir.display()
+            )
+        })?;
+
+    let plugin_dir = marketplace_dir.join(plugin_source);
+    let plugin = read_json(&plugin_dir.join(".claude-plugin").join("plugin.json"))?;
+    let mcp = read_json(&plugin_dir.join(".mcp.json"))?;
+    let server = &mcp["mcpServers"][MCP_SERVER_NAME];
+    let command = server["command"].as_str().filter(|path| !path.is_empty());
+    let args = server["args"].as_array().and_then(|items| {
+        items
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+    });
+    let (true, Some(command), Some(args)) = (plugin["name"] == PLUGIN_NAME, command, args) else {
+        return Err(format!(
+            "Invalid plugin or MCP server definition under {}.",
+            plugin_dir.display()
+        ));
+    };
+
+    let command_path = PathBuf::from(command);
+    if !command_path.is_file() {
+        return Err(format!(
+            "Registered executable does not exist: {}.",
+            command_path.display()
+        ));
+    }
+
+    Ok(RegisteredCommand {
+        settings_path: settings_path.to_path_buf(),
+        marketplace_dir,
+        command: command_path,
+        args,
+    })
+}
+
+fn check_registration() -> (Check, Option<RegisteredCommand>) {
+    let settings_path = match state::claude_settings_path() {
+        Ok(path) => path,
+        Err(message) => {
+            return (
+                Check::new("claude-code.registration", Status::Fail, message, None),
+                None,
+            );
+        }
+    };
+    match read_registration(&settings_path) {
+        Ok(reg) => {
+            let check = Check::new(
+                "claude-code.registration",
+                Status::Ok,
+                format!(
+                    "Claude Code registration points to {}.",
+                    reg.command.display()
+                ),
+                Some(json!({
+                    "settings_path": reg.settings_path.display().to_string(),
+                    "marketplace_dir": reg.marketplace_dir.display().to_string(),
+                    "command": reg.command.display().to_string(),
+                    "args": reg.args,
+                })),
+            );
+            (check, Some(reg))
+        }
+        Err(reason) => (
+            Check::new("claude-code.registration", Status::Fail, reason, None),
+            None,
+        ),
+    }
+}
+
+fn check_state_dir() -> Check {
+    let dir = match state::state_dir() {
+        Ok(path) => path,
+        Err(message) => return Check::new("state_dir.permissions", Status::Fail, message, None),
+    };
+    check_state_dir_platform(&dir)
+}
+
+#[cfg(unix)]
+fn check_state_dir_platform(dir: &Path) -> Check {
+    use std::os::unix::fs::PermissionsExt;
+
+    match fs::symlink_metadata(dir) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Check::new(
+            "state_dir.permissions",
+            Status::Warn,
+            format!("State directory {} does not exist yet.", dir.display()),
+            Some(json!({ "path": dir.display().to_string() })),
+        ),
+        Err(err) => Check::new(
+            "state_dir.permissions",
+            Status::Fail,
+            format!("Could not inspect state directory {}: {err}", dir.display()),
+            None,
+        ),
+        Ok(meta) => {
+            let mode = meta.permissions().mode() & 0o777;
+            let mode_text = format!("{mode:04o}");
+            let details = Some(json!({
+                "path": dir.display().to_string(),
+                "mode": mode_text,
+            }));
+            if !meta.is_dir() || (mode & 0o077) != 0 {
+                Check::new(
+                    "state_dir.permissions",
+                    Status::Fail,
+                    format!(
+                        "State directory {} is not a private directory (mode {mode_text}; expected 0700).",
+                        dir.display()
+                    ),
+                    details,
+                )
+            } else {
+                Check::new(
+                    "state_dir.permissions",
+                    Status::Ok,
+                    format!(
+                        "State directory {} has private permissions ({mode_text}).",
+                        dir.display()
+                    ),
+                    details,
+                )
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn check_state_dir_platform(dir: &Path) -> Check {
+    let details = Some(json!({ "path": dir.display().to_string() }));
+    if dir.is_dir() {
+        Check::new(
+            "state_dir.permissions",
+            Status::Ok,
+            format!(
+                "State directory {} exists (Unix permission bits do not apply on this platform).",
+                dir.display()
+            ),
+            details,
+        )
+    } else {
+        Check::new(
+            "state_dir.permissions",
+            Status::Warn,
+            format!("State directory {} does not exist yet.", dir.display()),
+            details,
+        )
+    }
+}
+
+fn provider_check(provider: &Provider, status: CliStatus) -> Check {
+    let name = format!("cli.{}", provider.name);
+    match status {
+        CliStatus::Ready { program, version } => Check::new(
+            name,
+            Status::Ok,
+            format!("{} {version} ({})", provider.cli, program.display()),
+            Some(json!({
+                "provider": provider.name,
+                "cli": provider.cli,
+                "path": program.display().to_string(),
+                "version": version,
+            })),
+        ),
+        CliStatus::NotFound(failure) => Check::new(
+            name,
+            Status::Warn,
+            failure.message,
+            Some(json!({
+                "provider": provider.name,
+                "cli": provider.cli,
+            })),
+        ),
+        #[cfg(windows)]
+        CliStatus::UnsupportedLauncher(failure) => Check::new(
+            name,
+            Status::Fail,
+            failure.message,
+            Some(json!({
+                "provider": provider.name,
+                "cli": provider.cli,
+            })),
+        ),
+        CliStatus::ProbeFailed { program, error } => Check::new(
+            name,
+            Status::Fail,
+            error.failure.message,
+            Some(json!({
+                "provider": provider.name,
+                "cli": provider.cli,
+                "path": program.display().to_string(),
+            })),
+        ),
+    }
+}
+
+async fn read_response(
+    reader: &mut BufReader<ChildStdout>,
+    expected_id: i64,
+) -> Result<Value, HandshakeError> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            return Err(HandshakeError::Protocol(
+                "MCP server closed stdout before answering.".to_owned(),
+            ));
+        }
+        let frame: Value = serde_json::from_str(&line).map_err(|err| {
+            HandshakeError::Protocol(format!("MCP server returned invalid JSON: {err}"))
+        })?;
+        if frame.get("id") == Some(&json!(expected_id)) {
+            if let Some(error) = frame.get("error") {
+                return Err(HandshakeError::Protocol(format!(
+                    "MCP server returned error: {error}"
+                )));
+            }
+            return Ok(frame);
+        }
+    }
+}
+
+async fn run_handshake(command: &Path, args: &[String]) -> Result<HandshakeInfo, HandshakeError> {
+    let limit = handshake_timeout();
+    let mut child = Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut reader = BufReader::new(stdout);
+
+    let exchange = async {
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "proxenos-doctor",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }
+        });
+        stdin.write_all(format!("{init_req}\n").as_bytes()).await?;
+        stdin.flush().await?;
+        let init = read_response(&mut reader, 1).await?;
+
+        let initialized = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        let list_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        });
+        stdin
+            .write_all(format!("{initialized}\n{list_req}\n").as_bytes())
+            .await?;
+        stdin.flush().await?;
+        let listed = read_response(&mut reader, 2).await?;
+
+        let Some(entries) = listed["result"]["tools"].as_array() else {
+            return Err(HandshakeError::Protocol(
+                "MCP tools/list response did not include a tools array.".to_owned(),
+            ));
+        };
+        let tools = entries
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect();
+        let server_info = &init["result"]["serverInfo"];
+        Ok(HandshakeInfo {
+            server_name: server_info["name"].as_str().map(str::to_owned),
+            server_version: server_info["version"].as_str().map(str::to_owned),
+            tools,
+        })
+    };
+
+    let outcome = match tokio::time::timeout(limit, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err(HandshakeError::TimedOut(limit)),
+    };
+
+    drop(stdin);
+    drop(reader);
+    let clean = outcome.is_ok()
+        && tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_ok();
+    if !clean {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+
+    outcome
+}
+
+async fn check_handshake(registration: Option<&RegisteredCommand>) -> Check {
+    let Some(reg) = registration else {
+        return Check::new(
+            "claude-code.handshake",
+            Status::Fail,
+            "Skipped: Claude Code registration check failed.",
+            None,
+        );
+    };
+    let command_str = reg.command.display().to_string();
+    match run_handshake(&reg.command, &reg.args).await {
+        Ok(info) => {
+            let details = Some(json!({
+                "command": command_str,
+                "args": reg.args,
+                "server_name": info.server_name,
+                "server_version": info.server_version,
+                "tools": info.tools,
+            }));
+            if info.tools.is_empty() {
+                Check::new(
+                    "claude-code.handshake",
+                    Status::Warn,
+                    "MCP handshake succeeded, but tools/list returned 0 tools.",
+                    details,
+                )
+            } else {
+                Check::new(
+                    "claude-code.handshake",
+                    Status::Ok,
+                    format!("MCP handshake succeeded ({} tools).", info.tools.len()),
+                    details,
+                )
+            }
+        }
+        Err(error) => Check::new(
+            "claude-code.handshake",
+            Status::Fail,
+            error.to_string(),
+            Some(json!({
+                "command": command_str,
+                "args": reg.args,
+            })),
+        ),
+    }
+}
+
+pub fn run(json_output: bool) -> (bool, String) {
+    let (reg_check, registration) = check_registration();
+    let state_check = check_state_dir();
+
+    let runtime = tokio::runtime::Runtime::new().expect("the async runtime starts");
+    let (cli_checks, handshake_check) = runtime.block_on(async {
+        let cancel = CancellationToken::new();
+        let (activity, mut finished) = Activity::track();
+        let mut handles = Vec::with_capacity(providers::ALL.len());
+        for provider in providers::ALL {
+            let cancel = cancel.clone();
+            let activity = activity.clone();
+            handles.push((
+                provider,
+                tokio::spawn(async move { discovery::inspect(provider, &cancel, activity).await }),
+            ));
+        }
+
+        let mut cli_checks = Vec::with_capacity(handles.len());
+        for (provider, handle) in handles {
+            let status = handle.await.expect("provider check finished");
+            cli_checks.push(provider_check(provider, status));
+        }
+
+        let handshake_check = check_handshake(registration.as_ref()).await;
+        drop(activity);
+        let _ = tokio::time::timeout(Duration::from_secs(2), finished.recv()).await;
+        (cli_checks, handshake_check)
+    });
+    runtime.shutdown_timeout(Duration::from_millis(500));
+
+    let mut checks = Vec::with_capacity(3 + cli_checks.len());
+    checks.push(reg_check);
+    checks.push(state_check);
+    checks.extend(cli_checks);
+    checks.push(handshake_check);
+
+    let ok = checks.iter().all(|check| check.status != Status::Fail);
+    let report = Report {
+        schema_version: REPORT_SCHEMA_VERSION,
+        ok,
+        checks,
+    };
+
+    let output = if json_output {
+        let mut text = serde_json::to_string_pretty(&report).expect("doctor report serializes");
+        text.push('\n');
+        text
+    } else {
+        let mut text = String::new();
+        for check in &report.checks {
+            text.push_str(&format!(
+                "[{}] {}: {}\n",
+                check.status.label(),
+                check.name,
+                check.message
+            ));
+        }
+        text
+    };
+
+    (ok, output)
+}

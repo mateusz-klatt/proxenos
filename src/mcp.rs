@@ -70,6 +70,19 @@ impl Activity {
     }
 }
 
+impl Activity {
+    pub fn track() -> (Self, mpsc::Receiver<()>) {
+        let (running, finished) = mpsc::channel(1);
+        (
+            Self {
+                _running: running,
+                shutdown: CancellationToken::new(),
+            },
+            finished,
+        )
+    }
+}
+
 /// What the server offers. Implemented outside this module, without `rmcp` types.
 pub trait Service: Send + Sync + 'static {
     fn tools(
@@ -109,7 +122,7 @@ pub enum Served {
 /// input or the first failure.
 pub async fn serve<S: Service>(service: S) -> Served {
     let stopper = Arc::new(Stopper::default());
-    let (active, mut finished) = mpsc::channel::<()>(1);
+    let (active, mut finished) = mpsc::channel(1);
     let handler = Handler {
         service: Arc::new(service),
         stopper: Arc::clone(&stopper),

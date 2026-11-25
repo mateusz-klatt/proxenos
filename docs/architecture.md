@@ -370,6 +370,70 @@ entries it wrote, refuses to take over one it did not, and keeps a record of wha
   path, as Iris does.
 - `proxenos doctor` reads the registrations back, checks the CLIs, and runs a handshake.
 
+At milestone 1 step 5, `proxenos integrate claude-code [--remove]` and `proxenos doctor [--json]`
+implement the Claude Code registration and health check:
+
+- **State directory.** Proxenos stores its integration state under `$XDG_STATE_HOME/proxenos` (or
+  `$HOME/.local/state/proxenos` when `XDG_STATE_HOME` is unset or non-absolute) on Unix, and
+  `%LOCALAPPDATA%\proxenos` on Windows. Directories created by Proxenos use mode `0700` on Unix and
+  files owned by Proxenos use mode `0600`. All writes go through a unique temporary file in the same
+  directory followed by an atomic rename.
+- **Claude Code marketplace layout.** `proxenos integrate claude-code` writes a local marketplace
+  under `<state_dir>/claude-marketplace`:
+  - `.claude-plugin/marketplace.json` naming marketplace `proxenos`, owner `Proxenos`, and plugin
+    `proxenos` at `./plugins/proxenos`.
+  - `plugins/proxenos/.claude-plugin/plugin.json` carrying name, description, crate version and
+    author `Proxenos`.
+  - `plugins/proxenos/.mcp.json` defining `mcpServers.proxenos` with `command` set to the
+    canonical absolute path of the running `proxenos` binary and `args` set to
+    `["mcp", "--client", "claude"]`.
+- **Claude Code settings.** In `<HOME>/.claude/settings.json` (`%USERPROFILE%\.claude\settings.json`
+  on Windows), Proxenos writes `extraKnownMarketplaces.proxenos` (with
+  `source: { source: "directory", path: "<marketplace_dir>" }`) and
+  `enabledPlugins."proxenos@proxenos": true`, preserving all unrelated keys and key ordering (via
+  `serde_json`'s pure-Rust `preserve_order` feature) and preserving an existing file's Unix
+  permissions. If `settings.json` already existed, a verbatim backup is saved to
+  `<state_dir>/integrate/backups/claude-code-settings.json` (mode `0600` on Unix) before the first
+  edit.
+- **Manifest and ownership rules.** `<state_dir>/integrate/manifest.json` (`schema_version: 1`)
+  records per-client ownership under `clients."claude-code"`: `marketplace_dir`, `binary_path`,
+  `settings_path`, whether Proxenos created `settings.json` and the two container objects, the
+  optional `backup_path`, the exact JSON values written under `entries`, the generated `files`, and
+  the `created_dirs` list in creation order.
+  - Re-running `integrate claude-code` is idempotent and updates `.mcp.json` and `binary_path` when
+    the binary moves, keeping the original backup and creation flags.
+  - If `extraKnownMarketplaces.proxenos` or `enabledPlugins."proxenos@proxenos"` already exists
+    without a matching manifest record, or if `<state_dir>/claude-marketplace` already exists and is
+    not recorded as ours, `integrate` refuses with exit code 1 and changes nothing. It also refuses
+    to overwrite an entry the user edited after `integrate`.
+  - `integrate claude-code --remove` removes only entries in `settings.json` that still match the
+    manifest's recorded values (never restoring the backup over newer user edits), removes only
+    files recorded in the manifest and its backup, deletes `settings.json` only if Proxenos created
+    it and no keys remain, deletes recorded directories in reverse order only when empty, and is
+    idempotent when already removed. If the user modified a managed entry in `settings.json`,
+    `--remove` refuses to delete that entry, reports it on stderr, and exits 1.
+- **`proxenos doctor [--json]`.** Reads back the Claude Code registration (`settings.json` through
+  `marketplace.json`, `plugin.json` and `.mcp.json`) and checks that the registered executable
+  exists; checks that `<state_dir>` has private (`0700`-compatible) permissions on Unix (or exists
+  on Windows); inspects each provider CLI using D7 discovery and reports its version; and runs an
+  MCP stdio handshake (`initialize`, `notifications/initialized`, `tools/list`) against the
+  registered command and args under a bounded deadline (10 seconds by default), killing and reaping
+  the child if it fails or times out. Output is text by default or schema-versioned JSON with
+  `--json`, with each check reported as `ok`, `warn`, or `fail`; exit status is 0 when no check
+  fails and 1 otherwise.
+
+What this cannot do:
+
+- Claude Code reads `settings.json` and local marketplace plugins only when it starts; running
+  `integrate` or `--remove` does not reload a Claude Code session that is already open.
+- `doctor`'s handshake proves that the registered binary starts and speaks MCP with the configured
+  arguments; it does not prove that Claude Code itself loaded the plugin or that Claude Code's own
+  hook/plugin discovery will accept it.
+- An entry in `settings.json` edited by hand after `integrate` is reported and left untouched by
+  both `integrate` and `--remove`, never forced or overwritten.
+- On Windows, Unix mode bits do not apply; `<state_dir>` relies on the user profile's `%LOCALAPPDATA%`
+  ACLs rather than `0700`/`0600` modes.
+
 ### D11. Releases are built and signed as Iris's are
 
 Six targets: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (statically linked),

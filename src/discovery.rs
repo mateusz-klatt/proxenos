@@ -33,6 +33,50 @@ pub struct DiscoveryError {
     pub diagnostic: Option<String>,
 }
 
+pub enum CliStatus {
+    Ready {
+        program: PathBuf,
+        version: String,
+    },
+    NotFound(Failure),
+    #[cfg(windows)]
+    UnsupportedLauncher(Failure),
+    ProbeFailed {
+        program: PathBuf,
+        error: DiscoveryError,
+    },
+}
+
+pub async fn inspect(
+    provider: &'static Provider,
+    cancel: &CancellationToken,
+    activity: Activity,
+) -> CliStatus {
+    let located = tokio::task::spawn_blocking(move || locate(provider))
+        .await
+        .expect("resolver finished");
+    let exe = match located {
+        Ok(exe) => exe,
+        Err(failure) => {
+            #[cfg(windows)]
+            if failure.kind == FailureKind::UnsupportedLauncher {
+                return CliStatus::UnsupportedLauncher(failure);
+            }
+            return CliStatus::NotFound(failure);
+        }
+    };
+    match probe(&exe, cancel, None, activity).await {
+        Ok(version) => CliStatus::Ready {
+            program: exe.program,
+            version,
+        },
+        Err(error) => CliStatus::ProbeFailed {
+            program: exe.program,
+            error,
+        },
+    }
+}
+
 impl From<Failure> for DiscoveryError {
     fn from(failure: Failure) -> Self {
         Self {
@@ -133,7 +177,9 @@ impl Discovery {
                     .await
                     .expect("resolver finished");
                 let check = match &executable {
-                    Ok(exe) => probe(exe, &cancel, None, activity.clone()).await,
+                    Ok(exe) => probe(exe, &cancel, None, activity.clone())
+                        .await
+                        .map(|_| ()),
                     Err(error) => Err(DiscoveryError::from(error.clone())),
                 };
                 let _ = publish.send(Some(Arc::new(Located {
@@ -187,7 +233,9 @@ impl Discovery {
             && (checked_before
                 || (previous.failure.kind == FailureKind::Cancellation && !cancel.is_cancelled()))
         {
-            *check = probe(executable, cancel, Some(deadline), activity).await;
+            *check = probe(executable, cancel, Some(deadline), activity)
+                .await
+                .map(|_| ());
         }
         check.clone().map(|()| executable.clone())
     }
@@ -244,7 +292,7 @@ async fn probe(
     cancel: &CancellationToken,
     deadline: Option<Instant>,
     activity: Activity,
-) -> Result<(), DiscoveryError> {
+) -> Result<String, DiscoveryError> {
     let mut args = exe.prefix.clone();
     args.push("--version".into());
     let limit = Instant::now() + Duration::from_secs(10);
@@ -283,7 +331,18 @@ async fn probe(
         Ending::Exited
             if outcome.code == Some(0) && outcome.stdout.total + outcome.stderr.total > 0 =>
         {
-            Ok(())
+            let version = [&outcome.stdout.bytes, &outcome.stderr.bytes]
+                .into_iter()
+                .filter_map(|bytes| {
+                    let text = String::from_utf8_lossy(bytes);
+                    text.lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(str::to_owned)
+                })
+                .next()
+                .unwrap_or_default();
+            Ok(version)
         }
         _ => {
             let detail = if outcome.stderr.bytes.is_empty() {
