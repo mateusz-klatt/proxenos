@@ -61,7 +61,7 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = arm64
           mkdir -p "$RUNNER_TEMP/tools"
-          curl -fsSL "https://github.com/goreleaser/goreleaser/releases/download/${GORELEASER_VERSION}/goreleaser_Darwin_all.tar.gz" \
+          curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/goreleaser/goreleaser/releases/download/${GORELEASER_VERSION}/goreleaser_Darwin_all.tar.gz" \
             -o "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz"
           printf '%s  %s\n' "$GORELEASER_TARBALL_SHA256_DARWIN_ALL" "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz" | shasum -a 256 -c -
           tar -xzf "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz" -C "$RUNNER_TEMP/tools" goreleaser

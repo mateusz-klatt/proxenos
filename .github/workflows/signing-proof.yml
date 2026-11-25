@@ -169,12 +169,14 @@ jobs:
           CERTUM_EMAIL: ${{ secrets.CERTUM_EMAIL }}
           CERTUM_OTP: ${{ secrets.CERTUM_OTP }}
           PROXENOS_WINDOWS_SIGNER: ${{ runner.temp }}/signer/ssign
-          XDG_RUNTIME_DIR: ${{ runner.temp }}/certum-signing
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/certum-signing-step
         # Runs ssign twice in separate processes with only the five allowlisted
-        # environment variables and suppressed stdio. ssign caches its OAuth
-        # session under $XDG_RUNTIME_DIR/ssign on this ephemeral runner.
+        # environment variables and suppressed stdio. ssign caches a reusable
+        # OAuth session under $XDG_RUNTIME_DIR/ssign; the EXIT trap removes that
+        # step-private directory when this step finishes (including on failure).
         run: |
           set -euo pipefail
+          trap 'test -n "${RUNNER_TEMP:-}" && rm -rf "$RUNNER_TEMP/certum-signing-step"' EXIT
           printf '%s  %s\n' "$EXPECTED_SIGNER_SHA256" "$PROXENOS_WINDOWS_SIGNER" | sha256sum --check --strict
           test "$(find "$RUNNER_TEMP/windows" ! -type d | LC_ALL=C sort)" = "$(printf '%s\n' "$RUNNER_TEMP/windows/amd64/proxenos.exe" "$RUNNER_TEMP/windows/arm64/proxenos.exe")"
           printf '%s  %s\n' "$EXPECTED_AMD64_SHA256" "$RUNNER_TEMP/windows/amd64/proxenos.exe" | sha256sum --check --strict
@@ -192,6 +194,8 @@ jobs:
           if os.path.islink(signer) or not stat.S_ISREG(os.stat(signer).st_mode):
               sys.exit("Windows signer executable is unavailable")
           os.chmod(signer, 0o700)
+          os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+          os.chmod(runtime_dir, 0o700)
           cache_dir = os.path.join(runtime_dir, "ssign")
           os.makedirs(cache_dir, mode=0o700, exist_ok=True)
           os.chmod(cache_dir, 0o700)
