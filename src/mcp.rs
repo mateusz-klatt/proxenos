@@ -60,6 +60,14 @@ pub struct UnknownTool;
 #[derive(Clone)]
 pub struct Activity {
     _running: mpsc::Sender<()>,
+    shutdown: CancellationToken,
+}
+
+impl Activity {
+    /// A child token that fires only when serving shuts down, never when a single request ends.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.child_token()
+    }
 }
 
 /// What the server offers. Implemented outside this module, without `rmcp` types.
@@ -105,7 +113,10 @@ pub async fn serve<S: Service>(service: S) -> Served {
     let handler = Handler {
         service: Arc::new(service),
         stopper: Arc::clone(&stopper),
-        active: Activity { _running: active },
+        active: Activity {
+            _running: active,
+            shutdown: stopper.shutdown.clone(),
+        },
     };
     let (server_input, input) = tokio::io::duplex(PIPE_BYTES);
     let (server_output, output) = tokio::io::duplex(PIPE_BYTES);

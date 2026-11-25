@@ -255,6 +255,7 @@ async fn probe(
         env_set: crate::delegation::env_set(),
         env_remove: crate::delegation::env_remove(),
         deadline: deadline.map_or(limit, |call| call.min(limit)),
+        memory_limit_bytes: None,
         capture_limit: 2048,
         temporary_files: Vec::new(),
     };
@@ -284,7 +285,7 @@ async fn probe(
         {
             Ok(())
         }
-        Ending::Exited => {
+        _ => {
             let detail = if outcome.stderr.bytes.is_empty() {
                 &outcome.stdout.bytes
             } else {

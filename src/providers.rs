@@ -15,6 +15,8 @@ use crate::mcp::ToolSpec;
 use crate::supervise::Finished;
 
 pub const ALL: &[Provider] = &[codex::SPEC, antigravity::SPEC];
+pub const DEFAULT_TIMEOUT_MS: u64 = 3_600_000;
+const MAX_MODEL_LEN: usize = 256;
 
 pub struct Provider {
     pub name: &'static str,
@@ -49,6 +51,21 @@ pub struct Settings {
     pub effort: Option<String>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct RememberedStart {
+    pub settings: Settings,
+    pub reported_model: Option<String>,
+}
+
+/// Validates a model name from either a caller or untrusted provider output.
+pub fn is_valid_model(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && value.len() <= MAX_MODEL_LEN
+        && !value.contains(char::is_control)
+        && !trimmed.starts_with('-')
+}
+
 // A native pathname need not be Unicode. JSON can represent only the Unicode case.
 fn serialize_cwd<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
     path.to_str().serialize(serializer)
@@ -61,6 +78,8 @@ pub struct Turn {
     pub timeout_ms: u64,
     pub prompt: String,
     pub guidance: String,
+    pub wait: bool,
+    pub memory_limit_bytes: Option<u64>,
 }
 
 #[derive(Default, Serialize)]
@@ -98,21 +117,24 @@ impl Provider {
         let mut fields = json!({
             "prompt": string,
             "cwd": string,
-            "instructions":string,
-            "model":string,
-            "mode":{"enum":["advisory","implementation"],"description":"An instruction to the provider. It cannot restrict writes or commands."},
-            "access":{"enum":access,"description":mechanisms.join(" ")},
-            "timeout_ms":{"type":"integer","minimum":1,"maximum":86400000},
-            "coordination":{"type":"object","properties":{"caller_agent_name":string},"required":["caller_agent_name"],"additionalProperties":false}
+            "instructions": string,
+            "model": string,
+            "mode": {"enum": ["advisory", "implementation"], "description": "An instruction to the provider. It cannot restrict writes or commands."},
+            "access": {"enum": access, "description": mechanisms.join(" ")},
+            "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 86400000},
+            "wait": {"type": "boolean", "default": true, "description": "Wait for the delegation to finish (default true). With false, an admitted delegation returns a process-local handle immediately."},
+            "memory_limit_bytes": {"type": "integer", "minimum": 1, "description": "Optional memory limit in bytes (none by default). On Windows, the job refuses allocations above the limit and the CLI may fail or carry on. On Linux and macOS, the supervised process group is sampled periodically and crossing the threshold triggers a stop; sampling can miss brief peaks, short-lived children, or descendants that leave the group."},
+            "coordination": {"type": "object", "properties": {"caller_agent_name": string}, "required": ["caller_agent_name"], "additionalProperties": false}
         });
         if !self.efforts.is_empty() {
-            fields["effort"] = json!({"enum":self.efforts});
+            fields["effort"] = json!({"enum": self.efforts});
         }
         if reply {
             fields["thread_id"] = string;
             if self.reply_model {
-                fields["model"]["description"] =
-                    json!("Required unless the start passed a model that this server remembers.");
+                fields["model"]["description"] = json!(
+                    "Required unless the start passed a model or the provider reported one that this server remembers."
+                );
             }
             if self.fixed_instructions {
                 fields["mode"]["description"] =
@@ -122,7 +144,12 @@ impl Provider {
         fields.as_object_mut().unwrap().retain(|key, _| {
             matches!(
                 key.as_str(),
-                "prompt" | "thread_id" | "timeout_ms" | "coordination"
+                "prompt"
+                    | "thread_id"
+                    | "timeout_ms"
+                    | "wait"
+                    | "memory_limit_bytes"
+                    | "coordination"
             ) || supported.contains(&key.as_str())
         });
         fields
@@ -154,7 +181,7 @@ impl Provider {
         &self,
         args: &Map<String, Value>,
         reply: bool,
-        start: Option<Settings>,
+        start: Option<RememberedStart>,
     ) -> Result<Turn, String> {
         let schema = self.tool(reply).input_schema;
         for field in schema["required"].as_array().unwrap() {
@@ -169,12 +196,15 @@ impl Provider {
                 choices.contains(value)
             } else {
                 match field["type"].as_str() {
-                    Some("string") => value
-                        .as_str()
-                        .is_some_and(|s| !s.trim().is_empty() && !s.contains('\0')),
-                    Some("integer") => value
-                        .as_u64()
-                        .is_some_and(|n| (1..=field["maximum"].as_u64().unwrap()).contains(&n)),
+                    Some("string") => value.as_str().is_some_and(|s| {
+                        !s.trim().is_empty()
+                            && !s.contains('\0')
+                            && (key != "model" || is_valid_model(s))
+                    }),
+                    Some("boolean") => value.is_boolean(),
+                    Some("integer") => value.as_u64().is_some_and(|n| {
+                        n >= 1 && field["maximum"].as_u64().is_none_or(|m| n <= m)
+                    }),
                     Some("object") => value.as_object().is_some_and(|map| {
                         map.len() == 1
                             && map
@@ -201,18 +231,24 @@ impl Provider {
             return Err("This server has no settings for that session. Supply its cwd, access and mode, and any model, effort or instructions used at the start.".into());
         }
         let fixed = self.fixed_instructions && reply && !unknown;
-        let mut settings = start.unwrap_or_else(|| Settings {
-            cwd: PathBuf::from("."),
-            mode: "advisory".into(),
-            access: "full".into(),
-            instructions: None,
-            model: None,
-            effort: None,
-        });
+        let (mut settings, reported_model) = match start {
+            Some(remembered) => (remembered.settings, remembered.reported_model),
+            None => (
+                Settings {
+                    cwd: PathBuf::from("."),
+                    mode: "advisory".into(),
+                    access: "full".into(),
+                    instructions: None,
+                    model: None,
+                    effort: None,
+                },
+                None,
+            ),
+        };
         let timeout_ms = args
             .get("timeout_ms")
             .and_then(Value::as_u64)
-            .unwrap_or(3_600_000);
+            .unwrap_or(DEFAULT_TIMEOUT_MS);
         let supported = self.supported_settings(reply);
         settings.model = settings.model.filter(|_| supported.contains(&"model"));
         settings.effort = settings.effort.filter(|_| supported.contains(&"effort"));
@@ -239,7 +275,7 @@ impl Provider {
             .ok()
             .ok_or("Cannot resolve the working directory")?;
         if let Some(s) = text("model") {
-            settings.model = Some(s.into());
+            settings.model = Some(s.trim().into());
         }
         if let Some(s) = text("effort") {
             settings.effort = Some(s.into());
@@ -247,11 +283,17 @@ impl Provider {
         if let Some(s) = text("instructions") {
             settings.instructions = Some(s.into());
         }
-        // D19 leaves the no-model start open. Until resolved, a required model comes from the caller.
+        // D19 owner decision (2026-11-25): if start named no model and reply must name one,
+        // repeat the model the provider reported at start; if none was reported, refuse.
         if reply && self.reply_model && settings.model.is_none() {
-            return Err(
-                "The reply requires a model. Supply one because the start passed none.".into(),
-            );
+            if let Some(reported) = reported_model {
+                settings.model = Some(reported);
+            } else {
+                return Err(
+                    "The reply requires a model. Supply one because the start passed none and the provider reported none."
+                        .into(),
+                );
+            }
         }
         let mut guidance = match settings.mode.as_str() {
             "advisory" => "Advise the caller and leave the workspace as you found it.".to_owned(),
@@ -271,6 +313,8 @@ impl Provider {
             timeout_ms,
             prompt,
             guidance,
+            wait: args.get("wait").and_then(Value::as_bool).unwrap_or(true),
+            memory_limit_bytes: args.get("memory_limit_bytes").and_then(Value::as_u64),
         })
     }
 }
