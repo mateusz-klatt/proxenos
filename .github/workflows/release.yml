@@ -1,0 +1,804 @@
+name: release
+
+# D11 release pipeline:
+# - Pull requests touching release inputs and manual workflow_dispatch runs
+#   exercise all six Rust cross-builds, archives, SBOMs and checksums as a
+#   snapshot with no secrets and no write permissions.
+# - A pushed v* tag on mateusz-klatt/proxenos verifies Cargo.toml matches the
+#   tag, builds and notarizes macOS binaries on macos-latest, verifies them
+#   natively, builds Linux musl and Windows binaries on ubuntu-latest with
+#   Certum Authenticode signing, signs checksums.txt with keyless cosign,
+#   attests build provenance, creates a draft GitHub release, and verifies the
+#   signed Windows archives on windows-latest.
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+    paths:
+      - '.goreleaser.yaml'
+      - '.github/workflows/release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && 'certum-signing' || format('release-snapshot-{0}', github.ref) }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Snapshot cross-build path (PR / workflow_dispatch, no secrets, read-only)
+  # ---------------------------------------------------------------------------
+  snapshot-darwin:
+    name: Snapshot (macOS cross-builds)
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.1'
+          use-cache: false
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-zigbuild@0.24.1
+
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.20.0
+          install-only: true
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version --verbose
+          zig version
+          cargo-zigbuild --version
+          syft version
+          goreleaser --version
+
+      - name: Build macOS snapshot archives and SBOMs
+        shell: bash
+        env:
+          PROXENOS_BUILD_GROUP: darwin
+        run: goreleaser release --snapshot --clean --parallelism=1 --skip=publish,sign
+
+      - name: Verify macOS binaries and archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          lipo -archs dist/proxenos-darwin_x86_64-apple-darwin/proxenos | grep -Fx 'x86_64'
+          lipo -archs dist/proxenos-darwin_aarch64-apple-darwin/proxenos | grep -Fx 'arm64'
+          ./dist/proxenos-darwin_aarch64-apple-darwin/proxenos --version | grep -E '^proxenos '
+          python3 - <<'PY'
+          from pathlib import Path
+          import tarfile
+
+          dist = Path("dist")
+          archives = sorted(dist.glob("proxenos_*_darwin_*.tar.gz"))
+          sboms = sorted(dist.glob("proxenos_*_darwin_*.tar.gz.sbom.json"))
+          assert len(archives) == 2, f"expected 2 darwin archives, got {archives}"
+          assert len(sboms) == 2, f"expected 2 darwin SBOMs, got {sboms}"
+          for archive in archives:
+              with tarfile.open(archive, "r:gz") as tf:
+                  names = sorted(m.name for m in tf.getmembers())
+              assert names == ["LICENSE", "NOTICE", "proxenos"], f"{archive.name}: unexpected members {names}"
+          PY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: snapshot-darwin-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/proxenos_*_darwin_*.tar.gz
+            dist/proxenos_*_darwin_*.tar.gz.sbom.json
+          if-no-files-found: error
+          retention-days: 1
+
+  snapshot-linux-windows:
+    name: Snapshot (Linux musl & Windows cross-builds)
+    needs: snapshot-darwin
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.snapshot-darwin.outputs.artifact-id }}
+          path: ${{ runner.temp }}/macos-dist
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.1'
+          use-cache: false
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-zigbuild@0.24.1
+
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.20.0
+          install-only: true
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version --verbose
+          zig version
+          cargo-zigbuild --version
+          syft version
+          goreleaser --version
+
+      - name: Build Linux musl and Windows snapshot archives, SBOMs and checksums
+        shell: bash
+        env:
+          PROXENOS_BUILD_GROUP: linux-windows
+          PROXENOS_MACOS_DIST: ${{ runner.temp }}/macos-dist
+        run: goreleaser release --snapshot --clean --parallelism=1 --skip=publish,sign
+
+      - name: Verify static Linux binaries, Windows PE architectures and full checksums
+        shell: bash
+        env:
+          PROXENOS_MACOS_DIST: ${{ runner.temp }}/macos-dist
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            bin="dist/proxenos_${target}/proxenos"
+            if readelf -l "$bin" | grep -q 'INTERP'; then
+              echo "::error::$bin is dynamically linked (PT_INTERP present)"
+              exit 1
+            fi
+          done
+          readelf -h dist/proxenos_x86_64-unknown-linux-musl/proxenos | grep -q 'X86-64'
+          readelf -h dist/proxenos_aarch64-unknown-linux-musl/proxenos | grep -q 'AArch64'
+          ./dist/proxenos_x86_64-unknown-linux-musl/proxenos --version | grep -E '^proxenos '
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import struct
+          import tarfile
+          import zipfile
+
+          def pe_machine(path: Path) -> int:
+              data = path.read_bytes()
+              assert data[:2] == b"MZ", f"{path}: missing MZ header"
+              pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+              assert data[pe_offset : pe_offset + 4] == b"PE\x00\x00", f"{path}: missing PE signature"
+              return struct.unpack_from("<H", data, pe_offset + 4)[0]
+
+          assert pe_machine(Path("dist/proxenos_x86_64-pc-windows-gnu/proxenos.exe")) == 0x8664
+          assert pe_machine(Path("dist/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe")) == 0xAA64
+
+          dist = Path("dist")
+          macos_dist = Path(os.environ["PROXENOS_MACOS_DIST"])
+
+          for archive in sorted(dist.glob("proxenos_*_linux_*.tar.gz")):
+              with tarfile.open(archive, "r:gz") as tf:
+                  names = sorted(m.name for m in tf.getmembers())
+              assert names == ["LICENSE", "NOTICE", "proxenos"], f"{archive.name}: unexpected members {names}"
+
+          for archive in sorted(dist.glob("proxenos_*_windows_*.zip")):
+              with zipfile.ZipFile(archive) as zf:
+                  names = sorted(zf.namelist())
+              assert names == ["LICENSE", "NOTICE", "proxenos.exe"], f"{archive.name}: unexpected members {names}"
+
+          lines = [line.strip() for line in (dist / "checksums.txt").read_text().splitlines() if line.strip()]
+          assert len(lines) == 12, f"expected 12 checksum subjects (6 archives + 6 SBOMs), got {len(lines)}"
+          for line in lines:
+              digest, name = line.split()
+              candidate = dist / name
+              if not candidate.exists():
+                  candidate = macos_dist / name
+              assert candidate.is_file(), f"missing checksum subject {name}"
+              actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+              assert actual == digest, f"checksum mismatch for {name}"
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("### Snapshot build verified\n\n")
+              summary.write("All 6 targets built, archived, cataloged with Syft, and verified in `checksums.txt` (12 subjects).\n\n")
+              summary.write("```text\n" + "\n".join(lines) + "\n```\n")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Tag release path (v* tag on mateusz-klatt/proxenos -> draft GitHub release)
+  # ---------------------------------------------------------------------------
+  check-tag:
+    name: Verify tag matches Cargo.toml
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare tag version with Cargo.toml
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          if not tag.startswith("v"):
+              raise SystemExit(f"Tag must start with 'v', got {tag!r}")
+          version = tag[1:]
+          if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+-]*", version):
+              raise SystemExit(f"Tag version has unexpected characters: {version!r}")
+          cargo = tomllib.loads(Path("Cargo.toml").read_text())
+          cargo_version = cargo["package"]["version"]
+          if cargo_version != version:
+              raise SystemExit(
+                  f"Cargo.toml package.version ({cargo_version!r}) does not match tag {tag!r} ({version!r})"
+              )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={version}\n")
+          PY
+
+  signer:
+    name: Build pinned Certum signer
+    needs: check-tag
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Le-Syl21/ssign
+          ref: f7ba7b2360a3e40bb8aa062d244d95c62a743b90 # v0.1.8, MIT
+          path: ssign
+          persist-credentials: false
+
+      - name: Build ssign without credentials
+        working-directory: ssign
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal
+          cargo +1.99.1 build --release --locked
+          sha256sum target/release/ssign >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: certum-signer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ssign/target/release/ssign
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: Build, sign and notarize macOS targets
+    needs: check-tag
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.1'
+          use-cache: false
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-zigbuild@0.24.1
+
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.20.0
+          install-only: true
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version --verbose
+          zig version
+          cargo-zigbuild --version
+          syft version
+          goreleaser --version
+
+      - name: Build, sign, notarize and archive macOS targets
+        shell: bash
+        env:
+          PROXENOS_BUILD_GROUP: darwin
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+        run: |
+          set -euo pipefail
+          for credential in MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_ISSUER_ID MACOS_NOTARY_KEY_ID MACOS_NOTARY_KEY; do
+            if [ -z "${!credential}" ]; then
+              echo "::error::$credential is empty"
+              exit 1
+            fi
+          done
+          # Skip cosign (runs in the release job over the complete checksums.txt)
+          # and skip publish (the release job creates the draft GitHub release).
+          # GoReleaser's notarize stage remains enabled and runs on this macOS runner.
+          goreleaser release --clean --parallelism=1 --skip=publish,sign 2>&1 | tee "$RUNNER_TEMP/macos-release.log"
+
+      - name: Require Apple notarization acceptance for both macOS binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+
+          log = Path(os.environ["RUNNER_TEMP"], "macos-release.log").read_text()
+          log = re.sub(r"\x1b\[[0-9;]*m", "", log)
+          for target in ("proxenos-darwin_x86_64-apple-darwin", "proxenos-darwin_aarch64-apple-darwin"):
+              rel = Path("dist", target, "proxenos")
+              candidates = {str(rel), str(Path.cwd() / rel), str((Path.cwd() / rel).resolve())}
+              if not any(re.search(r"\bnotarized\s+binary=" + re.escape(c) + r"(?:\s|$)", log) for c in candidates):
+                  raise SystemExit(f"Missing Apple notarization acceptance for {rel}")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                  summary.write(f"Apple accepted notarization: `{rel}`\n\n")
+          PY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: macos-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/proxenos_${{ needs.check-tag.outputs.version }}_darwin_amd64.tar.gz
+            dist/proxenos_${{ needs.check-tag.outputs.version }}_darwin_amd64.tar.gz.sbom.json
+            dist/proxenos_${{ needs.check-tag.outputs.version }}_darwin_arm64.tar.gz
+            dist/proxenos_${{ needs.check-tag.outputs.version }}_darwin_arm64.tar.gz.sbom.json
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-macos:
+    name: Verify signed macOS archives
+    needs: [check-tag, macos]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.macos.outputs.artifact-id }}
+          path: ${{ runner.temp }}/macos-handoff
+
+      - name: Inspect archives and extract macOS binaries
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import tarfile
+
+          version = os.environ["RELEASE_VERSION"]
+          handoff = Path(os.environ["RUNNER_TEMP"], "macos-handoff")
+          out_root = Path(os.environ["RUNNER_TEMP"], "macos-verified")
+          expected = {
+              f"proxenos_{version}_darwin_amd64.tar.gz",
+              f"proxenos_{version}_darwin_amd64.tar.gz.sbom.json",
+              f"proxenos_{version}_darwin_arm64.tar.gz",
+              f"proxenos_{version}_darwin_arm64.tar.gz.sbom.json",
+          }
+          entries = {p.name for p in handoff.iterdir() if p.is_file() and not p.is_symlink()}
+          if entries != expected or len(list(handoff.iterdir())) != 4:
+              raise SystemExit(f"Unexpected macOS handoff entries: {sorted(entries)}")
+
+          max_member_bytes = 128 * 1024 * 1024
+          summary_lines = ["### macOS handoff SHA-256 evidence\n"]
+          for name in sorted(expected):
+              digest = hashlib.sha256((handoff / name).read_bytes()).hexdigest()
+              summary_lines.append(f"- `{name}`: `{digest}`")
+
+          for arch in ("amd64", "arm64"):
+              archive_path = handoff / f"proxenos_{version}_darwin_{arch}.tar.gz"
+              with tarfile.open(archive_path, "r:gz") as tf:
+                  members = tf.getmembers()
+                  names = [m.name for m in members]
+                  if sorted(names) != ["LICENSE", "NOTICE", "proxenos"] or len(names) != 3:
+                      raise SystemExit(f"{archive_path.name}: unexpected members {names}")
+                  for m in members:
+                      if not m.isfile() or m.size > max_member_bytes:
+                          raise SystemExit(f"{archive_path.name}: invalid member {m.name}")
+                  bin_member = tf.getmember("proxenos")
+                  f = tf.extractfile(bin_member)
+                  assert f is not None
+                  data = f.read(max_member_bytes + 1)
+                  if len(data) > max_member_bytes:
+                      raise SystemExit(f"{archive_path.name}: binary exceeds limit")
+              dest_dir = out_root / arch
+              dest_dir.mkdir(parents=True, mode=0o700)
+              dest_bin = dest_dir / "proxenos"
+              dest_bin.write_bytes(data)
+              os.chmod(dest_bin, 0o755)
+              summary_lines.append(f"- `{arch}/proxenos`: `{hashlib.sha256(data).hexdigest()}`")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(summary_lines) + "\n\n")
+          PY
+
+      - name: Verify signatures, notarization and arm64 execution
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          cd "$RUNNER_TEMP/macos-verified"
+          for arch in amd64 arm64; do
+            binary="./$arch/proxenos"
+            printf '\n### macOS %s\n\n```text\n' "$arch" >> "$GITHUB_STEP_SUMMARY"
+            codesign --verify --strict --verbose=2 "$binary" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+            codesign -dv --verbose=4 "$binary" 2>&1 | tee "$RUNNER_TEMP/macos-signature.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -Fx 'Authority=Developer ID Application: Mateusz Klatt (26MP7QQP95)' "$RUNNER_TEMP/macos-signature.txt"
+            grep -Fx 'TeamIdentifier=26MP7QQP95' "$RUNNER_TEMP/macos-signature.txt"
+            grep -E '^CodeDirectory .*flags=.*\(.*runtime.*\)' "$RUNNER_TEMP/macos-signature.txt"
+            grep -E '^Timestamp=.+$' "$RUNNER_TEMP/macos-signature.txt"
+            spctl -a -vvv -t install "$binary" 2>&1 | tee "$RUNNER_TEMP/macos-assessment.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -Fx "$binary: accepted" "$RUNNER_TEMP/macos-assessment.txt"
+            grep -Fx 'source=Notarized Developer ID' "$RUNNER_TEMP/macos-assessment.txt"
+            printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+          done
+          actual="$(./arm64/proxenos --version)"
+          test "$actual" = "proxenos $RELEASE_VERSION"
+          printf '\n### macOS arm64 execution\n\n```text\n%s\n```\n' "$actual" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Build Linux/Windows, sign, and create draft release
+    needs: [check-tag, signer, macos, verify-macos]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # create the draft GitHub release and upload assets
+      id-token: write # keyless cosign signing and build provenance attestation
+      attestations: write
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.signer.outputs.artifact-id }}
+          path: ${{ runner.temp }}/signer
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.macos.outputs.artifact-id }}
+          path: ${{ runner.temp }}/macos-dist
+
+      - name: Verify macOS handoff inventory
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          for f in \
+            "proxenos_${RELEASE_VERSION}_darwin_amd64.tar.gz" \
+            "proxenos_${RELEASE_VERSION}_darwin_amd64.tar.gz.sbom.json" \
+            "proxenos_${RELEASE_VERSION}_darwin_arm64.tar.gz" \
+            "proxenos_${RELEASE_VERSION}_darwin_arm64.tar.gz.sbom.json"; do
+            test -f "$RUNNER_TEMP/macos-dist/$f"
+          done
+          test "$(find "$RUNNER_TEMP/macos-dist" -maxdepth 1 -type f | wc -l)" -eq 4
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.1'
+          use-cache: false
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-zigbuild@0.24.1
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.20.0
+          install-only: true
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version --verbose
+          zig version
+          cargo-zigbuild --version
+          cosign version
+          syft version
+          goreleaser --version
+
+      - name: Build Linux/Windows, sign Windows & checksums, and create draft release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROXENOS_BUILD_GROUP: linux-windows
+          PROXENOS_MACOS_DIST: ${{ runner.temp }}/macos-dist
+          PROXENOS_WINDOWS_SIGNER: ${{ runner.temp }}/signer/ssign
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/certum-signing
+          CERTUM_EMAIL: ${{ secrets.CERTUM_EMAIL }}
+          CERTUM_OTP: ${{ secrets.CERTUM_OTP }}
+        run: goreleaser release --clean --parallelism=1
+
+      - name: Verify static Linux binaries and checksum count
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            bin="dist/proxenos_${target}/proxenos"
+            if readelf -l "$bin" | grep -q 'INTERP'; then
+              echo "::error::$bin is dynamically linked (PT_INTERP present)"
+              exit 1
+            fi
+          done
+          test "$(./dist/proxenos_x86_64-unknown-linux-musl/proxenos --version)" = "proxenos $RELEASE_VERSION"
+          test "$(wc -l < dist/checksums.txt | tr -d ' ')" -eq 12
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/checksums.txt
+
+      # Hand over the untouched signed Windows ZIPs and checksums.txt for
+      # native Authenticode verification on windows-latest.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: windows-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/proxenos_${{ needs.check-tag.outputs.version }}_windows_amd64.zip
+            dist/proxenos_${{ needs.check-tag.outputs.version }}_windows_arm64.zip
+            dist/checksums.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-windows:
+    name: Verify signed Windows archives
+    needs: [check-tag, release]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions: {}
+    env:
+      # Owner's Certum open-source code-signing certificate (valid until 2027-11-10).
+      # Update this pin in both release.yml and signing-proof.yml when renewed.
+      EXPECTED_SIGNER_THUMBPRINT: '9C837C68415187A72D88612BDF14FCB0D6623D67'
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.release.outputs.artifact-id }}
+          path: ${{ runner.temp }}/windows-handoff
+
+      - name: Verify archive checksums, contents and PE architectures
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $version = $env:RELEASE_VERSION
+          $handoff = Join-Path $env:RUNNER_TEMP 'windows-handoff'
+          $outRoot = Join-Path $env:RUNNER_TEMP 'windows-verified'
+          $expectedZips = [ordered]@{
+            amd64 = @{ Name = "proxenos_${version}_windows_amd64.zip"; Machine = [uint16]0x8664 }
+            arm64 = @{ Name = "proxenos_${version}_windows_arm64.zip"; Machine = [uint16]0xAA64 }
+          }
+          $expectedFiles = @('checksums.txt', $expectedZips['amd64'].Name, $expectedZips['arm64'].Name)
+
+          $items = @(Get-ChildItem -LiteralPath $handoff -Force)
+          if ($items.Count -ne 3) {
+            throw "Invalid Windows handoff file count: $($items.Count)"
+          }
+          foreach ($item in $items) {
+            if ($item.PSIsContainer -or $item.LinkType -or ($item.Name -cnotin $expectedFiles)) {
+              throw "Invalid Windows handoff entry: $($item.Name)"
+            }
+          }
+
+          $manifestPath = Join-Path $handoff 'checksums.txt'
+          $manifestBytes = [IO.File]::ReadAllBytes($manifestPath)
+          if ($manifestBytes.Length -gt 1048576) {
+            throw "checksums.txt exceeds size limit."
+          }
+          $hashes = @{}
+          foreach ($rawLine in ([Text.Encoding]::UTF8.GetString($manifestBytes).Trim() -split "`r?`n")) {
+            $fields = $rawLine.Trim() -split '\s+'
+            if ($fields.Count -ne 2 -or $fields[0] -notmatch '^[0-9a-fA-F]{64}$') {
+              throw "Malformed checksum manifest line."
+            }
+            if ($hashes.ContainsKey($fields[1])) {
+              throw "Duplicate checksum entry: $($fields[1])"
+            }
+            $hashes[$fields[1]] = $fields[0].ToLowerInvariant()
+          }
+
+          function Get-Sha256Hex([byte[]]$Data) {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+              return ([BitConverter]::ToString($sha.ComputeHash($Data)) -replace '-', '').ToLowerInvariant()
+            } finally {
+              $sha.Dispose()
+            }
+          }
+
+          $maxZipBytes = 128L * 1024L * 1024L
+          $maxMemberBytes = 128L * 1024L * 1024L
+          [long]$remaining = 256L * 1024L * 1024L
+
+          $summary = [Collections.Generic.List[string]]::new()
+          $summary.Add("### Windows handoff SHA-256 evidence`n")
+          $summary.Add("- ``checksums.txt``: ``$(Get-Sha256Hex $manifestBytes)``")
+
+          foreach ($arch in 'amd64', 'arm64') {
+            $zipName = $expectedZips[$arch].Name
+            $expectedMachine = $expectedZips[$arch].Machine
+            $zipPath = Join-Path $handoff $zipName
+            $zipInfo = Get-Item -LiteralPath $zipPath
+            if ($zipInfo.Length -gt $maxZipBytes) {
+              throw "${zipName}: exceeds size limit."
+            }
+            $zipBytes = [IO.File]::ReadAllBytes($zipPath)
+            $zipHash = Get-Sha256Hex $zipBytes
+            if (-not $hashes.ContainsKey($zipName) -or $hashes[$zipName] -ne $zipHash) {
+              throw "${zipName}: checksum mismatch against checksums.txt."
+            }
+            $summary.Add("- ``${zipName}``: ``${zipHash}``")
+
+            $exeBytes = $null
+            $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
+            try {
+              $entries = @($zip.Entries)
+              $names = @($entries | ForEach-Object { $_.FullName } | Sort-Object)
+              if ($entries.Count -ne 3 -or ($names -join ',') -cne 'LICENSE,NOTICE,proxenos.exe') {
+                throw "${zipName}: unexpected ZIP members ($($names -join ', '))."
+              }
+              foreach ($entry in $entries) {
+                if ($entry.FullName.EndsWith('/') -or $entry.Length -gt $maxMemberBytes -or $entry.Length -gt $remaining) {
+                  throw "${zipName}: invalid or oversized member $($entry.FullName)."
+                }
+                $limit = [Math]::Min($maxMemberBytes, $remaining)
+                $stream = $entry.Open()
+                $ms = [IO.MemoryStream]::new()
+                try {
+                  $buf = New-Object byte[] 65536
+                  [long]$total = 0
+                  while (($read = $stream.Read($buf, 0, $buf.Length)) -gt 0) {
+                    $total += $read
+                    if ($total -gt $limit) {
+                      throw "${zipName}: member $($entry.FullName) exceeded decompression bound."
+                    }
+                    $ms.Write($buf, 0, $read)
+                  }
+                  $data = $ms.ToArray()
+                } finally {
+                  $ms.Dispose()
+                  $stream.Dispose()
+                }
+                $remaining -= $data.LongLength
+                if ($entry.FullName -ceq 'proxenos.exe') {
+                  $exeBytes = $data
+                }
+              }
+            } finally {
+              $zip.Dispose()
+            }
+
+            if ($null -eq $exeBytes -or $exeBytes.Length -lt 0x40 -or $exeBytes[0] -ne 0x4D -or $exeBytes[1] -ne 0x5A) {
+              throw "${zipName}: invalid PE header."
+            }
+            $peOffset = [BitConverter]::ToUInt32($exeBytes, 0x3C)
+            if (($peOffset + 6) -gt $exeBytes.Length -or
+                $exeBytes[$peOffset] -ne 0x50 -or $exeBytes[$peOffset + 1] -ne 0x45 -or
+                $exeBytes[$peOffset + 2] -ne 0 -or $exeBytes[$peOffset + 3] -ne 0) {
+              throw "${zipName}: missing PE signature."
+            }
+            $machine = [BitConverter]::ToUInt16($exeBytes, [int]($peOffset + 4))
+            if ($machine -ne $expectedMachine) {
+              throw ("${zipName}: wrong PE machine 0x{0:x4}, expected 0x{1:x4}." -f $machine, $expectedMachine)
+            }
+
+            $destDir = Join-Path $outRoot $arch
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+            [IO.File]::WriteAllBytes((Join-Path $destDir 'proxenos.exe'), $exeBytes)
+            $summary.Add("- ``${arch}/proxenos.exe``: ``$(Get-Sha256Hex $exeBytes)``")
+          }
+
+          ($summary -join "`n") + "`n" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Verify both Authenticode signatures and amd64 execution
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "Windows SDK signtool.exe was not found." }
+          foreach ($arch in 'amd64', 'arm64') {
+            $file = Join-Path $env:RUNNER_TEMP "windows-verified/$arch/proxenos.exe"
+            & $signtool verify /pa /all /v /tw $file
+            if ($LASTEXITCODE -ne 0) { throw "signtool verification failed for $arch (exit $LASTEXITCODE)." }
+            $signature = Get-AuthenticodeSignature -FilePath $file
+            if ($signature.Status -ne 'Valid' -or
+                $null -eq $signature.TimeStamperCertificate -or
+                $signature.SignerCertificate.Thumbprint -ne $env:EXPECTED_SIGNER_THUMBPRINT) {
+              throw "Authenticode verification failed for ${arch}: expected a valid, timestamped signature from the pinned certificate."
+            }
+            "${arch}: valid timestamped signature; signer $($signature.SignerCertificate.Thumbprint); timestamp signer $($signature.TimeStamperCertificate.Subject)" >> $env:GITHUB_STEP_SUMMARY
+          }
+          $actual = (& (Join-Path $env:RUNNER_TEMP "windows-verified/amd64/proxenos.exe") --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne "proxenos $env:RELEASE_VERSION") {
+            throw "Unexpected Windows amd64 version output: $actual"
+          }
+          "amd64 execution: ``$actual``" >> $env:GITHUB_STEP_SUMMARY

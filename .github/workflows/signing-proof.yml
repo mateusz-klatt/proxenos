@@ -1,0 +1,218 @@
+name: Windows signing proof
+
+# Manual proof for Certum cloud Authenticode signing on throwaway Windows Rust
+# builds. Runs only on workflow_dispatch on main, uploads signed executables as
+# a 1-day artifact for verification, and never creates or publishes a release.
+# Each run consumes two Certum signatures (one per Windows architecture).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: certum-signing
+  cancel-in-progress: false
+
+jobs:
+  signer:
+    name: Build pinned Certum signer
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Le-Syl21/ssign
+          ref: f7ba7b2360a3e40bb8aa062d244d95c62a743b90 # v0.1.8, MIT
+          path: ssign
+          persist-credentials: false
+
+      - name: Build ssign without credentials
+        working-directory: ssign
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal
+          cargo +1.99.1 build --release --locked
+          sha256sum target/release/ssign >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: certum-signer-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ssign/target/release/ssign
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Build and sign throwaway Windows binaries
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    needs: signer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.signer.outputs.artifact-id }}
+          path: ${{ runner.temp }}/signer
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.1'
+          use-cache: false
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-zigbuild@0.24.1
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version --verbose
+          zig version
+          cargo-zigbuild --version
+
+      - name: Cross-build two disposable Windows release binaries
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS: -C link-arg=-lunwind
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm
+          cargo zigbuild --release --locked --target x86_64-pc-windows-gnu
+          cargo zigbuild --release --locked --target aarch64-pc-windows-gnullvm
+          mkdir -p "$RUNNER_TEMP/windows/amd64" "$RUNNER_TEMP/windows/arm64"
+          cp target/x86_64-pc-windows-gnu/release/proxenos.exe "$RUNNER_TEMP/windows/amd64/proxenos.exe"
+          cp target/aarch64-pc-windows-gnullvm/release/proxenos.exe "$RUNNER_TEMP/windows/arm64/proxenos.exe"
+
+      - name: Sign each binary once in a separate ssign process
+        shell: bash
+        env:
+          CERTUM_EMAIL: ${{ secrets.CERTUM_EMAIL }}
+          CERTUM_OTP: ${{ secrets.CERTUM_OTP }}
+          PROXENOS_WINDOWS_SIGNER: ${{ runner.temp }}/signer/ssign
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/certum-signing
+        # Runs ssign twice in separate processes (matching GoReleaser's serial
+        # post-build hooks) with only the five allowlisted environment variables
+        # and suppressed stdio. ssign caches its OAuth session under
+        # $XDG_RUNTIME_DIR/ssign on this ephemeral runner.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import stat
+          import subprocess
+          import sys
+
+          signer = os.environ.get("PROXENOS_WINDOWS_SIGNER", "")
+          runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
+          if not (os.path.isabs(signer) and os.path.isabs(runtime_dir) and os.environ.get("CERTUM_EMAIL") and os.environ.get("CERTUM_OTP")):
+              sys.exit("Windows signing configuration is incomplete")
+          if os.path.islink(signer) or not stat.S_ISREG(os.stat(signer).st_mode):
+              sys.exit("Windows signer executable is unavailable")
+          os.chmod(signer, 0o700)
+          cache_dir = os.path.join(runtime_dir, "ssign")
+          os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+          os.chmod(cache_dir, 0o700)
+          env = {k: os.environ.get(k, "") for k in ("CERTUM_EMAIL", "CERTUM_OTP", "XDG_RUNTIME_DIR", "HOME", "PATH")}
+
+          for arch in ("amd64", "arm64"):
+              path = os.path.join(os.environ["RUNNER_TEMP"], "windows", arch, "proxenos.exe")
+              if os.path.islink(path) or not stat.S_ISREG(os.stat(path).st_mode):
+                  sys.exit(f"Windows binary missing for {arch}")
+              try:
+                  res = subprocess.run([signer, path], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+              except subprocess.TimeoutExpired:
+                  sys.exit(f"Windows signing deadline exceeded for {arch}")
+              if res.returncode != 0:
+                  sys.exit(f"Windows signing failed for {arch}")
+          PY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: signed-windows-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/windows/amd64/proxenos.exe
+            ${{ runner.temp }}/windows/arm64/proxenos.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    name: Verify signed Windows proof binaries
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    needs: sign
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions: {}
+    env:
+      # Owner's Certum open-source code-signing certificate (valid until 2027-11-10).
+      # Update this pin in both release.yml and signing-proof.yml when renewed.
+      EXPECTED_SIGNER_THUMBPRINT: '9C837C68415187A72D88612BDF14FCB0D6623D67'
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.sign.outputs.artifact-id }}
+          path: ${{ runner.temp }}/windows
+
+      - name: Verify both signatures and amd64 execution on Windows
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows'
+          $expected = 'amd64/proxenos.exe', 'arm64/proxenos.exe'
+          $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
+            [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
+          })
+          if ($files.Count -ne 2 -or @($files | Where-Object { $_ -cnotin $expected }).Count -ne 0) {
+            throw "Signing proof artifact must contain only amd64/proxenos.exe and arm64/proxenos.exe."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_SIGNER_THUMBPRINT)) {
+            foreach ($arch in 'amd64', 'arm64') {
+              $signature = Get-AuthenticodeSignature -FilePath (Join-Path $root "$arch/proxenos.exe")
+              [pscustomobject]@{
+                Subject = $signature.SignerCertificate.Subject
+                Issuer = $signature.SignerCertificate.Issuer
+                Thumbprint = $signature.SignerCertificate.Thumbprint
+                NotBefore = $signature.SignerCertificate.NotBefore
+                NotAfter = $signature.SignerCertificate.NotAfter
+                TimeStamperSubject = $signature.TimeStamperCertificate.Subject
+              } | Format-List | Out-Host
+            }
+            throw "Confirm the public certificate above and pin its Thumbprint in EXPECTED_SIGNER_THUMBPRINT."
+          }
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "Windows SDK signtool.exe was not found." }
+          foreach ($arch in 'amd64', 'arm64') {
+            $file = Join-Path $root "$arch/proxenos.exe"
+            & $signtool verify /pa /all /v /tw $file
+            if ($LASTEXITCODE -ne 0) { throw "signtool verification failed for $arch (exit $LASTEXITCODE)." }
+            $signature = Get-AuthenticodeSignature -FilePath $file
+            if ($signature.Status -ne 'Valid' -or
+                $null -eq $signature.TimeStamperCertificate -or
+                $signature.SignerCertificate.Thumbprint -ne $env:EXPECTED_SIGNER_THUMBPRINT) {
+              throw "Authenticode verification failed for ${arch}: expected a valid, timestamped signature from the pinned certificate."
+            }
+            "${arch}: valid timestamped signature; signer $($signature.SignerCertificate.Thumbprint); timestamp signer $($signature.TimeStamperCertificate.Subject)" >> $env:GITHUB_STEP_SUMMARY
+          }
+          $actual = (& (Join-Path $root "amd64/proxenos.exe") --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^proxenos ') {
+            throw "Unexpected Windows amd64 version output: $actual"
+          }
+          "amd64 execution: ``$actual``" >> $env:GITHUB_STEP_SUMMARY

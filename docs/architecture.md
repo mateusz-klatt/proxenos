@@ -274,13 +274,75 @@ entries it wrote, refuses to take over one it did not, and keeps a record of wha
 
 ### D11. Releases are built and signed as Iris's are
 
-Six targets: Linux, macOS and Windows on x86-64 and arm64, with the Linux binaries linked
-statically. GoReleaser builds them with its Rust builder. Windows binaries are signed with the
-Certum certificate, macOS binaries with a Developer ID and notarized, the checksums with keyless
-cosign, and each archive has an SBOM. A tag produces a draft that the owner publishes. Proxenos
-never updates itself.
+Six targets: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (statically linked),
+`x86_64-apple-darwin` and `aarch64-apple-darwin`, and `x86_64-pc-windows-gnu` and
+`aarch64-pc-windows-gnullvm`. GoReleaser v2.20.0 builds them with its Rust builder
+(`cargo zigbuild --release --locked`, without `--features test-tools`, using pinned Zig and
+`cargo-zigbuild`). `Cargo.toml` strips release symbols and enables thin LTO while keeping
+`panic = "unwind"`, so handler panic catching (D4) stays intact. On `aarch64-pc-windows-gnullvm`,
+`libunwind` is linked explicitly for that unwind runtime. Each archive holds `proxenos` (or
+`proxenos.exe`), `LICENSE` and `NOTICE` with fixed `root:root` ownership and the commit timestamp,
+and gets an SPDX JSON SBOM from Syft.
 
-Not measured: any of this for Proxenos. The cross-builds are the first thing to try.
+The release workflow (`.github/workflows/release.yml`) splits the build across runners by
+`PROXENOS_BUILD_GROUP` and keeps credentials and write permissions separated by job:
+
+- **Tag check (`check-tag`, `ubuntu-latest`, `contents: read`)**: on a pushed `v*` tag in
+  `mateusz-klatt/proxenos`, checks that `Cargo.toml`'s package version matches the tag before any
+  build or signing runs.
+- **Certum signer (`signer`, `ubuntu-latest`, `contents: read`)**: builds pinned `Le-Syl21/ssign`
+  from source with `--locked` and no credentials, recording its SHA-256.
+- **macOS build, sign and notarize (`macos`, `macos-latest`, `contents: read`)**: builds both
+  darwin targets on macOS, signs with the Developer ID certificate and notarizes with Apple via
+  GoReleaser's `notarize.macos` stage, checks that Apple accepted both binaries in the log, and
+  archives and catalogs them with Syft. Only this job receives the `MACOS_*` secrets.
+- **macOS verification (`verify-macos`, `macos-latest`, no permissions, no secrets)**: extracts
+  both darwin archives, verifies both binaries with `codesign` and `spctl` against the pinned
+  Developer ID identity, and runs the arm64 binary with `--version`.
+- **Linux/Windows build, signing and draft release (`release`, `ubuntu-latest`, `contents: write`,
+  `id-token: write`, `attestations: write`)**: runs only after `verify-macos` passes. It builds
+  both static Linux musl binaries and both Windows binaries, signs each Windows executable in a
+  post-build hook through `ssign` with a five-variable environment allowlist, suppressed stdio and
+  a five-minute timeout, packages and catalogs them, folds the verified macOS archives and SBOMs
+  into one `checksums.txt`, signs `checksums.txt` with keyless cosign, records GitHub build
+  provenance, and creates a **draft** GitHub release (14 assets: 6 archives, 6 SBOMs,
+  `checksums.txt` and `checksums.txt.sigstore.json`) for the owner to publish. Only this job
+  receives `CERTUM_*` secrets, `contents: write` or `id-token: write`.
+- **Windows verification (`verify-windows`, `windows-latest`, no permissions, no secrets)**: checks
+  both Windows ZIPs against `checksums.txt`, verifies archive members and PE machine types, checks
+  both timestamped Authenticode signatures with `signtool` and `Get-AuthenticodeSignature` against
+  the pinned Certum certificate thumbprint, and runs the amd64 binary with `--version`.
+
+Pull requests touching the release files and manual `workflow_dispatch` runs of `release.yml`
+exercise the six-target snapshot path across `macos-latest` and `ubuntu-latest` with no secrets
+and read-only permissions, checking static ELF linking, Mach-O and PE architectures, archive
+members, SBOMs and the 12-subject `checksums.txt`. Two manual-only signing-proof workflows
+(`.github/workflows/signing-proof.yml` for Windows/Certum and
+`.github/workflows/macos-signing-proof.yml` for macOS) run only on `workflow_dispatch` on `main`,
+sign throwaway builds, verify them natively, retain artifacts for one day, and never publish.
+Proxenos never updates itself.
+
+What this cannot do:
+
+- Pushing a `v*` tag has no workflow approval gate; repository secrets are available to workflows
+  on trusted repository refs, and the tag, workflow logs, Rekor entries, provenance attestations
+  and one-day handoff artifacts can be public before the owner publishes the draft.
+- Restricting `ssign`'s child environment to five variables filters environment variables on a
+  shared runner; it is not a process sandbox.
+- Native signature verification checks valid signatures from the pinned identities; it does not
+  establish Windows SmartScreen reputation, quarantined browser startup under macOS Gatekeeper, or
+  execution of the Windows arm64 or macOS x86-64 binaries on runners of the other architecture.
+
+Measured locally on 2026-11-25 on Linux x86-64: `actionlint` passed on the three release and
+signing-proof workflows, `goreleaser check` validated `.goreleaser.yaml`, and local GoReleaser
+snapshots with Zig 0.17.1 and `cargo-zigbuild` 0.24.1 built the four Linux musl and Windows
+targets, confirmed static ELF output (no `PT_INTERP`) and standard Windows UCRT DLL imports, and
+ran the Linux x86-64 binary.
+
+Not measured: the CI snapshot cross-builds (`snapshot-darwin` and `snapshot-linux-windows`), both
+macOS targets, Syft SBOMs, keyless cosign, GitHub build provenance, both signing-proof workflows,
+a real `v*` tag draft release, quarantined macOS Gatekeeper startup, and Windows SmartScreen. The
+CI snapshot job is the first thing to run.
 
 ### D12. Every line is tested, through the binary
 
