@@ -8,6 +8,16 @@ license = "Apache-2.0"
 repository = "https://github.com/mateusz-klatt/proxenos"
 publish = false
 
+[dependencies]
+rmcp = { version = "=3.11.0", default-features = false, features = ["server", "transport-io"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["io-std", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7.20"
+
+[features]
+# Extra tools that exist only to test the MCP layer through the compiled binary.
+test-tools = []
+
 [lints.rust]
 unsafe_code = "deny"
 

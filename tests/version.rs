@@ -23,7 +23,15 @@ fn version_prints_the_package_version_on_stdout() {
 
 #[test]
 fn anything_else_is_a_usage_error_and_leaves_stdout_empty() {
-    let cases: [&[&str]; 3] = [&[], &["mcp"], &["--version", "extra"]];
+    let cases: [&[&str]; 7] = [
+        &[],
+        &["mcp"],
+        &["--version", "extra"],
+        &["mcp", "--client"],
+        &["mcp", "--client", "nobody"],
+        &["mcp", "--client", "claude", "extra"],
+        &["mcp", "claude"],
+    ];
 
     for args in cases {
         let output = proxenos().args(args).output().expect("the binary runs");

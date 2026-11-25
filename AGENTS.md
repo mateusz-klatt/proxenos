@@ -20,7 +20,8 @@ direction goes in `docs/adr/`.
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo llvm-cov --locked --fail-under-lines 100   # runs the tests; needs cargo-llvm-cov 0.9.2
+cargo clippy --all-targets --locked --features test-tools -- -D warnings
+cargo llvm-cov --locked --features test-tools --fail-under-lines 100   # runs the tests; needs cargo-llvm-cov 0.9.2
 ```
 
 ## Rules for code

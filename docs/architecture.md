@@ -5,7 +5,8 @@ what was measured, and what is still unknown. A decision here stands until a rec
 changes it. [ADR 001](adr/001-decisions-by-the-families-that-can-answer.md) says how decisions are
 taken, and [votes.md](votes.md) records who proposed and who supported each one.
 
-**Status: design.** Apart from the crate skeleton, nothing below is built yet. Sentences in the
+**Status: milestone 1 in progress.** Built so far: the MCP layer of D4, served by
+`proxenos mcp --client <client>` with no provider yet. Nothing else below is built. Sentences in the
 present tense describe the design, not a running program.
 
 ## 1. Terms
@@ -264,6 +265,9 @@ Not measured: any of this for Proxenos. The cross-builds are the first thing to 
 - Line coverage is 100% on each platform for the code that platform compiles, enforced in CI.
 - Behavioural tests start the compiled binary and speak MCP to it. Providers run against a stub
   CLI built from this crate, which records what it was started with.
+- Tools that exist only to test the MCP layer, such as one that panics, are compiled in only with
+  the `test-tools` feature. CI lints with and without it and measures coverage with it; a release
+  is built without it.
 - During the migration, the same scenarios are replayed against claude-delegator 3.5.0 and the
   results compared, apart from a short list of intended differences.
 - No test starts a real agent CLI or spends a model call.
