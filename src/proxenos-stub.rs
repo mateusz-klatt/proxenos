@@ -25,6 +25,7 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
             "flood" => io::stdout().write_all(&vec![0xff; value.parse()?])?,
             "flood-err" => io::stderr().write_all(&vec![0xfe; value.parse()?])?,
             "sleep" => thread::sleep(Duration::from_millis(value.parse()?)),
+            "burn" => burn_cpu(value.parse()?),
             "close-output" => platform::close_output()?,
             "stdin" => {
                 let count = io::copy(&mut io::stdin().lock(), &mut io::sink())?;
@@ -125,12 +126,15 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
         std::hint::black_box(&held_memory);
     }
     if let Some(ms) = step["burn_cpu_ms"].as_u64() {
-        let until = Instant::now() + Duration::from_millis(ms);
-        let mut acc = 0_u64;
-        while Instant::now() < until {
-            acc = acc.wrapping_add(1);
-        }
-        std::hint::black_box(acc);
+        burn_cpu(ms);
+    }
+    if let Some(ms) = step["child_burn_cpu_ms"].as_u64() {
+        let mut child = Command::new(std::env::current_exe()?);
+        child
+            .env_remove("PROXENOS_STUB_DIR")
+            .arg(format!("burn:{ms}"));
+        let status = child.status()?;
+        status.success().then_some(()).ok_or("child burn failed")?;
     }
     if let Some(message) = step["final_message"].as_str() {
         let pos = args
@@ -187,6 +191,15 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
     ));
     std::hint::black_box(&held_memory);
     Ok(ExitCode::from(step["code"].as_u64().unwrap_or(0) as u8))
+}
+
+fn burn_cpu(ms: u64) {
+    let until = Instant::now() + Duration::from_millis(ms);
+    let mut acc = 0_u64;
+    while Instant::now() < until {
+        acc = acc.wrapping_add(1);
+    }
+    std::hint::black_box(acc);
 }
 
 fn hold_lock(path: &str) -> io::Result<()> {

@@ -61,11 +61,13 @@ fn wait_false_await_before_and_after_completion_and_cancel() {
 
     let mut server = fleet.server("claude");
 
-    // Validation errors on await and cancel.
+    // Validation errors on await and cancel, including the 16-handle cap (P2 #7).
+    let too_many_handles: Vec<String> = (0..17).map(|i| format!("h-{i}")).collect();
     for bad in [
         json!({}),
         json!({"handles": []}),
         json!({"handles": [""]}),
+        json!({"handles": too_many_handles}),
         json!({"handles": ["ok"], "condition": "first"}),
         json!({"handles": ["ok"], "extra": true}),
     ] {
@@ -156,8 +158,15 @@ fn wait_false_await_before_and_after_completion_and_cancel() {
         "session"
     );
 
-    // Reading a result does not consume it, and cancel on a finished handle leaves it finished.
-    let (again, _) = raw_call(&mut server, 15, "await", json!({"handles": [handle_a]}));
+    // Reading a result does not consume it, duplicate handles are deduplicated (P2 #7),
+    // and cancel on a finished handle leaves it finished.
+    let (again, _) = raw_call(
+        &mut server,
+        15,
+        "await",
+        json!({"handles": [handle_a, handle_a]}),
+    );
+    assert_eq!(again["results"].as_array().unwrap().len(), 1, "{again}");
     assert_eq!(again["results"][0]["state"], "finished");
     assert_eq!(
         again["results"][0]["result"]["reported"]["content"],
@@ -427,4 +436,144 @@ fn retained_background_results_are_bounded_and_evict_the_oldest() {
     assert_eq!(checked["results"][0]["state"], "unknown");
     assert_eq!(checked["results"][1]["state"], "finished");
     assert_eq!(checked["results"][2]["state"], "finished");
+}
+
+#[test]
+fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
+    let fleet = Fleet::new(&["agy"]);
+    fleet.script("agy", json!([turn("ok1"), turn("ok2"), turn("ok3")]));
+    let mut server = fleet.server("claude");
+
+    let (started, is_error) = raw_call(&mut server, 1, "test_panic", json!({"background": true}));
+    assert!(!is_error, "{started}");
+    let handle = started["handle"].as_str().unwrap().to_owned();
+
+    let (awaited, is_error) = raw_call(
+        &mut server,
+        2,
+        "await",
+        json!({"handles": [handle], "condition": "all"}),
+    );
+    assert!(!is_error, "{awaited}");
+    assert_eq!(awaited["satisfied"], true);
+    assert_eq!(awaited["results"][0]["state"], "failed", "{awaited}");
+    assert_eq!(
+        awaited["results"][0]["result"]["observed"]["failure"]["kind"], "unknown",
+        "{awaited}"
+    );
+    assert!(
+        awaited["results"][0]["result"]["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed unexpectedly"),
+        "{awaited}"
+    );
+
+    // Server remains healthy and all 3 concurrency slots are available.
+    assert_eq!(
+        text(&server.call(3, "test_echo", json!({"alive": true}))),
+        r#"{"alive":true}"#
+    );
+    let mut handles = Vec::new();
+    for i in 0..3 {
+        let (bg, is_error) = raw_call(
+            &mut server,
+            10 + i,
+            "antigravity",
+            json!({"prompt": format!("after panic {i}"), "wait": false}),
+        );
+        assert!(!is_error, "{bg}");
+        handles.push(bg["handle"].as_str().unwrap().to_owned());
+    }
+    let (done, _) = raw_call(
+        &mut server,
+        20,
+        "await",
+        json!({"handles": handles, "condition": "all"}),
+    );
+    assert_eq!(done["satisfied"], true);
+    assert!(
+        done["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["state"] == "finished"),
+        "{done}"
+    );
+}
+
+#[test]
+fn cancelled_or_expired_wait_false_request_does_not_spawn_background_delegation() {
+    const CODEX_FINISHED: &str = include_str!("../fixtures/codex/finished.jsonl");
+    const CODEX_THREAD: &str = "eeb3a731-d53a-4444-8a6a-4d9d89e76073";
+
+    let fleet = Fleet::new(&["codex"]);
+    fleet.script("codex", json!([{"stdout": CODEX_FINISHED}]));
+    let mut seed = fleet.server("claude");
+    assert_eq!(
+        call(&mut seed, "codex", json!({"prompt": "seed"}))["observed"]["state"],
+        "finished"
+    );
+    assert!(seed.finish().0.success());
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let provider_dir = fleet.root.join(".local/state/proxenos/sessions/codex");
+    #[cfg(target_os = "macos")]
+    let provider_dir = fleet
+        .root
+        .join("Library/Application Support/proxenos/sessions/codex");
+    #[cfg(windows)]
+    let provider_dir = fleet.root.join("proxenos/sessions/codex");
+
+    let session_file = fs::read_dir(&provider_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(session_file.with_extension("lock"))
+        .unwrap();
+    lock.lock().unwrap();
+
+    let mut server = fleet.server("claude");
+    let before = fleet.records().len();
+    let timed = call(
+        &mut server,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "expired wait false",
+            "wait": false,
+            "timeout_ms": 150
+        }),
+    );
+    assert_eq!(timed["observed"]["failure"]["kind"], "timeout", "{timed}");
+
+    server.start_call(
+        50,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "cancelled wait false",
+            "wait": false
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    server.close_input();
+    let cancelled: Value = serde_json::from_str(text(&server.response(50))).unwrap();
+    assert_eq!(cancelled["observed"]["state"], "cancelled", "{cancelled}");
+    assert_eq!(
+        cancelled["observed"]["failure"]["kind"], "cancellation",
+        "{cancelled}"
+    );
+    assert_eq!(
+        fleet.records().len(),
+        before,
+        "cancelled/expired wait:false must not spawn a provider"
+    );
+
+    drop(lock);
+    assert!(server.finish().0.success());
 }

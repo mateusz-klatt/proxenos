@@ -20,10 +20,11 @@ use tokio::sync::oneshot;
 use super::session;
 use crate::mcp::Activity;
 use crate::supervise::cleanup::{TemporaryFile, remove_files_blocking};
-use crate::supervise::{Accounting, StartError, finish_reap};
+use crate::supervise::{Accounting, Ending, StartError, finish_reap};
 
 const GRACE: Duration = Duration::from_secs(3);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_TRACKED_PIDS: usize = 4096;
 static SPAWNING: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "linux")]
@@ -31,10 +32,26 @@ const METHOD: &str = "linux_proc_group_sample";
 #[cfg(target_os = "macos")]
 const METHOD: &str = "macos_proc_group_sample";
 
+#[cfg(target_os = "linux")]
 const CAVEATS: &[&str] = &[
     "Values come from periodic samples of the supervised process group; sampling can miss brief peaks, short-lived children, and descendants that leave the process group.",
+    "At most 4096 members of the process group are tracked per sample.",
+    "Summed RSS across group members double-counts pages shared between processes.",
     "A memory limit is a sampled threshold that triggers a D6 stop, not a hard allocation ceiling.",
 ];
+
+#[cfg(target_os = "macos")]
+const CAVEATS: &[&str] = &[
+    "Values come from periodic samples of the supervised process group; sampling can miss brief peaks, short-lived children, and descendants that leave the process group.",
+    "Only the first 4096 members of the process group are sampled.",
+    "Summed RSS across group members double-counts pages shared between processes.",
+    "A memory limit is a sampled threshold that triggers a D6 stop, not a hard allocation ceiling.",
+];
+
+pub fn current_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments and always succeeds.
+    unsafe { libc::geteuid() }
+}
 
 pub fn empty_accounting(memory_limit_bytes: Option<u64>) -> Accounting {
     Accounting {
@@ -52,7 +69,9 @@ struct UnixAccounting {
     memory_limit_bytes: Option<u64>,
     samples: u64,
     peak_memory_bytes: Option<u64>,
-    cpu_ms_by_pid: HashMap<libc::pid_t, u64>,
+    exited_cpu_ms: u64,
+    active_cpu_ms: HashMap<libc::pid_t, u64>,
+    seen_cpu: bool,
     memory_limit_exceeded: bool,
 }
 
@@ -62,7 +81,9 @@ impl UnixAccounting {
             memory_limit_bytes,
             samples: 0,
             peak_memory_bytes: None,
-            cpu_ms_by_pid: HashMap::new(),
+            exited_cpu_ms: 0,
+            active_cpu_ms: HashMap::new(),
+            seen_cpu: false,
             memory_limit_exceeded: false,
         }
     }
@@ -70,10 +91,22 @@ impl UnixAccounting {
     fn record(&mut self, rows: Vec<(libc::pid_t, u64, u64)>, check_limit: bool) -> bool {
         self.samples += 1;
         let mut rss = 0_u64;
-        for &(pid, mem, cpu_ms) in &rows {
+        let mut next_active = HashMap::with_capacity(rows.len().min(MAX_TRACKED_PIDS));
+        for &(pid, mem, cpu_ms) in rows.iter().take(MAX_TRACKED_PIDS) {
             rss = rss.saturating_add(mem);
-            self.cpu_ms_by_pid.insert(pid, cpu_ms);
+            if let Some(previous) = self.active_cpu_ms.remove(&pid) {
+                // If a PID was recycled between consecutive samples, fold the prior process's CPU.
+                self.exited_cpu_ms = self
+                    .exited_cpu_ms
+                    .saturating_add(previous * u64::from(cpu_ms < previous));
+            }
+            next_active.insert(pid, cpu_ms);
         }
+        for previous in self.active_cpu_ms.values() {
+            self.exited_cpu_ms = self.exited_cpu_ms.saturating_add(*previous);
+        }
+        self.active_cpu_ms = next_active;
+        self.seen_cpu |= !rows.is_empty();
         self.peak_memory_bytes = (!rows.is_empty())
             .then(|| self.peak_memory_bytes.unwrap_or(0).max(rss))
             .or(self.peak_memory_bytes);
@@ -83,10 +116,10 @@ impl UnixAccounting {
     }
 
     fn snapshot(&self) -> Accounting {
-        let cpu_time_ms = (!self.cpu_ms_by_pid.is_empty()).then(|| {
-            self.cpu_ms_by_pid
+        let cpu_time_ms = self.seen_cpu.then(|| {
+            self.active_cpu_ms
                 .values()
-                .fold(0_u64, |acc, &ms| acc.saturating_add(ms))
+                .fold(self.exited_cpu_ms, |acc, &ms| acc.saturating_add(ms))
         });
         Accounting {
             method: METHOD,
@@ -194,31 +227,28 @@ pub fn spawn(
 impl Child {
     /// Observe exit without reaping so that the final group signal still targets our group,
     /// while periodically sampling the supervised process group for D18.
-    pub async fn wait_for_exit(&mut self) -> io::Result<()> {
-        {
-            let pid = self.pid;
-            let accounting = Arc::clone(&self.accounting);
-            let mut exit = pin!(async {
-                while !self.exited()? {
-                    self.changes.recv().await;
-                }
-                Ok::<(), io::Error>(())
-            });
-            let mut monitor = pin!(async move {
-                loop {
-                    if sample_once(pid, &accounting, true).await {
-                        return;
-                    }
-                    tokio::time::sleep(SAMPLE_INTERVAL).await;
-                }
-            });
-            tokio::select! {
-                biased;
-                result = &mut exit => return result,
-                () = &mut monitor => (),
+    pub async fn wait_for_exit(&mut self) -> io::Result<Ending> {
+        let pid = self.pid;
+        let accounting = Arc::clone(&self.accounting);
+        let mut exit = pin!(async {
+            while !self.exited()? {
+                self.changes.recv().await;
             }
+            Ok::<Ending, io::Error>(Ending::Exited)
+        });
+        let mut monitor = pin!(async move {
+            loop {
+                if sample_once(pid, &accounting, true).await {
+                    return Ending::MemoryLimit;
+                }
+                tokio::time::sleep(SAMPLE_INTERVAL).await;
+            }
+        });
+        tokio::select! {
+            biased;
+            result = &mut exit => result,
+            ending = &mut monitor => Ok(ending),
         }
-        self.stop().await
     }
 
     fn exited(&self) -> io::Result<bool> {
@@ -270,17 +300,21 @@ impl Child {
             .expect("reaper waits for this leader");
     }
 
-    pub async fn finish(mut self) -> io::Result<(ExitStatus, Accounting)> {
-        let _ = sample_once(self.pid, &self.accounting, false).await;
+    async fn reap(&mut self) -> io::Result<ExitStatus> {
         self.signal(libc::SIGKILL)?;
         self.release();
-        let status = finish_reap(&mut self.status, &mut self.cleaned).await?;
+        finish_reap(&mut self.status, &mut self.cleaned).await
+    }
+
+    pub async fn finish(mut self) -> (io::Result<ExitStatus>, Accounting) {
+        let _ = sample_once(self.pid, &self.accounting, false).await;
+        let status = self.reap().await;
         let accounting = self
             .accounting
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .snapshot();
-        Ok((status, accounting))
+        (status, accounting)
     }
 }
 

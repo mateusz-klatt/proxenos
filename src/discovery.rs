@@ -285,7 +285,7 @@ async fn probe(
         {
             Ok(())
         }
-        Ending::Exited => {
+        _ => {
             let detail = if outcome.stderr.bytes.is_empty() {
                 &outcome.stdout.bytes
             } else {

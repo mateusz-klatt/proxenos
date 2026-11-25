@@ -59,6 +59,7 @@ fn reply_after_server_restart_uses_persisted_file_and_stores_no_secrets() {
         "codex",
         json!([
             {"stdout": CODEX_FINISHED, "final_message": "SECRET_ANSWER_MARKER"},
+            {"stdout": CODEX_FINISHED},
             {"stdout": CODEX_FINISHED}
         ]),
     );
@@ -174,7 +175,7 @@ fn reply_after_server_restart_uses_persisted_file_and_stores_no_secrets() {
         fs::canonicalize(&cwd).unwrap()
     );
 
-    // An expired session file is treated as unremembered and cleaned up on a fresh server.
+    // An expired session file is treated as unremembered and NOT deleted during load (P2 #8).
     let mut expired = parsed;
     expired["saved_at_epoch_s"] = json!(1);
     fs::write(&session_file, expired.to_string()).unwrap();
@@ -194,7 +195,23 @@ fn reply_after_server_restart_uses_persisted_file_and_stores_no_secrets() {
             .unwrap()
             .contains("no settings")
     );
-    assert!(!session_file.exists());
+    assert!(
+        session_file.exists(),
+        "load must not delete expired session files"
+    );
+
+    // A fresh confirmed start cleanly replaces the expired file under the save lock.
+    let refreshed = call(
+        &mut server3,
+        "codex",
+        json!({"prompt": "refresh expired", "model": "refreshed-model"}),
+    );
+    assert_eq!(refreshed["observed"]["state"], "finished", "{refreshed}");
+    let refreshed_json: Value =
+        serde_json::from_str(&fs::read_to_string(&session_file).unwrap()).unwrap();
+    assert_eq!(refreshed_json["ambiguous"], false);
+    assert_eq!(refreshed_json["settings"]["model"], "refreshed-model");
+    assert!(refreshed_json["saved_at_epoch_s"].as_u64().unwrap() > 1);
 }
 
 #[test]
@@ -391,9 +408,12 @@ fn d19_no_model_rule_handles_every_branch_across_restarts() {
         "reported-start",
         "unreported-start",
         "unsafe-reported",
+        "padded-dash-reported",
+        "oversized-reported",
     ] {
         fs::write(agy_store(&fleet).join(format!("{id}.db")), []).unwrap();
     }
+    let long_model = "m".repeat(257);
     let agy_turn = |id: &str, model: Option<&str>| {
         let mut body = json!({
             "status": "SUCCESS",
@@ -409,14 +429,18 @@ fn d19_no_model_rule_handles_every_branch_across_restarts() {
     fleet.script(
         "agy",
         json!([
-            // Branch 1: start passed explicit model; provider reported a different one.
+            // Branch 1: start passed explicit model (with surrounding spaces); provider reported a different one.
             agy_turn("explicit-start", Some("provider-reported")),
-            // Branch 2: start passed no model; provider reported a valid model.
-            agy_turn("reported-start", Some("provider-chosen")),
+            // Branch 2: start passed no model; provider reported a valid padded model.
+            agy_turn("reported-start", Some("  provider-chosen  ")),
             // Branch 3: start passed no model; provider reported none.
             agy_turn("unreported-start", None),
             // Branch 4: start passed no model; provider reported an unsafe flag-like model.
             agy_turn("unsafe-reported", Some("--evil-flag")),
+            // Branch 5: start passed no model; provider reported leading spaces before '-'.
+            agy_turn("padded-dash-reported", Some("  --padded-evil")),
+            // Branch 6: start passed no model; provider reported an over-256-byte model.
+            agy_turn("oversized-reported", Some(&long_model)),
             // Replies after restart:
             agy_turn("explicit-start", Some("provider-reported")),
             agy_turn("reported-start", Some("provider-chosen")),
@@ -429,11 +453,23 @@ fn d19_no_model_rule_handles_every_branch_across_restarts() {
     );
 
     let mut server1 = fleet.server("claude");
+    // Caller-supplied model names reject leading '-' after trimming and >256 bytes (P2 #9).
+    for bad_model in ["  --flag", "-x", &long_model] {
+        let rejected = call(
+            &mut server1,
+            "antigravity",
+            json!({"prompt": "reject", "model": bad_model}),
+        );
+        assert_eq!(
+            rejected["observed"]["failure"]["kind"], "invalid_request",
+            "{bad_model}: {rejected}"
+        );
+    }
     assert_eq!(
         call(
             &mut server1,
             "antigravity",
-            json!({"prompt": "s1", "model": "caller-start-model"})
+            json!({"prompt": "s1", "model": "  caller-start-model  "})
         )["observed"]["state"],
         "finished"
     );
@@ -446,6 +482,12 @@ fn d19_no_model_rule_handles_every_branch_across_restarts() {
     let r4 = call(&mut server1, "antigravity", json!({"prompt": "s4"}));
     assert_eq!(r4["observed"]["state"], "finished");
     assert!(r4["reported"]["model"].is_null());
+    let r5 = call(&mut server1, "antigravity", json!({"prompt": "s5"}));
+    assert_eq!(r5["observed"]["state"], "finished");
+    assert!(r5["reported"]["model"].is_null());
+    let r6 = call(&mut server1, "antigravity", json!({"prompt": "s6"}));
+    assert_eq!(r6["observed"]["state"], "finished");
+    assert!(r6["reported"]["model"].is_null());
     // Codex start without model.
     assert_eq!(
         call(&mut server1, "codex", json!({"prompt": "c1"}))["observed"]["state"],
@@ -498,14 +540,20 @@ fn d19_no_model_rule_handles_every_branch_across_restarts() {
             .contains("model")
     );
 
-    // 5) Start named no model, provider reported an unsafe string -> ignored, reply refused.
-    let b5 = call(
-        &mut server2,
-        "antigravity-reply",
-        json!({"thread_id": "unsafe-reported", "prompt": "r5"}),
-    );
-    assert_eq!(b5["observed"]["state"], "failed", "{b5}");
-    assert_eq!(b5["observed"]["failure"]["kind"], "invalid_request");
+    // 5) Start named no model, provider reported unsafe/padded-dash/oversized strings -> ignored, reply refused.
+    for id in [
+        "unsafe-reported",
+        "padded-dash-reported",
+        "oversized-reported",
+    ] {
+        let refused = call(
+            &mut server2,
+            "antigravity-reply",
+            json!({"thread_id": id, "prompt": "r5"}),
+        );
+        assert_eq!(refused["observed"]["state"], "failed", "{id}: {refused}");
+        assert_eq!(refused["observed"]["failure"]["kind"], "invalid_request");
+    }
 
     // 6) Codex start passed no model -> reply passes no model (reply_model is false).
     let b6 = call(
@@ -522,13 +570,13 @@ fn d19_no_model_rule_handles_every_branch_across_restarts() {
         .into_iter()
         .filter(|r| r["cli"] == "agy" && argument(r, "--print").is_some())
         .collect();
-    assert_eq!(agy_calls.len(), 7);
+    assert_eq!(agy_calls.len(), 9);
     assert_eq!(
-        argument(&agy_calls[4], "--model"),
+        argument(&agy_calls[6], "--model"),
         Some("caller-start-model")
     );
-    assert_eq!(argument(&agy_calls[5], "--model"), Some("provider-chosen"));
-    assert_eq!(argument(&agy_calls[6], "--model"), Some("caller-override"));
+    assert_eq!(argument(&agy_calls[7], "--model"), Some("provider-chosen"));
+    assert_eq!(argument(&agy_calls[8], "--model"), Some("caller-override"));
 
     let codex_calls: Vec<Value> = fleet
         .records()
@@ -547,6 +595,8 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
     fleet.script(
         "agy",
         json!([
+            {"stdout": AGY_FINISHED},
+            {"stdout": AGY_FINISHED},
             {"stdout": AGY_FINISHED},
             {"stdout": AGY_FINISHED},
             {"stdout": AGY_FINISHED},
@@ -569,12 +619,12 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
         serde_json::from_str(&fs::read_to_string(&session_file).unwrap()).unwrap();
 
     // Fresh server with zero invocations allowed for any corrupt or unreadable file.
-    let invocations_before = fleet.records().len();
     let mut server2 = fleet.server("claude");
 
-    let mut assert_corrupt = |label: &str| {
+    let assert_corrupt = |server: &mut Server, label: &str| {
+        let before = fleet.records().len();
         let reply = call(
-            &mut server2,
+            server,
             "antigravity-reply",
             json!({
                 "thread_id": AGY_ID,
@@ -599,40 +649,40 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
         );
         assert_eq!(
             fleet.records().len(),
-            invocations_before,
+            before,
             "{label}: corrupt file must not reach discovery or launch"
         );
     };
 
     // 1. Malformed JSON.
     fs::write(&session_file, "{not valid json").unwrap();
-    assert_corrupt("malformed JSON");
+    assert_corrupt(&mut server2, "malformed JSON");
 
     // 2. Unknown field (deny_unknown_fields).
     let mut extra = valid_json.clone();
     extra["command"] = json!("rm -rf /");
     fs::write(&session_file, extra.to_string()).unwrap();
-    assert_corrupt("unknown field");
+    assert_corrupt(&mut server2, "unknown field");
 
     // 3. Wrong schema version.
     let mut wrong_version = valid_json.clone();
     wrong_version["schema_version"] = json!(99);
     fs::write(&session_file, wrong_version.to_string()).unwrap();
-    assert_corrupt("wrong schema_version");
+    assert_corrupt(&mut server2, "wrong schema_version");
 
     // 4. Invalid settings inside valid schema (relative cwd, and ambiguous with settings).
     let mut bad_cwd = valid_json.clone();
     bad_cwd["settings"]["cwd"] = json!("relative/path");
     fs::write(&session_file, bad_cwd.to_string()).unwrap();
-    assert_corrupt("relative cwd");
+    assert_corrupt(&mut server2, "relative cwd");
     let mut bad_ambiguous = valid_json.clone();
     bad_ambiguous["ambiguous"] = json!(true);
     fs::write(&session_file, bad_ambiguous.to_string()).unwrap();
-    assert_corrupt("ambiguous with settings");
+    assert_corrupt(&mut server2, "ambiguous with settings");
 
     // 5. Oversized file (> 64 KiB).
     fs::write(&session_file, vec![b' '; 70 * 1024]).unwrap();
-    assert_corrupt("oversized file");
+    assert_corrupt(&mut server2, "oversized file");
 
     // 6. Unreadable file.
     fs::write(&session_file, valid_json.to_string()).unwrap();
@@ -640,7 +690,7 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&session_file, fs::Permissions::from_mode(0o000)).unwrap();
-        assert_corrupt("unreadable chmod 000");
+        assert_corrupt(&mut server2, "unreadable chmod 000");
         fs::set_permissions(&session_file, fs::Permissions::from_mode(0o600)).unwrap();
     }
     #[cfg(windows)]
@@ -652,24 +702,81 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
             .share_mode(0)
             .open(&session_file)
             .unwrap();
-        assert_corrupt("unreadable exclusively locked file");
+        assert_corrupt(&mut server2, "unreadable exclusively locked file");
     }
 
-    // 7. Symlink at session path (Unix).
+    // 7. Symlink and FIFO at session path, plus symlink / wrong-mode parent directories (Unix).
     #[cfg(unix)]
     {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
         let target = fleet.root.join("decoy.json");
         fs::write(&target, valid_json.to_string()).unwrap();
         fs::remove_file(&session_file).unwrap();
         std::os::unix::fs::symlink(&target, &session_file).unwrap();
-        assert_corrupt("symlink session file");
+        assert_corrupt(&mut server2, "symlink session file");
         fs::remove_file(&session_file).unwrap();
+
+        // FIFO at session path must fail immediately without blocking (O_NONBLOCK + regular-file check).
+        let c_fifo = CString::new(session_file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_fifo is a valid NUL-terminated path inside this test's temporary directory.
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+        assert_corrupt(&mut server2, "FIFO session file");
+        fs::remove_file(&session_file).unwrap();
+
+        // Wrong permissions (0755) on provider directory must fail closed on both load and save.
+        fs::write(&session_file, valid_json.to_string()).unwrap();
+        fs::set_permissions(&provider_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_corrupt(&mut server2, "world-readable provider dir 0755");
+        let saved_bad_mode = call(
+            &mut server2,
+            "antigravity",
+            json!({"prompt": "save refuses 0755 dir", "model": "seed-model"}),
+        );
+        assert_eq!(saved_bad_mode["observed"]["state"], "finished");
+        fs::set_permissions(&provider_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Symlink parent directory (sessions/antigravity -> real 0700 dir) must fail closed on load and save.
+        let decoy_dir = fleet.root.join("decoy-provider-dir");
+        fs::create_dir(&decoy_dir).unwrap();
+        fs::set_permissions(&decoy_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let decoy_session = decoy_dir.join(session_file.file_name().unwrap());
+        fs::write(&decoy_session, valid_json.to_string()).unwrap();
+        fs::remove_dir_all(&provider_dir).unwrap();
+        std::os::unix::fs::symlink(&decoy_dir, &provider_dir).unwrap();
+        assert_corrupt(&mut server2, "symlink provider dir");
+        let saved_symlink_dir = call(
+            &mut server2,
+            "antigravity",
+            json!({"prompt": "save refuses symlink dir", "model": "other-model"}),
+        );
+        assert_eq!(saved_symlink_dir["observed"]["state"], "finished");
+        assert_eq!(
+            fs::read_to_string(&decoy_session).unwrap(),
+            valid_json.to_string(),
+            "save must not write through symlinked parent directory"
+        );
+        fs::remove_file(&provider_dir).unwrap();
+        fs::create_dir(&provider_dir).unwrap();
+        fs::set_permissions(&provider_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&session_file, valid_json.to_string()).unwrap();
     }
 
-    // 8. Directory at session path: load fails safely AND a new start cleans up its staging file.
+    // 7b. Directory at the advisory lock path fails closed on load (cross-platform).
+    let lock_path = session_file.with_extension("lock");
+    let _ = fs::remove_file(&lock_path);
+    fs::create_dir(&lock_path).unwrap();
+    assert_corrupt(&mut server2, "directory at lock path");
+    fs::remove_dir(&lock_path).unwrap();
+
+    // 8. Directory at session path: load fails safely AND a new start fails closed with no staging left.
     let _ = fs::remove_file(&session_file);
     fs::create_dir(&session_file).unwrap();
-    assert_corrupt("directory at session path");
+    assert_corrupt(&mut server2, "directory at session path");
 
     // Saving over a directory fails without crashing the turn and removes its staging file.
     let saved_err_turn = call(
@@ -731,4 +838,362 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
             .contains("no settings")
     );
     assert!(server4.finish().0.success());
+}
+
+#[test]
+fn save_refuses_to_overwrite_corrupt_session_file() {
+    let fleet = Fleet::new(&["agy"]);
+    fs::create_dir_all(agy_store(&fleet)).unwrap();
+    fs::write(agy_store(&fleet).join(format!("{AGY_ID}.db")), []).unwrap();
+    fleet.script(
+        "agy",
+        json!([
+            {"stdout": AGY_FINISHED},
+            {"stdout": AGY_FINISHED},
+            {"stdout": AGY_FINISHED}
+        ]),
+    );
+
+    let mut server1 = fleet.server("claude");
+    let seeded = call(
+        &mut server1,
+        "antigravity",
+        json!({"prompt": "seed", "model": "m1"}),
+    );
+    assert_eq!(seeded["observed"]["state"], "finished");
+
+    let provider_dir = sessions_root(&fleet.root).join("antigravity");
+    let session_file = single_session_file(&provider_dir);
+    let sentinel = "{corrupt-sentinel-must-not-be-overwritten";
+    fs::write(&session_file, sentinel).unwrap();
+
+    // Even in the same server that previously cached AGY_ID, a confirmed start fails closed on
+    // disk, leaves the corrupt bytes untouched, and evicts the stale cache entry.
+    let same_server_start = call(
+        &mut server1,
+        "antigravity",
+        json!({"prompt": "second", "model": "m2"}),
+    );
+    assert_eq!(same_server_start["observed"]["state"], "finished");
+    assert_eq!(fs::read_to_string(&session_file).unwrap(), sentinel);
+    assert!(server1.stderr().contains("corrupt"));
+
+    let before_reply = fleet.records().len();
+    let refused_same = call(
+        &mut server1,
+        "antigravity-reply",
+        json!({"thread_id": AGY_ID, "prompt": "must fail closed"}),
+    );
+    assert_eq!(
+        refused_same["observed"]["failure"]["kind"],
+        "invalid_request"
+    );
+    assert!(
+        refused_same["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session settings file"),
+        "{refused_same}"
+    );
+    assert_eq!(fleet.records().len(), before_reply);
+    assert!(server1.finish().0.success());
+
+    // On a fresh server, a confirmed start also refuses to overwrite the corrupt file.
+    let mut server2 = fleet.server("claude");
+    let fresh_start = call(
+        &mut server2,
+        "antigravity",
+        json!({"prompt": "third", "model": "m3"}),
+    );
+    assert_eq!(fresh_start["observed"]["state"], "finished");
+    assert_eq!(fs::read_to_string(&session_file).unwrap(), sentinel);
+    assert!(server2.stderr().contains("could not save session settings"));
+    let before_reply2 = fleet.records().len();
+    let refused_fresh = call(
+        &mut server2,
+        "antigravity-reply",
+        json!({"thread_id": AGY_ID, "prompt": "still corrupt"}),
+    );
+    assert_eq!(
+        refused_fresh["observed"]["failure"]["kind"],
+        "invalid_request"
+    );
+    assert_eq!(fleet.records().len(), before_reply2);
+    assert!(server2.finish().0.success());
+}
+
+#[test]
+fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
+    use std::time::{Duration, Instant};
+
+    // Part A: cross-process sticky tombstone under the advisory lock, and cache updated after disk.
+    let fleet_a = Fleet::new(&["codex"]);
+    fleet_a.script(
+        "codex",
+        json!([{"stdout": CODEX_FINISHED}, {"stdout": CODEX_FINISHED}]),
+    );
+    let mut seed_a = fleet_a.server("claude");
+    assert_eq!(
+        call(
+            &mut seed_a,
+            "codex",
+            json!({"prompt": "seed", "access": "full"})
+        )["observed"]["state"],
+        "finished"
+    );
+    assert!(seed_a.finish().0.success());
+
+    let session_a = single_session_file(&sessions_root(&fleet_a.root).join("codex"));
+    let lock_path_a = session_a.with_extension("lock");
+    let lock_a = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path_a)
+        .unwrap();
+    lock_a.lock().unwrap();
+
+    let mut server_a = fleet_a.server("claude");
+    server_a.request(1, "tools/list", json!({}));
+    let before_a = fleet_a.records().len();
+    server_a.start_call(10, "codex", json!({"prompt": "race", "access": "full"}));
+    let until = Instant::now() + crate::common::WAIT;
+    while fleet_a.records().len() <= before_a {
+        assert!(Instant::now() < until, "start stub did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Simulate another server writing an ambiguity tombstone while server_a waits on the lock.
+    let mut tombstone: Value =
+        serde_json::from_str(&fs::read_to_string(&session_a).unwrap()).unwrap();
+    tombstone["ambiguous"] = json!(true);
+    tombstone["settings"] = Value::Null;
+    tombstone["reported_model"] = Value::Null;
+    fs::write(&session_a, tombstone.to_string()).unwrap();
+    drop(lock_a);
+
+    let finished_a: Value =
+        serde_json::from_str(crate::common::text(&server_a.response(10))).unwrap();
+    assert_eq!(finished_a["observed"]["state"], "finished", "{finished_a}");
+    let after_a: Value = serde_json::from_str(&fs::read_to_string(&session_a).unwrap()).unwrap();
+    assert_eq!(
+        after_a["ambiguous"], true,
+        "save downgraded sticky ambiguity tombstone: {after_a}"
+    );
+    let reply_a = call(
+        &mut server_a,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "must see tombstone"}),
+    );
+    assert_eq!(reply_a["observed"]["failure"]["kind"], "invalid_request");
+    assert!(
+        reply_a["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting"),
+        "{reply_a}"
+    );
+    assert!(server_a.finish().0.success());
+
+    // Part B: in-process reply waits while a conflicting save is in flight and never dispatches stale settings.
+    let fleet_b = Fleet::new(&["codex"]);
+    fleet_b.script(
+        "codex",
+        json!([
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED}
+        ]),
+    );
+    let mut seed_b = fleet_b.server("claude");
+    assert_eq!(
+        call(
+            &mut seed_b,
+            "codex",
+            json!({"prompt": "seed", "access": "full"})
+        )["observed"]["state"],
+        "finished"
+    );
+    assert!(seed_b.finish().0.success());
+
+    let session_b = single_session_file(&sessions_root(&fleet_b.root).join("codex"));
+    let lock_b = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(session_b.with_extension("lock"))
+        .unwrap();
+    lock_b.lock().unwrap();
+
+    let mut server_b = fleet_b.server("claude");
+    server_b.request(1, "tools/list", json!({}));
+    let before_b = fleet_b.records().len();
+    server_b.start_call(
+        20,
+        "codex",
+        json!({"prompt": "conflicting start", "access": "read-only"}),
+    );
+    let until = Instant::now() + crate::common::WAIT;
+    while fleet_b.records().len() <= before_b {
+        assert!(Instant::now() < until, "conflicting start did not run");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Issue a reply while save #20 is still blocked on the advisory lock.
+    server_b.start_call(
+        21,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "must wait for save"}),
+    );
+    assert!(
+        server_b
+            .next_frame(Instant::now() + Duration::from_millis(150))
+            .is_none(),
+        "reply must wait while save is in flight"
+    );
+    assert_eq!(
+        fleet_b
+            .records()
+            .iter()
+            .filter(|r| r["args"][0] == "exec")
+            .count(),
+        2,
+        "reply dispatched before in-flight save finished"
+    );
+    drop(lock_b);
+
+    let f1 = server_b.exact_next_frame();
+    let f2 = server_b.exact_next_frame();
+    let (start_frame, reply_frame) = if f1["id"] == 20 { (f1, f2) } else { (f2, f1) };
+    assert_eq!(start_frame["id"], 20);
+    assert_eq!(reply_frame["id"], 21);
+    let start_body: Value = serde_json::from_str(crate::common::text(&start_frame)).unwrap();
+    let reply_body: Value = serde_json::from_str(crate::common::text(&reply_frame)).unwrap();
+    assert_eq!(start_body["observed"]["state"], "finished");
+    assert_eq!(reply_body["observed"]["failure"]["kind"], "invalid_request");
+    assert!(
+        reply_body["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting"),
+        "{reply_body}"
+    );
+    assert_eq!(
+        fleet_b
+            .records()
+            .iter()
+            .filter(|r| r["args"][0] == "exec")
+            .count(),
+        2,
+        "ambiguous reply must never dispatch"
+    );
+    assert!(server_b.finish().0.success());
+}
+
+#[test]
+fn session_load_respects_call_deadline_and_cancellation() {
+    use std::time::{Duration, Instant};
+
+    let fleet = Fleet::new(&["codex"]);
+    fleet.script("codex", json!([{"stdout": CODEX_FINISHED}]));
+    let mut server1 = fleet.server("claude");
+    assert_eq!(
+        call(&mut server1, "codex", json!({"prompt": "seed"}))["observed"]["state"],
+        "finished"
+    );
+    assert!(server1.finish().0.success());
+
+    let session_file = single_session_file(&sessions_root(&fleet.root).join("codex"));
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(session_file.with_extension("lock"))
+        .unwrap();
+    lock.lock().unwrap();
+
+    // Deadline bounds sessions::load.
+    let mut server2 = fleet.server("claude");
+    let began = Instant::now();
+    let timed_out = call(
+        &mut server2,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "blocked", "timeout_ms": 150}),
+    );
+    assert_eq!(
+        timed_out["observed"]["failure"]["kind"], "timeout",
+        "{timed_out}"
+    );
+    assert!(
+        timed_out["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Loading session settings"),
+        "{timed_out}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "session load ignored deadline: {:?}",
+        began.elapsed()
+    );
+
+    // Cancellation (connection EOF) bounds sessions::load.
+    server2.start_call(
+        30,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "cancel load"}),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    server2.close_input();
+    let cancelled: Value =
+        serde_json::from_str(crate::common::text(&server2.response(30))).unwrap();
+    assert_eq!(cancelled["observed"]["state"], "cancelled", "{cancelled}");
+    assert_eq!(
+        cancelled["observed"]["failure"]["kind"], "cancellation",
+        "{cancelled}"
+    );
+    assert!(
+        cancelled["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Loading session settings"),
+        "{cancelled}"
+    );
+
+    drop(lock);
+    assert!(server2.finish().0.success());
+}
+
+#[test]
+fn save_refuses_session_payload_above_size_limit() {
+    let fleet = Fleet::new(&["codex"]);
+    fleet.script("codex", json!([{"stdout": CODEX_FINISHED}]));
+    let mut cmd = fleet.command("claude");
+    cmd.env("PROXENOS_TEST_SESSION_MAX_BYTES", "64");
+    let mut server = Server::start_command(cmd);
+    server.initialize("2025-11-25");
+
+    let done = call(
+        &mut server,
+        "codex",
+        json!({"prompt": "too big for tiny cap", "model": "saved-model"}),
+    );
+    assert_eq!(done["observed"]["state"], "finished", "{done}");
+    assert!(
+        server
+            .stderr()
+            .contains("session payload exceeds size limit"),
+        "{}",
+        server.stderr()
+    );
+    let provider_dir = sessions_root(&fleet.root).join("codex");
+    let json_files: Vec<_> = fs::read_dir(&provider_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert!(
+        json_files.is_empty(),
+        "oversized payload must not be written: {json_files:?}"
+    );
+    assert!(server.finish().0.success());
 }

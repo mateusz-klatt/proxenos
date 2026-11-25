@@ -31,6 +31,7 @@ const METHOD: &str = "windows_job_totals";
 const CAVEATS: &[&str] = &[
     "Peak memory is the job's peak committed memory across all processes assigned to the job.",
     "A memory limit asks Windows to refuse allocations above the job limit; the CLI may fail on allocation failure or carry on.",
+    "Job IOCP memory-limit notifications are best effort and may be missed under memory pressure, in which case a memory-limit failure may surface as abnormal_exit.",
 ];
 
 pub fn empty_accounting(memory_limit_bytes: Option<u64>) -> Accounting {
@@ -211,12 +212,12 @@ impl Child {
         self.job.terminate()
     }
 
-    pub async fn finish(mut self) -> io::Result<(ExitStatus, Accounting)> {
+    pub async fn finish(mut self) -> (io::Result<ExitStatus>, Accounting) {
         let accounting = self.job.accounting();
         drop(self.job);
         drop(self.release);
-        let status = finish_reap(&mut self.status, &mut self.cleaned).await?;
-        Ok((status, accounting))
+        let status = finish_reap(&mut self.status, &mut self.cleaned).await;
+        (status, accounting)
     }
 }
 

@@ -753,15 +753,20 @@ the job on Windows, samples of the supervised process group on Linux and macOS.
   Proxenos sets `JOB_OBJECT_LIMIT_JOB_MEMORY` on the job and observes
   `JOB_OBJECT_MSG_JOB_MEMORY_LIMIT` via an associated completion port. The system refuses an
   allocation that would exceed the limit; the CLI may fail on that refusal (reported as
-  `memory_limit`) or carry on.
+  `memory_limit`) or carry on. Job IOCP memory-limit notifications are best effort and may be
+  missed under memory pressure, in which case a memory-limit failure may surface as
+  `abnormal_exit`.
 - **Linux and macOS**: the processes of the supervised process group are sampled every 50 ms
   (`linux_proc_group_sample` from `/proc/<pid>/stat` RSS pages and CPU ticks on Linux;
   `macos_proc_group_sample` from `proc_listpgrppids` and `proc_pidinfo(PROC_PIDTASKINFO)` scaled
   with `mach_timebase_info` on macOS). Samples can miss a brief peak, a short-lived child, and a
-  descendant that has left the group. On macOS only the first 4096 members of the group are
-  sampled. With `memory_limit_bytes` set, a sample above it starts the
-  stop that D6 describes and reports `memory_limit`. That is a threshold checked between samples,
-  not a hard allocation ceiling.
+  descendant that has left the group. Summed RSS across group members double-counts pages shared
+  between processes. On macOS only the first 4096 members of the group are sampled (and per-sample
+  PID tracking is bounded at 4096 members on Unix, folding exited PIDs into an accumulator so PID
+  reuse does not overwrite earlier CPU time). With `memory_limit_bytes` set, a sample above it
+  starts a single D6 stop (`Ending::MemoryLimit`) without reading the provider output file and
+  reports `memory_limit`. That is a threshold checked between samples, not a hard allocation
+  ceiling.
 
 No memory limit applies unless the caller sets `memory_limit_bytes`.
 
@@ -801,14 +806,33 @@ provider and a SHA-256-encoded thread ID under `$XDG_STATE_HOME/proxenos/session
 macOS, and `%LOCALAPPDATA%\proxenos\sessions` on Windows. Each file stores only the save timestamp,
 an `ambiguous` flag, and for non-ambiguous entries validated start settings (`cwd`, `mode`,
 `access`, `model`, `effort`) and any validated start model the provider reported. It never stores
-the prompt, the instructions text, the environment, `timeout_ms`, or the provider's answer. Files
-are written atomically with mode `0600` in `0700` directories on Unix, and loaded with bounded
-reads without following symlinks. A corrupt, oversized, non-regular, or unreadable session file
-fails closed before discovery or launch and executes nothing from the file. Because `instructions`
-text is never persisted to disk, a reply served from the file after a server restart or cache
-eviction does not reapply start `instructions` text; within the same server process while cached in
-`StartStore`, start instructions remain available in memory only. Proxenos cannot verify explicit
-reply settings supplied for a forgotten or expired start.
+the prompt, the instructions text, the environment, `timeout_ms`, or the provider's answer.
+Confirmed-start saves and reply lookups serialize per `(provider, thread_id)` inside the process
+and coordinate across server processes through an advisory lock file (`<key>.lock`) alongside the
+session file. `StartStore` is updated only after the disk outcome is known, and a reply waits
+(bounded by its call deadline and cancellation) while a save for the same ID is in flight. An
+ambiguity tombstone (`ambiguous: true`) is sticky and is never downgraded to `false`.
+
+Files are written atomically with mode `0600` in `0700` directories on Unix, after checking that
+each component under the state base (`proxenos`, `sessions`, `<provider>`) is a real directory
+rather than a symlink (and on Unix owned by the current effective UID with mode `0700`; on Windows
+not a reparse point). Reads open with `O_NONBLOCK | O_NOFOLLOW` on Unix and
+`FILE_FLAG_OPEN_REPARSE_POINT` on Windows, re-check the open descriptor's type, enforce the 64 KiB
+size cap, and run under the call deadline and cancellation. An expired file is treated as missing
+on load and is never deleted during load. A corrupt, oversized, non-regular, or unreadable session
+file fails closed on both load and save—never overwritten on save, never reaching discovery or
+launch on reply, and executing nothing from the file. Because `instructions` text is never
+persisted to disk, a reply served from the file after a server restart or cache eviction does not
+reapply start `instructions` text; within the same server process while cached in `StartStore`,
+start instructions remain available in memory only.
+
+What this cannot do: Proxenos cannot verify explicit reply settings supplied for a forgotten or
+expired start. Parent-directory checks cover the directories Proxenos creates under the state base
+(`proxenos`, `sessions`, `<provider>`) and cannot prevent symlinks or permissive permissions on
+ancestor directories outside that base (such as `$HOME`, `$XDG_STATE_HOME`, or `%LOCALAPPDATA%`),
+nor close a path-swap race on those parent directories by another process running as the same user
+without descriptor-relative traversal. The per-session lock file is an advisory lock and relies on
+cooperating Proxenos processes.
 
 The file was a provisional choice of vote 4, where one reviewer would keep the settings only in
 the server's memory, and vote 6 backed it: eight of nine positions are for a file. How long it is

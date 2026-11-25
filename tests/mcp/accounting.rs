@@ -42,6 +42,8 @@ fn accounting_reports_platform_method_caveats_memory_and_cpu() {
             assert!(caveats.contains("miss"), "{caveats}");
             assert!(caveats.contains("short-lived"), "{caveats}");
             assert!(caveats.contains("leave the process group"), "{caveats}");
+            assert!(caveats.contains("double-counts"), "{caveats}");
+            assert!(caveats.contains("4096"), "{caveats}");
         }
         #[cfg(target_os = "macos")]
         {
@@ -51,6 +53,8 @@ fn accounting_reports_platform_method_caveats_memory_and_cpu() {
             assert!(caveats.contains("miss"), "{caveats}");
             assert!(caveats.contains("short-lived"), "{caveats}");
             assert!(caveats.contains("leave the process group"), "{caveats}");
+            assert!(caveats.contains("double-counts"), "{caveats}");
+            assert!(caveats.contains("4096"), "{caveats}");
         }
         #[cfg(windows)]
         {
@@ -59,6 +63,8 @@ fn accounting_reports_platform_method_caveats_memory_and_cpu() {
             let caveats = accounting["caveats"].to_string().to_lowercase();
             assert!(caveats.contains("committed"), "{caveats}");
             assert!(caveats.contains("refuse"), "{caveats}");
+            assert!(caveats.contains("best effort"), "{caveats}");
+            assert!(caveats.contains("abnormal_exit"), "{caveats}");
         }
         assert!(accounting["memory_limit_bytes"].is_null());
         assert_eq!(accounting["memory_limit_exceeded"], false);
@@ -137,5 +143,82 @@ fn memory_limit_is_honoured_when_under_and_triggers_memory_limit_failure_when_ex
             .unwrap()
             > tight,
         "{over}"
+    );
+}
+
+#[test]
+fn accounting_preserves_exited_child_cpu_time() {
+    let fleet = Fleet::new(&["agy"]);
+    let mut step = turn("child burned");
+    step["child_burn_cpu_ms"] = json!(150);
+    step["sleep_ms"] = json!(250);
+    fleet.script("agy", json!([step]));
+
+    let mut server = fleet.server("claude");
+    let result = call(&mut server, "antigravity", json!({"prompt": "child cpu"}));
+    assert_eq!(result["observed"]["state"], "finished", "{result}");
+    assert!(
+        result["observed"]["accounting"]["cpu_time_ms"]
+            .as_u64()
+            .unwrap()
+            >= 50,
+        "exited child CPU time was lost: {result}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_limit_stop_runs_once_skips_output_read_and_beats_timeout() {
+    use std::time::{Duration, Instant};
+
+    let fleet = Fleet::new(&["codex"]);
+    let finished = include_str!("../fixtures/codex/finished.jsonl");
+    fleet.script(
+        "codex",
+        json!([
+            {"stdout": finished, "sleep_ms": 150},
+            {
+                "stdout": finished,
+                "replace_output_with_dir": true,
+                "alloc_bytes": 64_u64 << 20,
+                "sleep_ms": 60_000
+            }
+        ]),
+    );
+
+    let mut server = fleet.server("claude");
+    let baseline = call(&mut server, "codex", json!({"prompt": "baseline"}));
+    assert_eq!(baseline["observed"]["state"], "finished", "{baseline}");
+    let base_bytes = baseline["observed"]["accounting"]["peak_memory_bytes"]
+        .as_u64()
+        .unwrap();
+
+    // timeout_ms is shorter than Unix's 3 s SIGTERM grace, and the stub replaced -o with a dir.
+    // A single MemoryLimit stop must finish without running a second stop, without reading output
+    // (no capture error), and classify as memory_limit rather than timeout.
+    let tight = base_bytes + (16 << 20);
+    let started = Instant::now();
+    let over = call(
+        &mut server,
+        "codex",
+        json!({
+            "prompt": "over with short timeout and bad output",
+            "memory_limit_bytes": tight,
+            "timeout_ms": 1_500
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(over["observed"]["state"], "failed", "{over}");
+    assert_eq!(
+        over["observed"]["failure"]["kind"], "memory_limit",
+        "memory_limit must precede timeout and capture checks: {over}"
+    );
+    assert_eq!(
+        over["observed"]["accounting"]["memory_limit_exceeded"],
+        true
+    );
+    assert!(
+        elapsed < Duration::from_millis(5_500),
+        "memory-limit stop ran more than one stop ({elapsed:?}): {over}"
     );
 }

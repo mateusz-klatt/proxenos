@@ -1,7 +1,7 @@
 //! Routes the client's installed providers and the optional protocol test tools.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -66,21 +66,32 @@ impl StartStore {
         self.insert(key, value);
     }
 
-    pub fn record(
-        &mut self,
-        provider: &'static str,
-        id: String,
-        remembered: RememberedStart,
-    ) -> Option<RememberedStart> {
-        let key = (provider, id);
-        if let Some(slot) = self.entries.get_mut(&key) {
-            if slot.as_ref() != Some(&remembered) {
-                *slot = None;
-            }
-            return slot.clone();
-        }
-        self.insert(key, Some(remembered.clone()));
-        Some(remembered)
+    pub fn remove(&mut self, provider: &'static str, id: &str) {
+        let key = (provider, id.to_owned());
+        self.entries.remove(&key);
+        self.order.retain(|item| item != &key);
+    }
+}
+
+type SessionKey = (&'static str, String);
+type KeyLock = tokio::sync::Mutex<()>;
+
+/// Serialises D19 session saves and reply lookups per `(provider, thread_id)` inside the process.
+#[derive(Default)]
+pub struct SessionLocks {
+    locks: Mutex<HashMap<SessionKey, Weak<KeyLock>>>,
+}
+
+impl SessionLocks {
+    pub fn for_key(&self, provider: &'static str, id: &str) -> Arc<KeyLock> {
+        let mut map = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
+        map.retain(|_, weak| weak.strong_count() > 0);
+        let key = (provider, id.to_owned());
+        map.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            map.insert(key, Arc::downgrade(&lock));
+            lock
+        })
     }
 }
 
@@ -89,6 +100,7 @@ pub struct Registry {
     pub discovery: Discovery,
     pub answers: crate::envelope::AnswerArchive,
     pub starts: Mutex<StartStore>,
+    pub session_locks: SessionLocks,
     pub background: Arc<Background>,
 }
 
@@ -99,6 +111,7 @@ impl Registry {
             discovery: Discovery::new(client),
             answers: Default::default(),
             starts: Mutex::new(StartStore::new()),
+            session_locks: SessionLocks::default(),
             background: Background::new(),
         }
     }
@@ -140,7 +153,7 @@ impl Service for Registry {
                 .delegate(provider, bare != name, arguments, cancel, activity)
                 .await);
         }
-        extra_call(&name, &arguments, &cancel, activity)
+        extra_call(&name, &arguments, &cancel, activity, &self.background)
             .await
             .ok_or(UnknownTool)
     }
@@ -162,8 +175,9 @@ async fn extra_call(
     arguments: &Map<String, Value>,
     cancel: &CancellationToken,
     activity: Activity,
+    background: &Arc<Background>,
 ) -> Option<ToolOutcome> {
-    test_tools::call(name, arguments, cancel, activity).await
+    test_tools::call(name, arguments, cancel, activity, background).await
 }
 
 #[cfg(not(feature = "test-tools"))]
@@ -172,17 +186,20 @@ async fn extra_call(
     _arguments: &Map<String, Value>,
     _cancel: &CancellationToken,
     _activity: Activity,
+    _background: &Arc<Background>,
 ) -> Option<ToolOutcome> {
     None
 }
 
 #[cfg(feature = "test-tools")]
 mod test_tools {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use serde_json::{Map, Value, json};
     use tokio_util::sync::CancellationToken;
 
+    use crate::background::Background;
     use crate::mcp::{Activity, ToolOutcome, ToolSpec};
     use crate::supervise::{self, Finished, Launch};
 
@@ -212,6 +229,7 @@ mod test_tools {
                         "env": { "type": "object", "additionalProperties": { "type": "string" } },
                         "env_remove": { "type": "array", "items": { "type": "string" } },
                         "deadline_ms": { "type": "integer", "minimum": 0 },
+                        "memory_limit_bytes": { "type": "integer", "minimum": 1 },
                         "capture_limit": { "type": "integer", "minimum": 0 },
                         "temp_file": { "type": "string", "description": "Create a new temporary file for the child at this path." },
                         "sharing_retry_ms": { "type": "integer", "minimum": 0, "description": "Windows sharing-violation retry budget for the temporary file, in milliseconds (default 1000)." },
@@ -294,7 +312,7 @@ mod test_tools {
                 .collect(),
             deadline: started
                 + Duration::from_millis(millis(arguments, "deadline_ms").unwrap_or(0)),
-            memory_limit_bytes: None,
+            memory_limit_bytes: millis(arguments, "memory_limit_bytes"),
             capture_limit: usize::try_from(millis(arguments, "capture_limit").unwrap_or(0))
                 .unwrap_or(usize::MAX),
             temporary_files,
@@ -350,6 +368,7 @@ mod test_tools {
         arguments: &Map<String, Value>,
         cancel: &CancellationToken,
         activity: Activity,
+        background: &Arc<Background>,
     ) -> Option<ToolOutcome> {
         let outcome = match name {
             "test_echo" => ToolOutcome {
@@ -360,6 +379,21 @@ mod test_tools {
                 text: "failed on purpose".to_owned(),
                 is_error: true,
             },
+            "test_panic" if arguments.get("background") == Some(&Value::Bool(true)) => {
+                let bg_cancel = activity.shutdown_token();
+                let task = background
+                    .try_start("test", bg_cancel, activity)
+                    .expect("slot available for background test_panic");
+                let handle = task.handle().to_owned();
+                tokio::spawn(async move {
+                    let _guard = task;
+                    panic!("test_panic background was called");
+                });
+                ToolOutcome {
+                    text: json!({ "handle": handle }).to_string(),
+                    is_error: false,
+                }
+            }
             "test_panic" => panic!("test_panic was called"),
             "test_run" => run_outcome(run(arguments, cancel, activity).await),
             "test_wait" => {

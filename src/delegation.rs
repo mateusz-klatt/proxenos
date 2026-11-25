@@ -4,7 +4,7 @@ mod git;
 
 use std::ffi::OsString;
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use crate::background::MAX_CONCURRENT;
 use crate::discovery::{Executable, exit_description};
 use crate::envelope::{CAPTURE_LIMIT, Envelope, Failure, FailureKind};
 use crate::mcp::{Activity, ToolOutcome};
-use crate::providers::{Provider, RememberedStart, Report, Turn};
+use crate::providers::{DEFAULT_TIMEOUT_MS, Provider, RememberedStart, Report, Turn};
 use crate::sessions::{self, SessionLookup};
 use crate::supervise::cleanup::DirectoryLease;
 use crate::supervise::{self, Ending, Finished, Launch};
@@ -56,11 +56,25 @@ impl Registry {
         };
         if !turn.wait {
             let bg_cancel = activity.shutdown_token();
-            let Some((handle, slot)) = self.background.try_start(p.name, bg_cancel.clone()) else {
-                result.fail(busy_failure());
-                return result.outcome();
+            let task = match await_bounded(
+                async {
+                    self.background
+                        .try_start(p.name, bg_cancel.clone(), activity.clone())
+                        .ok_or_else(busy_failure)
+                },
+                call_deadline,
+                &cancel,
+                "Starting the background delegation",
+            )
+            .await
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    result.fail(error);
+                    return result.outcome();
+                }
             };
-            let task_handle = handle.clone();
+            let handle = task.handle().to_owned();
             let registry = Arc::clone(&self);
             tokio::spawn(async move {
                 let outcome = registry
@@ -78,12 +92,7 @@ impl Registry {
                     result.fail(error);
                 }
                 let (state, value) = result.finalize();
-                // Free the concurrency slot before waking `await`, so a follow-up start
-                // issued right after `await` returns never races with the finished slot.
-                drop(slot);
-                registry
-                    .background
-                    .complete(&task_handle, p.name, state, value);
+                task.finish(state, value);
             });
             return ToolOutcome {
                 is_error: false,
@@ -134,50 +143,70 @@ impl Registry {
                 "A delegated CLI cannot start another Proxenos delegation.",
             ));
         }
+        let load_deadline = started
+            + Duration::from_millis(
+                args.get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .filter(|&ms| (1..=86_400_000).contains(&ms))
+                    .unwrap_or(DEFAULT_TIMEOUT_MS),
+            );
         let start = if reply
             && let Some(id) = args
                 .get("thread_id")
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty() && !s.contains('\0'))
         {
-            let cached = self.starts.lock().unwrap().get(p.name, id).cloned();
-            match cached {
-                Some(None) => return Err(ambiguous_thread_failure()),
-                Some(Some(remembered)) => Some(remembered),
-                None => {
+            let key_lock = self.session_locks.for_key(p.name, id);
+            let lookup = await_bounded(
+                async {
+                    let _key_guard = key_lock.lock().await;
+                    if let Some(cached) = self.starts.lock().unwrap().get(p.name, id).cloned() {
+                        return Ok(match cached {
+                            Some(remembered) => SessionLookup::Found(remembered),
+                            None => SessionLookup::Ambiguous,
+                        });
+                    }
                     let id_owned = id.to_owned();
                     let load_activity = activity.clone();
-                    let lookup = tokio::task::spawn_blocking(move || {
+                    let found = tokio::task::spawn_blocking(move || {
                         let found = sessions::load(p, &id_owned);
                         drop(load_activity);
                         found
                     })
                     .await
                     .expect("session loader finished");
-                    match lookup {
-                        SessionLookup::Missing => None,
+                    match &found {
                         SessionLookup::Found(remembered) => {
                             self.starts.lock().unwrap().cache(
                                 p.name,
                                 id.to_owned(),
                                 Some(remembered.clone()),
                             );
-                            Some(remembered)
                         }
                         SessionLookup::Ambiguous => {
                             self.starts
                                 .lock()
                                 .unwrap()
                                 .cache(p.name, id.to_owned(), None);
-                            return Err(ambiguous_thread_failure());
                         }
-                        SessionLookup::Corrupt(reason) => {
-                            return Err(Failure::new(
-                                FailureKind::InvalidRequest,
-                                format!("Cannot use session settings file: {reason}"),
-                            ));
-                        }
+                        SessionLookup::Missing | SessionLookup::Corrupt(_) => {}
                     }
+                    Ok(found)
+                },
+                load_deadline,
+                cancel,
+                "Loading session settings",
+            )
+            .await?;
+            match lookup {
+                SessionLookup::Missing => None,
+                SessionLookup::Found(remembered) => Some(remembered),
+                SessionLookup::Ambiguous => return Err(ambiguous_thread_failure()),
+                SessionLookup::Corrupt(reason) => {
+                    return Err(Failure::new(
+                        FailureKind::InvalidRequest,
+                        format!("Cannot use session settings file: {reason}"),
+                    ));
                 }
             }
         } else {
@@ -264,6 +293,13 @@ impl Registry {
                 result.report.diagnostic = Some(String::from_utf8_lossy(diagnostic).into_owned());
             }
             match finished.ending {
+                #[cfg(unix)]
+                Ending::MemoryLimit => {
+                    break Err(Failure::new(
+                        FailureKind::MemoryLimit,
+                        "The provider exceeded the delegation's memory limit.",
+                    ));
+                }
                 Ending::TimedOut => {
                     break Err(Failure::new(
                         FailureKind::Timeout,
@@ -276,10 +312,8 @@ impl Registry {
                         "The provider call was cancelled.",
                     ));
                 }
-                Ending::Exited
-                    if finished.accounting.memory_limit_exceeded
-                        && (cfg!(unix) || finished.code != Some(0)) =>
-                {
+                #[cfg(windows)]
+                Ending::Exited if is_memory_limit(finished) => {
                     break Err(Failure::new(
                         FailureKind::MemoryLimit,
                         "The provider exceeded the delegation's memory limit.",
@@ -331,34 +365,71 @@ impl Registry {
                     settings: turn.settings.clone(),
                     reported_model: result.report.model.clone(),
                 };
-                let entry = self
-                    .starts
-                    .lock()
-                    .unwrap()
-                    .record(p.name, id.clone(), remembered);
+                let key_lock = self.session_locks.for_key(p.name, id);
+                let _key_guard = key_lock.lock().await;
+                let desired = match self.starts.lock().unwrap().get(p.name, id) {
+                    Some(None) => None,
+                    Some(Some(existing)) if existing != &remembered => None,
+                    _ => Some(remembered),
+                };
                 let saved_id = id.clone();
                 let save_activity = activity.clone();
-                let saved = tokio::task::spawn_blocking(move || {
-                    let outcome = sessions::save(p, &saved_id, entry);
+                let (desired, saved) = tokio::task::spawn_blocking(move || {
+                    let outcome = sessions::save(p, &saved_id, desired.clone());
                     drop(save_activity);
-                    outcome
+                    (desired, outcome)
                 })
                 .await
                 .expect("session saver finished");
                 match saved {
                     Ok(true) => self.starts.lock().unwrap().cache(p.name, id.clone(), None),
-                    Ok(false) => (),
-                    Err(error) => eprintln!("proxenos: could not save session settings: {error}"),
+                    Ok(false) => self
+                        .starts
+                        .lock()
+                        .unwrap()
+                        .cache(p.name, id.clone(), desired),
+                    Err(error) => {
+                        if error.kind() == io::ErrorKind::InvalidData {
+                            self.starts.lock().unwrap().remove(p.name, id);
+                        } else {
+                            self.starts
+                                .lock()
+                                .unwrap()
+                                .cache(p.name, id.clone(), desired);
+                        }
+                        write_diagnostic(format!("could not save session settings: {error}")).await;
+                    }
                 }
             }
             break Ok(());
         };
-        if let Some(snapshot) = git::snapshot(&turn.settings.cwd, cancel, None, activity).await {
+        if let Some(snapshot) =
+            git::snapshot(&turn.settings.cwd, cancel, None, activity.clone()).await
+        {
             result.snapshot("after", snapshot);
         }
         result.excerpt(&self.answers).await;
+        drop(activity);
         outcome
     }
+}
+
+fn is_memory_limit(finished: &Finished) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(finished.ending, Ending::MemoryLimit)
+    }
+    #[cfg(windows)]
+    {
+        finished.accounting.memory_limit_exceeded && finished.code != Some(0)
+    }
+}
+
+async fn write_diagnostic(message: String) {
+    let write = tokio::task::spawn_blocking(move || {
+        let _ = writeln!(std::io::stderr().lock(), "proxenos: {message}");
+    });
+    let _ = tokio::time::timeout(Duration::from_millis(500), write).await;
 }
 
 fn ambiguous_thread_failure() -> Failure {
@@ -531,7 +602,11 @@ async fn launch(
         temporary_files: vec![scratch.for_child()],
     };
     let mut done = supervise::run(launch, cancel, activity.clone()).await?;
-    let read = if done.spawned && done.error.is_none() && matches!(done.ending, Ending::Exited) {
+    let read = if done.spawned
+        && done.error.is_none()
+        && !is_memory_limit(&done)
+        && matches!(done.ending, Ending::Exited)
+    {
         read_output(output, deadline, cancel, activity).await
     } else {
         Ok((Vec::new(), 0))

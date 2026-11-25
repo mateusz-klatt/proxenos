@@ -19,6 +19,18 @@ const SESSION_SCHEMA_VERSION: u32 = 1;
 const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
 
+fn max_session_bytes() -> u64 {
+    #[cfg(feature = "test-tools")]
+    if let Some(limit) = std::env::var("PROXENOS_TEST_SESSION_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+    {
+        return limit;
+    }
+    MAX_SESSION_BYTES
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionFile {
@@ -65,14 +77,11 @@ fn state_base() -> Option<PathBuf> {
     return absolute_env("LOCALAPPDATA");
 }
 
-/// Platform state directory holding Proxenos session files.
-pub fn directory() -> Option<PathBuf> {
-    state_base().map(|root| root.join("proxenos").join("sessions"))
-}
-
-fn session_path(root: &Path, provider: &str, thread_id: &str) -> PathBuf {
-    root.join(provider)
-        .join(format!("{}.json", encode_thread_id(thread_id)))
+fn provider_dir_chain(state_root: &Path, provider: &str) -> [PathBuf; 3] {
+    let proxenos = state_root.join("proxenos");
+    let sessions = proxenos.join("sessions");
+    let provider_dir = sessions.join(provider);
+    [proxenos, sessions, provider_dir]
 }
 
 fn now_epoch_s() -> u64 {
@@ -81,12 +90,8 @@ fn now_epoch_s() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-pub fn load(provider: &Provider, thread_id: &str) -> SessionLookup {
-    let Some(root) = directory() else {
-        return SessionLookup::Missing;
-    };
-    let path = session_path(&root, provider.name, thread_id);
-    let bytes = match read_session_file(&path) {
+fn lookup_bytes(provider: &Provider, thread_id: &str, read: io::Result<Vec<u8>>) -> SessionLookup {
+    let bytes = match read {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return SessionLookup::Missing,
         Err(error) => return SessionLookup::Corrupt(error.to_string()),
@@ -104,13 +109,23 @@ pub fn load(provider: &Provider, thread_id: &str) -> SessionLookup {
         Err(reason) => return SessionLookup::Corrupt(reason.into()),
     };
     if now_epoch_s().saturating_sub(saved_at) > SESSION_TTL_SECS {
-        let _ = fs::remove_file(&path);
         return SessionLookup::Missing;
     }
     match validated {
         Some(remembered) => SessionLookup::Found(remembered),
         None => SessionLookup::Ambiguous,
     }
+}
+
+pub fn load(provider: &Provider, thread_id: &str) -> SessionLookup {
+    let Some(base) = state_base() else {
+        return SessionLookup::Missing;
+    };
+    lookup_bytes(
+        provider,
+        thread_id,
+        read_provider_session(&base, provider.name, thread_id),
+    )
 }
 
 fn stored_from(start: &RememberedStart) -> io::Result<(StoredSettings, Option<String>)> {
@@ -131,7 +146,7 @@ fn stored_from(start: &RememberedStart) -> io::Result<(StoredSettings, Option<St
         .reported_model
         .as_deref()
         .filter(|model| is_valid_model(model))
-        .map(str::to_owned);
+        .map(|model| model.trim().to_owned());
     Ok((stored, reported_model))
 }
 
@@ -149,8 +164,22 @@ pub fn save(
         )
     })?;
     let desired = entry.as_ref().map(stored_from).transpose()?;
-    // Preserve ambiguity and detect cross-restart conflicts against an existing non-expired file.
-    let desired = match (desired, load(provider, thread_id)) {
+    let provider_dir = ensure_provider_dir(&base, provider.name)?;
+    let key = encode_thread_id(thread_id);
+    let _lock = open_lock_file(&provider_dir.join(format!("{key}.lock")))?;
+    let target = provider_dir.join(format!("{key}.json"));
+    // Re-check the target under the advisory lock: fail closed on corruption, never downgrade
+    // an ambiguity tombstone, and detect conflicts across processes or restarts.
+    let desired = match (
+        desired,
+        lookup_bytes(provider, thread_id, read_session_file(&target)),
+    ) {
+        (_, SessionLookup::Corrupt(reason)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("refusing to overwrite corrupt session file: {reason}"),
+            ));
+        }
         (None, _) | (_, SessionLookup::Ambiguous) => None,
         (Some(next), SessionLookup::Found(existing))
             if stored_from(&existing).ok().as_ref() != Some(&next) =>
@@ -164,8 +193,6 @@ pub fn save(
         Some((settings, reported_model)) => (Some(settings), reported_model),
         None => (None, None),
     };
-    let provider_dir = ensure_provider_dir(&base, provider.name)?;
-    let target = provider_dir.join(format!("{}.json", encode_thread_id(thread_id)));
     let payload = SessionFile {
         schema_version: SESSION_SCHEMA_VERSION,
         provider: provider.name.to_owned(),
@@ -176,38 +203,70 @@ pub fn save(
         reported_model,
     };
     let encoded = serde_json::to_vec(&payload).expect("session JSON serializes");
+    if encoded.len() as u64 > max_session_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session payload exceeds size limit",
+        ));
+    }
     let staging = provider_dir.join(format!(".tmp-{}", Uuid::new_v4()));
     let mut options = fs::OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut staging_guard = Staging(Some(staging.clone()));
+    let _staging_guard = Staging(staging.clone());
     let mut file = options.open(&staging)?;
     file.write_all(&encoded)?;
     drop(file);
     fs::rename(&staging, &target)?;
-    staging_guard.0 = None;
     Ok(ambiguous)
 }
 
-struct Staging(Option<PathBuf>);
+struct Staging(PathBuf);
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = fs::remove_file(path);
-        }
+        let _ = fs::remove_file(&self.0);
     }
+}
+
+fn is_private_dir(meta: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.file_type().is_dir()
+            && meta.uid() == crate::platform::current_uid()
+            && (meta.mode() & 0o777) == 0o700
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        meta.file_type().is_dir() && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+    }
+}
+
+fn verify_existing_dir(path: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if !is_private_dir(&meta) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session directory {} is not a private directory",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_provider_dir(state_root: &Path, provider: &str) -> io::Result<PathBuf> {
     fs::create_dir_all(state_root)?;
-    let proxenos_dir = state_root.join("proxenos");
-    ensure_private_dir(&proxenos_dir)?;
-    let sessions_dir = proxenos_dir.join("sessions");
-    ensure_private_dir(&sessions_dir)?;
-    let provider_dir = sessions_dir.join(provider);
-    ensure_private_dir(&provider_dir)?;
+    let chain = provider_dir_chain(state_root, provider);
+    for dir in &chain {
+        ensure_private_dir(dir)?;
+    }
+    let [_, _, provider_dir] = chain;
     Ok(provider_dir)
 }
 
@@ -215,30 +274,91 @@ fn ensure_private_dir(path: &Path) -> io::Result<()> {
     let builder = &mut fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(builder, 0o700);
-    match builder.create(path) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if error.kind() == io::ErrorKind::AlreadyExists
-                && fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir()) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(error),
+    let _ = builder.create(path);
+    verify_existing_dir(path)
+}
+
+fn is_regular_file(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        meta.file_type().is_file() && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_file()
     }
 }
 
-fn read_session_file(path: &Path) -> io::Result<Vec<u8>> {
-    if !fs::symlink_metadata(path)?.file_type().is_file() {
+fn require_regular(meta: &fs::Metadata) -> io::Result<()> {
+    if !is_regular_file(meta) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "session path is not a regular file",
         ));
     }
+    Ok(())
+}
+
+fn open_regular_read(path: &Path) -> io::Result<fs::File> {
+    require_regular(&fs::symlink_metadata(path)?)?;
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NONBLOCK | libc::O_NOFOLLOW,
+    );
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+    );
     let file = options.open(path)?;
+    require_regular(&file.metadata()?)?;
+    Ok(file)
+}
+
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    let file = options.open(path)?;
+    require_regular(&file.metadata()?)?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn read_provider_session(base: &Path, provider: &str, thread_id: &str) -> io::Result<Vec<u8>> {
+    let chain = provider_dir_chain(base, provider);
+    for dir in &chain {
+        verify_existing_dir(dir)?;
+    }
+    let key = encode_thread_id(thread_id);
+    let _lock = match open_regular_read(&chain[2].join(format!("{key}.lock"))) {
+        Ok(file) => {
+            file.lock_shared()?;
+            Some(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    read_session_file(&chain[2].join(format!("{key}.json")))
+}
+
+fn read_session_file(path: &Path) -> io::Result<Vec<u8>> {
+    let file = open_regular_read(path)?;
     let mut bytes = Vec::new();
     file.take(MAX_SESSION_BYTES + 1).read_to_end(&mut bytes)?;
     Ok(bytes)

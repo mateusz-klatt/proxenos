@@ -194,7 +194,7 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
         report.content = text("response").map(String::from);
         report.model = text("model")
             .filter(|s| is_valid_model(s))
-            .map(String::from);
+            .map(|s| s.trim().to_owned());
     }
     if !success {
         let reason = text("error").unwrap_or(stderr.trim());

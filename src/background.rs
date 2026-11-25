@@ -10,11 +10,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::envelope::{Failure, FailureKind};
-use crate::mcp::{ToolOutcome, ToolSpec};
+use crate::mcp::{Activity, ToolOutcome, ToolSpec};
 
 pub const MAX_CONCURRENT: usize = 3;
 /// Final server-side `await` limit (owner decision, 2026-11-25).
 pub const AWAIT_LIMIT: Duration = Duration::from_secs(20);
+const MAX_AWAIT_HANDLES: usize = 16;
 const MAX_RETAINED_RESULTS: usize = 16;
 const MAX_RETAINED_BYTES: usize = 1 << 20;
 const RETENTION_TTL: Duration = Duration::from_secs(30 * 60);
@@ -64,6 +65,57 @@ impl Drop for SlotGuard {
     }
 }
 
+/// Owns a running background delegation's handle, concurrency slot and shutdown activity.
+/// Dropping it without calling [`finish`](Self::finish) (for instance on a panic unwind)
+/// releases the slot and completes the handle with an internal failure so it never stays stuck
+/// in `"running"`. Keeps `activity` alive until `complete` has returned.
+pub struct BackgroundTask {
+    background: Arc<Background>,
+    handle: String,
+    provider: &'static str,
+    slot: Option<SlotGuard>,
+    _activity: Activity,
+}
+
+impl BackgroundTask {
+    pub fn handle(&self) -> &str {
+        &self.handle
+    }
+
+    pub fn finish(mut self, state: &'static str, value: Value) {
+        // Free the concurrency slot before waking `await`, so a follow-up start
+        // issued right after `await` returns never races with the finished slot.
+        drop(self.slot.take());
+        self.background
+            .complete(&self.handle, self.provider, state, value);
+    }
+}
+
+impl Drop for BackgroundTask {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            drop(slot);
+            let failure = Failure::new(
+                FailureKind::Unknown,
+                format!(
+                    "The background {} delegation failed unexpectedly; the server is still running.",
+                    self.provider
+                ),
+            );
+            let value = json!({
+                "schema_version": 1,
+                "observed": {
+                    "provider": self.provider,
+                    "state": "failed",
+                    "failure": failure,
+                },
+            });
+            self.background
+                .complete(&self.handle, self.provider, "failed", value);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Condition {
     Any,
@@ -103,7 +155,8 @@ impl Background {
         self: &Arc<Self>,
         provider: &'static str,
         cancel: CancellationToken,
-    ) -> Option<(String, SlotGuard)> {
+        activity: Activity,
+    ) -> Option<BackgroundTask> {
         let mut state = lock(&self.state);
         if state.running >= MAX_CONCURRENT {
             return None;
@@ -120,12 +173,15 @@ impl Background {
         );
         drop(state);
         self.notify();
-        Some((
+        Some(BackgroundTask {
+            background: Arc::clone(self),
             handle,
-            SlotGuard {
+            provider,
+            slot: Some(SlotGuard {
                 background: Arc::clone(self),
-            },
-        ))
+            }),
+            _activity: activity,
+        })
     }
 
     pub fn complete(
@@ -303,6 +359,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "type": "array",
                 "items": { "type": "string", "minLength": 1 },
                 "minItems": 1,
+                "maxItems": MAX_AWAIT_HANDLES,
                 "description": "Process-local handles returned by delegations started with wait: false."
             },
             "condition": {
@@ -350,6 +407,9 @@ fn parse_await_args(args: &Map<String, Value>) -> Result<(Vec<String>, Condition
     let Some(items) = args.get("handles").and_then(Value::as_array) else {
         return Err("Missing or invalid handles array");
     };
+    if items.len() > MAX_AWAIT_HANDLES {
+        return Err("handles must contain at most 16 handles");
+    }
     let mut handles = Vec::with_capacity(items.len());
     for item in items {
         let Some(handle) = item
@@ -358,7 +418,9 @@ fn parse_await_args(args: &Map<String, Value>) -> Result<(Vec<String>, Condition
         else {
             return Err("Each handle must be a non-empty string");
         };
-        handles.push(handle.to_owned());
+        if !handles.iter().any(|seen| seen == handle) {
+            handles.push(handle.to_owned());
+        }
     }
     if handles.is_empty() {
         return Err("handles must contain at least one handle");

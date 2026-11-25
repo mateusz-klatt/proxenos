@@ -5,7 +5,7 @@ mod session;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::{empty_accounting, exit_signal, spawn};
+pub use unix::{current_uid, empty_accounting, exit_signal, spawn};
 
 #[cfg(windows)]
 mod windows;

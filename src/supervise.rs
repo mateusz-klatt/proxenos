@@ -54,6 +54,8 @@ pub enum Ending {
     Exited,
     TimedOut,
     Cancelled,
+    #[cfg(unix)]
+    MemoryLimit,
 }
 
 pub(crate) enum StartError {
@@ -74,6 +76,8 @@ impl Ending {
             Self::Exited => "exited",
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
+            #[cfg(unix)]
+            Self::MemoryLimit => "memory_limit",
         }
     }
 }
@@ -217,6 +221,17 @@ pub async fn run(
         };
         let watch = async {
             let remaining = launch.deadline.saturating_duration_since(Instant::now());
+            #[cfg(unix)]
+            let ending = tokio::select! {
+                biased;
+                result = child.wait_for_exit() => match result? {
+                    Ending::Exited => return Ok(Ending::Exited),
+                    ending => ending,
+                },
+                () = cancel.cancelled() => Ending::Cancelled,
+                () = tokio::time::sleep(remaining) => Ending::TimedOut,
+            };
+            #[cfg(windows)]
             let ending = tokio::select! {
                 biased;
                 result = child.wait_for_exit() => return result.map(|()| Ending::Exited),
@@ -234,11 +249,8 @@ pub async fn run(
         }
     };
     // Close the group or job even when a reader or the stop failed. Preserve the first error
-    // alongside the dispatch evidence that was already observed.
-    let (status, accounting) = match child.finish().await {
-        Ok((status, accounting)) => (Ok(status), accounting),
-        Err(error) => (Err(error), platform::empty_accounting(memory_limit_bytes)),
-    };
+    // alongside the dispatch evidence and accounting that were already observed.
+    let (status, accounting) = child.finish().await;
     let code = status.as_ref().ok().and_then(ExitStatus::code);
     let signal = status.as_ref().ok().and_then(platform::exit_signal);
     let ending_kind = ending.as_ref().copied().unwrap_or(Ending::Exited);

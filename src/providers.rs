@@ -15,7 +15,8 @@ use crate::mcp::ToolSpec;
 use crate::supervise::Finished;
 
 pub const ALL: &[Provider] = &[codex::SPEC, antigravity::SPEC];
-const DEFAULT_TIMEOUT_MS: u64 = 3_600_000;
+pub const DEFAULT_TIMEOUT_MS: u64 = 3_600_000;
+const MAX_MODEL_LEN: usize = 256;
 
 pub struct Provider {
     pub name: &'static str,
@@ -58,7 +59,11 @@ pub struct RememberedStart {
 
 /// Validates a model name from either a caller or untrusted provider output.
 pub fn is_valid_model(value: &str) -> bool {
-    !value.trim().is_empty() && !value.contains(char::is_control) && !value.starts_with('-')
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && value.len() <= MAX_MODEL_LEN
+        && !value.contains(char::is_control)
+        && !trimmed.starts_with('-')
 }
 
 // A native pathname need not be Unicode. JSON can represent only the Unicode case.
@@ -270,7 +275,7 @@ impl Provider {
             .ok()
             .ok_or("Cannot resolve the working directory")?;
         if let Some(s) = text("model") {
-            settings.model = Some(s.into());
+            settings.model = Some(s.trim().into());
         }
         if let Some(s) = text("effort") {
             settings.effort = Some(s.into());

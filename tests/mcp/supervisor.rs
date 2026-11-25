@@ -417,6 +417,24 @@ fn a_child_ignoring_sigterm_is_killed_after_three_seconds() {
 
 #[cfg(unix)]
 #[test]
+fn a_memory_limit_ending_runs_one_stop_even_past_deadline() {
+    let mut args = launch(json!(["ignore-term", "sleep:60000"]));
+    args["memory_limit_bytes"] = json!(1);
+    args["deadline_ms"] = json!(1500);
+    let mut server = server();
+    let started = Instant::now();
+    let result = finished(&server.call(1, "test_run", args));
+    let elapsed = started.elapsed();
+    assert_eq!(result["ending"], "memory_limit", "{result}");
+    assert_eq!(result["signal"], libc::SIGKILL, "{result}");
+    assert!(
+        elapsed >= Duration::from_millis(2900) && elapsed < Duration::from_millis(5500),
+        "memory_limit stop took {elapsed:?}: {result}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn an_escaped_descendant_cannot_keep_the_readers_open() {
     let directory = Directory::new();
     let lock = directory.0.join("escaped");
