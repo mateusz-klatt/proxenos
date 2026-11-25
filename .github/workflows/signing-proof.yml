@@ -1,0 +1,287 @@
+name: Windows signing proof
+
+# Manual proof for Certum cloud Authenticode signing on throwaway Windows Rust
+# builds. Runs only on workflow_dispatch on main. Compilation runs without
+# credentials; signing runs in the `release` environment without Cargo; native
+# verification runs on windows-latest without credentials. Uploads 1-day
+# artifacts and never creates or publishes a release.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: certum-signing
+  cancel-in-progress: false
+
+jobs:
+  signer:
+    name: Build pinned Certum signer
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - name: Verify exact repository and main ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Le-Syl21/ssign
+          ref: f7ba7b2360a3e40bb8aa062d244d95c62a743b90 # v0.1.8, MIT
+          path: ssign
+          persist-credentials: false
+
+      - name: Build ssign without credentials
+        id: build
+        working-directory: ssign
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal
+          cargo +1.99.1 build --release --locked
+          digest="$(sha256sum target/release/ssign | awk '{print $1}')"
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+          printf '`ssign` build SHA-256 (for transit integrity): `%s`\n' "$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: certum-signer-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ssign/target/release/ssign
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: Build throwaway unsigned Windows binaries
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      amd64-sha256: ${{ steps.build.outputs.amd64-sha256 }}
+      arm64-sha256: ${{ steps.build.outputs.arm64-sha256 }}
+    steps:
+      - name: Verify exact repository and main ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.1'
+          use-cache: false
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-zigbuild@0.24.1,cargo-auditable@0.7.7
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version --verbose
+          zig version
+          cargo-zigbuild --version
+
+      - name: Cross-build two disposable Windows release binaries without credentials
+        id: build
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS: -C link-arg=-lunwind
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm
+          cargo auditable zigbuild --release --locked --target x86_64-pc-windows-gnu
+          cargo auditable zigbuild --release --locked --target aarch64-pc-windows-gnullvm
+          mkdir -p "$RUNNER_TEMP/windows/amd64" "$RUNNER_TEMP/windows/arm64"
+          cp target/x86_64-pc-windows-gnu/release/proxenos.exe "$RUNNER_TEMP/windows/amd64/proxenos.exe"
+          cp target/aarch64-pc-windows-gnullvm/release/proxenos.exe "$RUNNER_TEMP/windows/arm64/proxenos.exe"
+          echo "amd64-sha256=$(sha256sum "$RUNNER_TEMP/windows/amd64/proxenos.exe" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "arm64-sha256=$(sha256sum "$RUNNER_TEMP/windows/arm64/proxenos.exe" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: unsigned-windows-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/windows/amd64/proxenos.exe
+            ${{ runner.temp }}/windows/arm64/proxenos.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign throwaway Windows binaries with Certum
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    needs: [signer, build]
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      amd64-sha256: ${{ steps.sign.outputs.amd64-sha256 }}
+      arm64-sha256: ${{ steps.sign.outputs.arm64-sha256 }}
+    steps:
+      - name: Verify exact repository and main ref before signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.signer.outputs.artifact-id }}
+          path: ${{ runner.temp }}/signer
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/windows
+
+      - name: Verify signer and unsigned binary handoff digests (transit integrity) and sign both binaries
+        id: sign
+        shell: bash
+        env:
+          EXPECTED_SIGNER_SHA256: ${{ needs.signer.outputs.sha256 }}
+          EXPECTED_AMD64_SHA256: ${{ needs.build.outputs.amd64-sha256 }}
+          EXPECTED_ARM64_SHA256: ${{ needs.build.outputs.arm64-sha256 }}
+          CERTUM_EMAIL: ${{ secrets.CERTUM_EMAIL }}
+          CERTUM_OTP: ${{ secrets.CERTUM_OTP }}
+          PROXENOS_WINDOWS_SIGNER: ${{ runner.temp }}/signer/ssign
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/certum-signing-step
+        # Runs ssign twice in separate processes with only the five allowlisted
+        # environment variables and suppressed stdio. ssign caches a reusable
+        # OAuth session under $XDG_RUNTIME_DIR/ssign; the EXIT trap removes that
+        # step-private directory when this step finishes (including on failure).
+        run: |
+          set -euo pipefail
+          trap 'test -n "${RUNNER_TEMP:-}" && rm -rf "$RUNNER_TEMP/certum-signing-step"' EXIT
+          printf '%s  %s\n' "$EXPECTED_SIGNER_SHA256" "$PROXENOS_WINDOWS_SIGNER" | sha256sum --check --strict
+          test "$(find "$RUNNER_TEMP/windows" ! -type d | LC_ALL=C sort)" = "$(printf '%s\n' "$RUNNER_TEMP/windows/amd64/proxenos.exe" "$RUNNER_TEMP/windows/arm64/proxenos.exe")"
+          printf '%s  %s\n' "$EXPECTED_AMD64_SHA256" "$RUNNER_TEMP/windows/amd64/proxenos.exe" | sha256sum --check --strict
+          printf '%s  %s\n' "$EXPECTED_ARM64_SHA256" "$RUNNER_TEMP/windows/arm64/proxenos.exe" | sha256sum --check --strict
+          python3 -I - <<'PY'
+          import os
+          import stat
+          import subprocess
+          import sys
+
+          signer = os.environ.get("PROXENOS_WINDOWS_SIGNER", "")
+          runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
+          if not (os.path.isabs(signer) and os.path.isabs(runtime_dir) and os.environ.get("CERTUM_EMAIL") and os.environ.get("CERTUM_OTP")):
+              sys.exit("Windows signing configuration is incomplete")
+          if os.path.islink(signer) or not stat.S_ISREG(os.stat(signer).st_mode):
+              sys.exit("Windows signer executable is unavailable")
+          os.chmod(signer, 0o700)
+          os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+          os.chmod(runtime_dir, 0o700)
+          cache_dir = os.path.join(runtime_dir, "ssign")
+          os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+          os.chmod(cache_dir, 0o700)
+          env = {k: os.environ.get(k, "") for k in ("CERTUM_EMAIL", "CERTUM_OTP", "XDG_RUNTIME_DIR", "HOME", "PATH")}
+
+          for arch in ("amd64", "arm64"):
+              path = os.path.join(os.environ["RUNNER_TEMP"], "windows", arch, "proxenos.exe")
+              if os.path.islink(path) or not stat.S_ISREG(os.stat(path).st_mode):
+                  sys.exit(f"Windows binary missing for {arch}")
+              try:
+                  res = subprocess.run([signer, path], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+              except subprocess.TimeoutExpired:
+                  sys.exit(f"Windows signing deadline exceeded for {arch}")
+              if res.returncode != 0:
+                  sys.exit(f"Windows signing failed for {arch}")
+          PY
+          echo "amd64-sha256=$(sha256sum "$RUNNER_TEMP/windows/amd64/proxenos.exe" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "arm64-sha256=$(sha256sum "$RUNNER_TEMP/windows/arm64/proxenos.exe" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: signed-windows-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/windows/amd64/proxenos.exe
+            ${{ runner.temp }}/windows/arm64/proxenos.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    name: Verify signed Windows proof binaries
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    needs: sign
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions: {}
+    env:
+      # Owner's Certum open-source code-signing certificate (valid until 2027-11-10).
+      # Update this pin in both release.yml and signing-proof.yml when renewed.
+      EXPECTED_SIGNER_THUMBPRINT: '9C837C68415187A72D88612BDF14FCB0D6623D67'
+      EXPECTED_AMD64_SHA256: ${{ needs.sign.outputs.amd64-sha256 }}
+      EXPECTED_ARM64_SHA256: ${{ needs.sign.outputs.arm64-sha256 }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.sign.outputs.artifact-id }}
+          path: ${{ runner.temp }}/windows
+
+      - name: Verify signed digests, signatures and amd64 execution on Windows
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows'
+          $expected = 'amd64/proxenos.exe', 'arm64/proxenos.exe'
+          $items = @(Get-ChildItem -LiteralPath $root -Recurse -Force | Where-Object { -not $_.PSIsContainer })
+          $files = @($items | ForEach-Object {
+            [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
+          })
+          if ($items.Count -ne 2 -or @($items | Where-Object { $_.LinkType }).Count -ne 0 -or @($files | Where-Object { $_ -cnotin $expected }).Count -ne 0) {
+            throw "Signing proof artifact must contain only amd64/proxenos.exe and arm64/proxenos.exe."
+          }
+          $expectedHashes = @{
+            amd64 = $env:EXPECTED_AMD64_SHA256
+            arm64 = $env:EXPECTED_ARM64_SHA256
+          }
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "Windows SDK signtool.exe was not found." }
+          foreach ($arch in 'amd64', 'arm64') {
+            $file = Join-Path $root "$arch/proxenos.exe"
+            $actualHash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -cne $expectedHashes[$arch]) {
+              throw "Signed binary SHA-256 mismatch for ${arch}: $actualHash != $($expectedHashes[$arch])"
+            }
+            & $signtool verify /pa /all /v /tw $file
+            if ($LASTEXITCODE -ne 0) { throw "signtool verification failed for $arch (exit $LASTEXITCODE)." }
+            $signature = Get-AuthenticodeSignature -FilePath $file
+            if ($signature.Status -ne 'Valid' -or
+                $null -eq $signature.TimeStamperCertificate -or
+                $signature.SignerCertificate.Thumbprint -ne $env:EXPECTED_SIGNER_THUMBPRINT) {
+              throw "Authenticode verification failed for ${arch}: expected a valid, timestamped signature from the pinned certificate."
+            }
+            "${arch}: valid timestamped signature; signer $($signature.SignerCertificate.Thumbprint); timestamp signer $($signature.TimeStamperCertificate.Subject)" >> $env:GITHUB_STEP_SUMMARY
+          }
+          $actual = (& (Join-Path $root "amd64/proxenos.exe") --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^proxenos ') {
+            throw "Unexpected Windows amd64 version output: $actual"
+          }
+          "amd64 execution: ``$actual``" >> $env:GITHUB_STEP_SUMMARY

@@ -1,0 +1,83 @@
+version: 2
+project_name: proxenos
+
+# D11: GoReleaser builds Proxenos with its Rust builder (cargo auditable zigbuild)
+# in credential-free jobs. Publication and signing are disabled here so a local
+# `goreleaser release` with a personal token cannot create a draft or sign outside
+# the release workflow. Snapshot builds use this config directly to exercise all
+# six targets, archives, target-specific Syft SBOMs and checksums with no secrets.
+release:
+  disable: true
+
+builds:
+  - id: proxenos-darwin
+    builder: rust
+    binary: proxenos
+    command: auditablezigbuild
+    skip: '{{ eq (envOrDefault "PROXENOS_BUILD_GROUP" "all") "linux-windows" }}'
+    targets:
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+    flags:
+      - --release
+      - --locked
+    env:
+      # Cargo expands this single-word alias to `cargo auditable zigbuild`,
+      # embedding target-specific crate metadata for Syft in every binary.
+      - CARGO_ALIAS_AUDITABLEZIGBUILD=auditable zigbuild
+
+  - id: proxenos
+    builder: rust
+    binary: proxenos
+    command: auditablezigbuild
+    skip: '{{ eq (envOrDefault "PROXENOS_BUILD_GROUP" "all") "darwin" }}'
+    targets:
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+      - x86_64-pc-windows-gnu
+      - aarch64-pc-windows-gnullvm
+    flags:
+      - --release
+      - --locked
+    env:
+      - CARGO_ALIAS_AUDITABLEZIGBUILD=auditable zigbuild
+      # Zig's Windows ARM64 GNU wrapper does not add libunwind automatically from
+      # rustc's --unwindlib=libunwind; link it explicitly for panic unwinding (D4).
+      - CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS=-C link-arg=-lunwind
+
+archives:
+  - id: proxenos
+    ids:
+      - proxenos
+      - proxenos-darwin
+    name_template: 'proxenos_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    # Fixed ownership and commit timestamp avoid recording builder identity.
+    builds_info:
+      owner: root
+      group: root
+      mode: 0755
+      mtime: '{{ .CommitDate }}'
+    files:
+      - src: LICENSE
+        info: &fixed
+          owner: root
+          group: root
+          mode: 0644
+          mtime: '{{ .CommitDate }}'
+      - src: NOTICE
+        info: *fixed
+
+checksum:
+  name_template: checksums.txt
+  extra_files:
+    - glob: '{{ if isEnvSet "PROXENOS_MACOS_DIST" }}{{ .Env.PROXENOS_MACOS_DIST }}/*{{ end }}'
+
+sboms:
+  - artifacts: archive
+    cmd: syft

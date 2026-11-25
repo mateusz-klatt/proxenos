@@ -47,3 +47,9 @@ all = { level = "deny", priority = -1 }
 dbg_macro = "deny"
 print_stdout = "deny"
 todo = "deny"
+
+[profile.release]
+# Strip symbols and enable thin LTO for smaller release binaries while keeping
+# panic = "unwind" so D4's handler panic-catching still unwinds cleanly.
+strip = "symbols"
+lto = "thin"

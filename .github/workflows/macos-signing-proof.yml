@@ -1,0 +1,264 @@
+name: macOS signing proof
+
+# Manual proof for Apple Developer ID signing and notarization on throwaway
+# macOS Rust builds. Runs only on workflow_dispatch on main. Compilation runs
+# without credentials; signing and notarization run on macos-latest in the
+# `release` environment without Cargo; native verification runs separately
+# without credentials. Uploads 1-day artifacts and never publishes a release.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-signing-proof
+  cancel-in-progress: false
+
+env:
+  GORELEASER_VERSION: v2.20.0
+  GORELEASER_TARBALL_SHA256_DARWIN_ALL: b4f0702bcb2aad05bd13af5ac69ec94d84270dce59b917e7a8c446c974e29372
+  GORELEASER_SHA256_DARWIN_ALL: a8130ffe0c8d4fdcebc3bd62f51693bc928d2382aa74b82a7fd9fa7de5138b79
+
+jobs:
+  build:
+    name: Build throwaway unsigned macOS binaries
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      amd64-sha256: ${{ steps.build.outputs.amd64-sha256 }}
+      arm64-sha256: ${{ steps.build.outputs.arm64-sha256 }}
+    steps:
+      - name: Verify exact repository and main ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.1'
+          use-cache: false
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-zigbuild@0.24.1,cargo-auditable@0.7.7
+
+      - name: Install verified goreleaser binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/goreleaser/goreleaser/releases/download/${GORELEASER_VERSION}/goreleaser_Darwin_all.tar.gz" \
+            -o "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz"
+          printf '%s  %s\n' "$GORELEASER_TARBALL_SHA256_DARWIN_ALL" "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz" -C "$RUNNER_TEMP/tools" goreleaser
+          printf '%s  %s\n' "$GORELEASER_SHA256_DARWIN_ALL" "$RUNNER_TEMP/tools/goreleaser" | shasum -a 256 -c -
+          chmod 0755 "$RUNNER_TEMP/tools/goreleaser"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          cargo --version --verbose
+          zig version
+          cargo-zigbuild --version
+          "$RUNNER_TEMP/tools/goreleaser" --version
+
+      - name: Build unsigned macOS snapshot binaries without credentials
+        id: build
+        shell: bash
+        env:
+          PROXENOS_BUILD_GROUP: darwin
+        run: |
+          set -euo pipefail
+          goreleaser build --snapshot --clean --parallelism=1
+          echo "amd64-sha256=$(shasum -a 256 dist/proxenos-darwin_x86_64-apple-darwin/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "arm64-sha256=$(shasum -a 256 dist/proxenos-darwin_aarch64-apple-darwin/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: unsigned-macos-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/proxenos-darwin_x86_64-apple-darwin/proxenos
+            dist/proxenos-darwin_aarch64-apple-darwin/proxenos
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign and notarize throwaway macOS binaries
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: macos-latest
+    environment: release
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      amd64-sha256: ${{ steps.sign.outputs.amd64-sha256 }}
+      arm64-sha256: ${{ steps.sign.outputs.arm64-sha256 }}
+    steps:
+      - name: Verify exact repository and main ref before signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/macos-unsigned
+
+      - name: Verify unsigned digests, sign with Developer ID and notarize via Apple notarytool
+        id: sign
+        shell: bash
+        env:
+          EXPECTED_AMD64_SHA256: ${{ needs.build.outputs.amd64-sha256 }}
+          EXPECTED_ARM64_SHA256: ${{ needs.build.outputs.arm64-sha256 }}
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+        run: |
+          set -euo pipefail
+          for credential in MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_ISSUER_ID MACOS_NOTARY_KEY_ID MACOS_NOTARY_KEY; do
+            if [ -z "${!credential}" ]; then
+              echo "::error::$credential is empty"
+              exit 1
+            fi
+          done
+
+          test "$(find "$RUNNER_TEMP/macos-unsigned" ! -type d | LC_ALL=C sort)" = "$(printf '%s\n' "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_aarch64-apple-darwin/proxenos" "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_x86_64-apple-darwin/proxenos")"
+          printf '%s  %s\n' "$EXPECTED_AMD64_SHA256" "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_x86_64-apple-darwin/proxenos" | shasum -a 256 -c -
+          printf '%s  %s\n' "$EXPECTED_ARM64_SHA256" "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_aarch64-apple-darwin/proxenos" | shasum -a 256 -c -
+
+          IDENTITY="Developer ID Application: Mateusz Klatt (26MP7QQP95)"
+          KEYCHAIN_PASS="$(openssl rand -hex 24)"
+          trap 'security delete-keychain "$RUNNER_TEMP/proxenos-signing.keychain-db" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/AuthKey.p8"' EXIT
+
+          python3 -I - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          def write_owner_only(path: Path, data: bytes) -> None:
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+              try:
+                  os.fchmod(fd, 0o600)
+                  os.write(fd, data)
+              finally:
+                  os.close(fd)
+
+          rt = Path(os.environ["RUNNER_TEMP"])
+          write_owner_only(rt / "developer-id.p12", base64.b64decode(os.environ["MACOS_SIGN_P12"]))
+          write_owner_only(rt / "AuthKey.p8", base64.b64decode(os.environ["MACOS_NOTARY_KEY"]))
+          PY
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security import "$RUNNER_TEMP/developer-id.p12" -P "$MACOS_SIGN_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security find-identity -v -p codesigning "$RUNNER_TEMP/proxenos-signing.keychain-db" | grep -F "$IDENTITY"
+
+          for target in proxenos-darwin_x86_64-apple-darwin proxenos-darwin_aarch64-apple-darwin; do
+            binary="$RUNNER_TEMP/macos-unsigned/$target/proxenos"
+            zip_path="$RUNNER_TEMP/notarize-${target}.zip"
+            notary_json="$RUNNER_TEMP/notary-${target}.json"
+            chmod +x "$binary"
+            codesign --force --options runtime --timestamp --keychain "$RUNNER_TEMP/proxenos-signing.keychain-db" --sign "$IDENTITY" "$binary"
+            codesign --verify --strict --verbose=2 "$binary"
+            ditto -c -k --keepParent "$binary" "$zip_path"
+            xcrun notarytool submit "$zip_path" \
+              --key "$RUNNER_TEMP/AuthKey.p8" \
+              --key-id "$MACOS_NOTARY_KEY_ID" \
+              --issuer "$MACOS_NOTARY_ISSUER_ID" \
+              --wait \
+              --timeout 20m \
+              --output-format json > "$notary_json"
+            python3 -I - "$target" "$notary_json" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          target, json_path = sys.argv[1], Path(sys.argv[2])
+          data = json.loads(json_path.read_text())
+          status = data.get("status")
+          sub_id = data.get("id", "<unknown>")
+          if status != "Accepted":
+              raise SystemExit(f"Apple notarization did not accept {target}: status={status!r}, id={sub_id!r}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"Apple accepted notarization for `{target}` (submission `{sub_id}`)\n\n")
+          PY
+          done
+
+          echo "amd64-sha256=$(shasum -a 256 "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_x86_64-apple-darwin/proxenos" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "arm64-sha256=$(shasum -a 256 "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_aarch64-apple-darwin/proxenos" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: macos-signing-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/macos-unsigned/proxenos-darwin_x86_64-apple-darwin/proxenos
+            ${{ runner.temp }}/macos-unsigned/proxenos-darwin_aarch64-apple-darwin/proxenos
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    name: Verify signed macOS proof binaries
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    needs: sign
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.sign.outputs.artifact-id }}
+          path: ${{ runner.temp }}/macos-proof
+
+      - name: Verify signed digests, signatures, notarization and arm64 execution
+        shell: bash
+        env:
+          EXPECTED_AMD64_SHA256: ${{ needs.sign.outputs.amd64-sha256 }}
+          EXPECTED_ARM64_SHA256: ${{ needs.sign.outputs.arm64-sha256 }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          cd "$RUNNER_TEMP/macos-proof"
+          test "$(find . ! -type d | LC_ALL=C sort)" = "$(printf '%s\n' ./proxenos-darwin_aarch64-apple-darwin/proxenos ./proxenos-darwin_x86_64-apple-darwin/proxenos)"
+          printf '%s  %s\n' "$EXPECTED_AMD64_SHA256" "./proxenos-darwin_x86_64-apple-darwin/proxenos" | shasum -a 256 -c -
+          printf '%s  %s\n' "$EXPECTED_ARM64_SHA256" "./proxenos-darwin_aarch64-apple-darwin/proxenos" | shasum -a 256 -c -
+          for target in proxenos-darwin_x86_64-apple-darwin proxenos-darwin_aarch64-apple-darwin; do
+            binary="./$target/proxenos"
+            chmod +x "$binary"
+            printf '\n### %s\n\n```text\n' "$target" >> "$GITHUB_STEP_SUMMARY"
+            codesign --verify --strict --verbose=2 "$binary" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+            codesign -dv --verbose=4 "$binary" 2>&1 | tee "$RUNNER_TEMP/macos-signature.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -Fx 'Authority=Developer ID Application: Mateusz Klatt (26MP7QQP95)' "$RUNNER_TEMP/macos-signature.txt"
+            grep -Fx 'TeamIdentifier=26MP7QQP95' "$RUNNER_TEMP/macos-signature.txt"
+            grep -E '^CodeDirectory .*flags=.*\(.*runtime.*\)' "$RUNNER_TEMP/macos-signature.txt"
+            grep -E '^Timestamp=.+$' "$RUNNER_TEMP/macos-signature.txt"
+            spctl -a -vvv -t install "$binary" 2>&1 | tee "$RUNNER_TEMP/macos-assessment.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -Fx "$binary: accepted" "$RUNNER_TEMP/macos-assessment.txt"
+            grep -Fx 'source=Notarized Developer ID' "$RUNNER_TEMP/macos-assessment.txt"
+            printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+          done
+          actual="$(./proxenos-darwin_aarch64-apple-darwin/proxenos --version)"
+          printf '%s\n' "$actual" | grep -E '^proxenos '
+          printf '\n### arm64 execution\n\n```text\n%s\n```\n' "$actual" >> "$GITHUB_STEP_SUMMARY"
