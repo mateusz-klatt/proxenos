@@ -163,6 +163,14 @@ fn launch_failure_and_abnormal_exit_report_different_evidence() {
         json!({"prompt":"run","cwd":fleet.root.join("gone")}),
     );
     assert_observed_failure(&failed, "launch", "");
+    // A launch failure from the version probe would not exercise the missing directory.
+    assert!(
+        !failed["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Version check"),
+        "{failed}"
+    );
     assert!(failed["observed"]["passed"].is_null());
     fleet.assert_steps_remaining("agy", 1);
     let exit = call(&mut server, "antigravity", json!({"prompt":"run"}));

@@ -195,6 +195,14 @@ fn unavailable_scratch_space_omits_git_observations_and_prevents_dispatch() {
         json!({"cwd": repo.repo, "prompt": "check"}),
     );
     assert_observed_failure(&result, "launch", "");
+    // A launch failure from the version probe would not exercise the missing scratch space.
+    assert!(
+        !result["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Version check"),
+        "{result}"
+    );
     assert!(result["observed"]["git"].is_null());
     assert_eq!(repo.fleet.records().len(), 1);
     assert_eq!(repo.fleet.records()[0]["args"], json!(["--version"]));
