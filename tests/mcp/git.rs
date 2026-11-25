@@ -103,18 +103,21 @@ fn git_records_commit_and_paths_before_and_after_a_provider_timeout() {
     )
     .unwrap();
     repo.git(&["config", "filter.private.required", "true"]);
-    repo.fleet.script("agy", json!([{"sleep_ms":30000}]));
+    let ready = repo.fleet.root.join("agy.ready");
+    repo.fleet
+        .script("agy", json!([{"ready": ready, "sleep_ms": 30000}]));
     let mut server = repo.server(&repo.fleet.root);
+    server.request(1, "tools/list", json!({}));
     server.start_call(
         7,
         "antigravity",
         json!({"cwd":subdir,"prompt":"check","timeout_ms":3000}),
     );
-    // The stub consumes its step after the before snapshot. Another writer can edit the
+    // The stub signals readiness after the before snapshot. Another writer can edit the
     // checkout while the supervised turn is running.
     let deadline = Instant::now() + Duration::from_secs(20);
-    while fs::read(repo.fleet.root.join("agy.steps")).unwrap() != b"[]" {
-        assert!(Instant::now() < deadline, "stub never ran");
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "stub never reached ready");
         std::thread::sleep(Duration::from_millis(10));
     }
     fs::write(subdir.join("during turn"), "new").unwrap();
@@ -138,8 +141,15 @@ fn git_handles_an_unborn_repo_and_omits_an_unavailable_worktree() {
     let repo = Repository::new();
     fs::write(repo.repo.join("staged"), "text").unwrap();
     repo.git(&["add", "staged"]);
-    let external = repo.fleet.root.join("outside");
-    fs::create_dir(&external).unwrap();
+    struct Outside(PathBuf);
+    impl Drop for Outside {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let external =
+        Outside(env::temp_dir().join(format!("proxenos-outside-{}", uuid::Uuid::new_v4())));
+    fs::create_dir(&external.0).unwrap();
     repo.fleet
         .script("agy", json!([turn("first"), turn("second")]));
     // Keep private scratch inside this checkout. None of its names belong in the result.
@@ -159,7 +169,7 @@ fn git_handles_an_unborn_repo_and_omits_an_unavailable_worktree() {
     let outside = call(
         &mut server,
         "antigravity",
-        json!({"cwd":external,"prompt":"check"}),
+        json!({"cwd":&external.0,"prompt":"check"}),
     );
     assert_eq!(outside["observed"]["state"], "finished", "{outside}");
     assert!(outside["observed"]["git"].is_null());

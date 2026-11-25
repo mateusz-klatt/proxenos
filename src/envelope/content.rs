@@ -10,7 +10,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{Envelope, Failure, FailureKind};
-use crate::supervise::cleanup::create_private_directory;
+use crate::supervise::cleanup::{create_private_directory, temp_root};
 
 pub const CAPTURE_LIMIT: usize = 4 << 20;
 const EXCERPT: usize = 16 << 10;
@@ -38,7 +38,7 @@ impl AnswerArchive {
     fn save(&self, answer: &str) -> io::Result<String> {
         let mut slot = self.0.lock().unwrap();
         if slot.is_none() {
-            let path = std::env::temp_dir().join(format!("proxenos-answers-{}", Uuid::new_v4()));
+            let path = temp_root()?.join(format!("proxenos-answers-{}", Uuid::new_v4()));
             create_private_directory(&path)?;
             *slot = Some(Directory {
                 path,
@@ -68,32 +68,56 @@ impl AnswerArchive {
 }
 
 impl Envelope {
-    pub async fn excerpt(&mut self, archive: &AnswerArchive) {
-        let Some(content) = self.report.content.take_if(|text| text.len() > EXCERPT) else {
+    async fn retain(
+        &mut self,
+        archive: &AnswerArchive,
+        prefix: &str,
+        text: &mut String,
+        report_capture_as_failure: bool,
+    ) {
+        if text.len() <= EXCERPT {
             return;
-        };
-        self.observed["content_captured_bytes"] = json!(content.len());
-        self.report.content = Some(content[..content.floor_char_boundary(EXCERPT)].to_owned());
-        let bytes = content.floor_char_boundary(CAPTURE_LIMIT);
+        }
+        let captured = std::mem::take(text);
+        self.observed[format!("{prefix}_captured_bytes")] = json!(captured.len());
+        *text = captured[..captured.floor_char_boundary(EXCERPT)].to_owned();
+        let bytes = captured.floor_char_boundary(CAPTURE_LIMIT);
         let archive = archive.clone();
-        let saved = tokio::task::spawn_blocking(move || archive.save(&content[..bytes]))
+        let saved = tokio::task::spawn_blocking(move || archive.save(&captured[..bytes]))
             .await
             .expect("answer writer completed");
         match saved {
             Ok(path) => {
-                self.observed["content_file"] = json!(path);
-                self.observed["content_file_bytes"] = json!(bytes);
+                self.observed[format!("{prefix}_file")] = json!(path);
+                self.observed[format!("{prefix}_file_bytes")] = json!(bytes);
             }
             Err(error) => {
                 let failure = Failure::new(
                     FailureKind::Capture,
-                    format!("Could not retain the captured answer: {error}"),
+                    format!("Could not retain the captured {prefix}: {error}"),
                 );
                 self.observed["capture_error"] = json!(failure);
-                if self.report.failure.is_none() {
+                if report_capture_as_failure {
                     self.fail(failure);
                 }
             }
+        }
+    }
+
+    pub async fn excerpt(&mut self, archive: &AnswerArchive) {
+        if let Some(mut content) = self.report.content.take() {
+            let no_turn_failure = self.report.failure.is_none();
+            self.retain(archive, "content", &mut content, no_turn_failure)
+                .await;
+            self.report.content = Some(content);
+        }
+        if let Some(mut failure) = self.report.failure.take() {
+            self.retain(archive, "failure", &mut failure.message, false)
+                .await;
+            if let Some(reset) = &mut failure.reset_at {
+                reset.truncate(reset.floor_char_boundary(EXCERPT));
+            }
+            self.report.failure = Some(failure);
         }
     }
 }

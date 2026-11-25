@@ -35,16 +35,55 @@ fn expand(shim: &Path, search: &[PathBuf]) -> Result<Executable, Failure> {
     };
     let source = fs::read_to_string(shim).map_err(|_| unsupported())?;
     let dir = shim.parent().expect("shim in a directory");
+    // Every non-comment line of the wrapper must belong to a recognized shape. Any control
+    // flow, environment change or trailing command outside that shape is unsupported.
+    const NPM_PREAMBLE: &[&str] = &[
+        "echo off",
+        "goto start",
+        ":find_dp0",
+        "set dp0=%~dp0",
+        "exit /b",
+        ":start",
+        "setlocal",
+        "call :find_dp0",
+        "if exist \"%dp0%\\node.exe\" (",
+        "set \"_prog=%dp0%\\node.exe\"",
+        ") else (",
+        "set \"_prog=node\"",
+        "set pathext=%pathext:;.js;=;%",
+        ")",
+    ];
+    let lines: Vec<(&str, String)> = source
+        .lines()
+        .map(|line| line.trim().trim_start_matches('@').trim_start())
+        .filter(|line| !line.is_empty())
+        .map(|line| (line, line.to_ascii_lowercase()))
+        .filter(|(_, lower)| lower != "rem" && !lower.starts_with("rem "))
+        .collect();
+    let mut rest = lines.as_slice();
+    let mut npm_node = false;
+    if rest.len() >= NPM_PREAMBLE.len()
+        && rest[..NPM_PREAMBLE.len()]
+            .iter()
+            .zip(NPM_PREAMBLE)
+            .all(|((_, lower), expected)| lower == expected)
+    {
+        npm_node = true;
+        rest = &rest[NPM_PREAMBLE.len()..];
+    }
     // npm uses both %~dp0 directly and a variable assigned to it. Vendors choose different
     // variable names. No other environment or command substitutions are supported.
     let mut bases = vec![String::from("%~dp0"), String::from("%dp0%")];
-    let mut npm_node = false;
     let mut invocation = None;
-    for line in source.lines() {
-        let line = line.trim().trim_start_matches('@');
-        let lower = line.to_ascii_lowercase();
+    for &(line, ref lower) in rest {
+        if invocation.is_some() {
+            return Err(unsupported());
+        }
+        if matches!(lower.as_str(), "echo off" | "setlocal") {
+            continue;
+        }
         if let Some(assignment) = lower.strip_prefix("set ") {
-            let assignment = assignment.trim_matches('"');
+            let assignment = assignment.trim().trim_matches('"');
             if let Some(value) = assignment.strip_prefix("_prog=") {
                 if !matches!(
                     value,
@@ -53,14 +92,19 @@ fn expand(shim: &Path, search: &[PathBuf]) -> Result<Executable, Failure> {
                     return Err(unsupported());
                 }
                 npm_node = true;
-            }
-            if let Some(name) = assignment.strip_suffix("=%~dp0") {
+            } else if let Some(name) = assignment.strip_suffix("=%~dp0")
+                && !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
                 bases.push(format!("%{name}%"));
+            } else {
+                return Err(unsupported());
             }
-        } else if let Some(call) = line.strip_suffix("%*")
-            && !lower.starts_with("rem ")
-            && invocation.replace(call.trim_end()).is_some()
-        {
+        } else if let Some(call) = line.strip_suffix("%*") {
+            invocation = Some(call.trim_end());
+        } else {
             return Err(unsupported());
         }
     }

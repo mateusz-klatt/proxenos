@@ -112,7 +112,9 @@ receive the cancellation result during the drain described in D4.
 
 The supervisor keeps the first 4 MiB from each stream and reads up to 4 MiB of the Codex
 final-message file. Output beyond the limit can include a terminal record that the parser cannot
-see. Answers longer than 16 KiB have a UTF-8 excerpt and an archive path. This step keeps the
+see. Answers and provider-controlled failure messages longer than 16 KiB have a UTF-8 excerpt and
+an archive path; a version-probe failure keeps only the executable and exit status in `observed`
+and places captured CLI text in `reported.diagnostic`. This step keeps the
 eight most recent long answers per server, up to 4 MiB apiece, in a separate temporary directory.
 An orderly exit removes its files where permitted. An abrupt exit or a denied deletion can leave
 them behind. Unix directories use mode 0700 and answer files 0600. Windows inherits the user's
@@ -221,14 +223,23 @@ alone.
 Where providers differ, each one's tests assert its own behaviour through the compiled binary.
 Antigravity's reply must name a model; Cursor's must not. A shared test could assert neither.
 
-For Codex, a completed turn and a final answer are separate evidence. A turn that explicitly
+For Codex, a completed turn and a final answer are separate evidence. Codex accepts a thread name
+as well as a UUID in the resume position, so Proxenos requires a canonical UUID before dispatch,
+including on the automatic missing-final retry. A turn that explicitly
 lacks its answer can be asked once for that answer in the same confirmed thread. The server
 does not repeat the original task. Antigravity's print command can direct an unknown ID to a
 different conversation. The server requires an exact regular `<id>.db` or `<id>.pb` entry,
-checks again after discovery and the initial git snapshot, and compares the ID the CLI reports.
+checks again after discovery and the initial git snapshot, and compares the ID the CLI reports
+before accepting or archiving any response content (returning no content on a mismatch).
 These checks cannot make the store lookup atomic with Antigravity's own lookup.
 `PROXENOS_AGY_CONVERSATIONS_DIR` takes precedence over `CLAUDE_DELEGATOR_AGY_CONVERSATIONS_DIR`
-and the default `~/.gemini/antigravity-cli/conversations`.
+(kept as intentional migration compatibility; see D13) and the default
+`~/.gemini/antigravity-cli/conversations`.
+
+Not measured: Proxenos has not yet captured the real Codex or `agy` CLI output shape; the
+fixtures are synthetic, derived from claude-delegator's code. Capturing real CLI output—including
+pre-turn errors that spend no model call (such as `codex exec` with an invalid model while logged
+out) as well as live turn output—is the next step.
 
 ### D6. Children are supervised to the end
 
@@ -282,14 +293,24 @@ can remain suspended before it runs any CLI code. Stopping a child does not undo
 
 ### D7. A CLI is found by reading `PATH`, and a batch file is never run
 
-Proxenos reads `PATH` as data, directory by directory, and takes the first directory that holds the
-CLI. Known install locations are tried only after `PATH`. It never asks `which` or `where`.
+Proxenos reads `PATH` as data, directory by directory, skipping every non-absolute entry (empty
+segments, `.`, and relative paths on both Unix and Windows), and takes the first directory that
+holds the CLI. Known install locations are tried only after `PATH`. It never asks `which` or
+`where`.
 
 On Windows a `.cmd` or `.bat` shim is read and followed to the program it starts: an executable, a
-JavaScript loader, or a PowerShell script. The shim itself is never started: Rust would run it
-through `cmd.exe` and refuses any argument it cannot escape safely for that shell, a line break
-among them, and every real prompt has one. When the loader is JavaScript, `node` is looked for in
-this order: an explicit override, beside the shim, on `PATH`, then stable install locations.
+JavaScript loader, or a PowerShell script. Wrappers whose full behaviour cannot be established—for
+example those containing control flow or environment changes outside the recognized wrapper
+shapes—are reported as `unsupported_launcher` and never run. The shim itself is never started:
+Rust would run it through `cmd.exe` and refuses any argument it cannot escape safely for that
+shell, a line break among them, and every real prompt has one. When the loader is JavaScript,
+`node` is looked for in this order: an explicit override, beside the shim, on `PATH`, then stable
+install locations.
+
+What this cannot do: on macOS, a newly installed or updated CLI binary can incur first-run
+Gatekeeper (`AppleSystemPolicy`) verification on its initial `exec`, which may take several
+seconds or exceed the ten-second version-probe deadline. Because a failed probe is re-checked on
+the next call, a subsequent call can succeed once macOS caches the verification.
 
 ### D8. Data ships inside the binary and can be overlaid
 
@@ -612,7 +633,10 @@ reviewers of vote 4 wanted the contract tested before the remaining providers ar
 added that otherwise every provider would be written twice.
 
 While both projects run on one host, Proxenos reads and sets claude-delegator's delegation-depth
-variables as well as its own, so that a chain passing through both still stops.
+variables as well as its own, so that a chain passing through both still stops. For the same
+migration compatibility, Antigravity's conversation-store lookup falls back to
+`CLAUDE_DELEGATOR_AGY_CONVERSATIONS_DIR` when `PROXENOS_AGY_CONVERSATIONS_DIR` is unset or blank
+(D5).
 
 ### D14. One crate
 
@@ -733,10 +757,13 @@ start. A reply may change the mode where the CLI accepts it. Codex keeps the sta
 instructions, including its mode, for the session. Proxenos refuses a change before dispatch.
 
 At milestone 1 step 3 the server remembers starts only in process memory. Restarting it loses
-that continuity. A reply to an unremembered session must supply its directory, access, mode and
-the optional settings used at the start. Proxenos cannot verify these values against that start.
-Pending the owner decision above, an Antigravity reply with no remembered start model must
-supply a model explicitly. Proxenos never infers one from provider output.
+that continuity. `timeout_ms` is initialized per request and is never inherited by a reply. If two
+starts report the same `thread_id` with conflicting settings, the server marks that ID ambiguous
+and refuses to dispatch a reply from it. A reply to an unremembered session must supply its
+directory, access, mode and the optional settings used at the start. Proxenos cannot verify these
+values against that start. Pending the owner decision above, an Antigravity reply with no
+remembered start model must supply a model explicitly. Proxenos never infers one from provider
+output.
 
 The file was a provisional choice of vote 4, where one reviewer would keep the settings only in
 the server's memory, and vote 6 backed it: eight of nine positions are for a file. How long it is

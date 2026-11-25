@@ -38,7 +38,7 @@ pub struct CommandLine {
     pub cli_timeout_ms: Option<u64>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct Settings {
     #[serde(serialize_with = "serialize_cwd")]
     pub cwd: PathBuf,
@@ -47,7 +47,6 @@ pub struct Settings {
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub timeout_ms: u64,
 }
 
 // A native pathname need not be Unicode. JSON can represent only the Unicode case.
@@ -55,9 +54,11 @@ fn serialize_cwd<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::
     path.to_str().serialize(serializer)
 }
 
+#[derive(Clone)]
 pub struct Turn {
     pub thread_id: Option<String>,
     pub settings: Settings,
+    pub timeout_ms: u64,
     pub prompt: String,
     pub guidance: String,
 }
@@ -207,8 +208,11 @@ impl Provider {
             instructions: None,
             model: None,
             effort: None,
-            timeout_ms: 3_600_000,
         });
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(3_600_000);
         let supported = self.supported_settings(reply);
         settings.model = settings.model.filter(|_| supported.contains(&"model"));
         settings.effort = settings.effort.filter(|_| supported.contains(&"effort"));
@@ -243,9 +247,6 @@ impl Provider {
         if let Some(s) = text("instructions") {
             settings.instructions = Some(s.into());
         }
-        if let Some(n) = args.get("timeout_ms") {
-            settings.timeout_ms = n.as_u64().unwrap();
-        }
         // D19 leaves the no-model start open. Until resolved, a required model comes from the caller.
         if reply && self.reply_model && settings.model.is_none() {
             return Err(
@@ -264,13 +265,12 @@ impl Provider {
         if let Some(coord) = args.get("coordination") {
             prompt.push_str(&format!("\n\nIf Iris is available, use your own session to send a short start, progress and finish update to {}. Keep the answer in this tool result. Continue if Iris is unavailable.", coord["caller_agent_name"]));
         }
-        let turn = Turn {
+        Ok(Turn {
             thread_id: text("thread_id").map(str::to_owned),
             settings,
+            timeout_ms,
             prompt,
             guidance,
-        };
-        (self.prepare)(&turn)?;
-        Ok(turn)
+        })
     }
 }

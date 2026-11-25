@@ -17,7 +17,7 @@ fn store(fleet: &Fleet) -> PathBuf {
 fn argument<'a>(record: &'a Value, flag: &str) -> Option<&'a str> {
     record["args"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| panic!("missing args array in invocation record: {record}"))
         .windows(2)
         .find(|pair| pair[0] == flag)
         .and_then(|pair| pair[1].as_str())
@@ -111,6 +111,14 @@ fn start_and_reply_pass_the_model_workspace_permissions_and_new_guidance() {
             .contains(&json!("--conversation"))
     );
     assert_eq!(argument(&records[0], "--print-timeout"), Some("60000ms"));
+    assert_eq!(argument(&records[1], "--print-timeout"), Some("3570000ms"));
+    assert!(
+        reply["observed"]["attempts"][0]["deadline_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("missing deadline_ms in envelope: {reply}"))
+            > 90_000,
+        "reply inherited the start timeout: {reply}"
+    );
     assert!(
         argument(&records[0], "--print")
             .unwrap()
@@ -361,17 +369,52 @@ fn a_reply_checks_the_confirmed_id_as_well_as_the_store() {
     let fleet = Fleet::new(&["agy"]);
     fs::create_dir_all(store(&fleet)).unwrap();
     fs::write(store(&fleet).join("old-thread.db"), []).unwrap();
-    fleet.script("agy", json!([{"stdout": FINISHED}]));
-    let mut server = fleet.server("claude");
-    let result = resume(&mut server, "old-thread", &fleet.root);
-    assert_eq!(result["observed"]["state"], "failed");
-    assert_eq!(result["reported"]["thread_id"], ID);
-    assert!(
-        result["reported"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("conversation ID")
+    let long_other = json!({
+        "status": "SUCCESS",
+        "conversation_id": ID,
+        "response": "s".repeat((16 << 10) + 64)
+    })
+    .to_string();
+    let error_other = json!({
+        "status": "ERROR",
+        "conversation_id": ID,
+        "response": "foreign conversation text",
+        "error": "failed"
+    })
+    .to_string();
+    fleet.script(
+        "agy",
+        json!([
+            {"stdout": FINISHED},
+            {"stdout": long_other},
+            {"stdout": error_other}
+        ]),
     );
+    let mut server = fleet.server("claude");
+    for _ in 0..3 {
+        let result = resume(&mut server, "old-thread", &fleet.root);
+        assert_eq!(result["observed"]["state"], "failed", "{result}");
+        assert_eq!(result["reported"]["thread_id"], ID, "{result}");
+        assert!(
+            result["reported"]["content"].is_null(),
+            "mismatched reply leaked foreign content: {result}"
+        );
+        assert!(
+            result["observed"]["content_file"].is_null(),
+            "mismatched reply archived foreign content: {result}"
+        );
+        assert!(
+            result["observed"]["content_captured_bytes"].is_null(),
+            "{result}"
+        );
+        assert!(
+            result["reported"]["failure"]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing reported failure message: {result}"))
+                .contains("conversation ID"),
+            "{result}"
+        );
+    }
 }
 
 #[test]

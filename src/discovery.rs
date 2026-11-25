@@ -4,10 +4,12 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Component, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -26,6 +28,21 @@ pub struct Executable {
     pub prefix: Vec<OsString>,
 }
 
+#[derive(Clone)]
+pub struct DiscoveryError {
+    pub failure: Failure,
+    pub diagnostic: Option<String>,
+}
+
+impl From<Failure> for DiscoveryError {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            diagnostic: None,
+        }
+    }
+}
+
 fn absolute_env(key: &str) -> Option<PathBuf> {
     env::var_os(key).map(PathBuf::from).filter(|path| {
         path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
@@ -36,7 +53,7 @@ fn search_path() -> Vec<PathBuf> {
     env::var_os("PATH")
         .map(|path| {
             env::split_paths(&path)
-                .filter_map(|dir| std::path::absolute(dir.join(".")).ok())
+                .filter(|dir| dir.is_absolute())
                 .collect()
         })
         .unwrap_or_default()
@@ -79,54 +96,90 @@ fn locate(provider: &Provider) -> Result<Executable, Failure> {
 
 struct Located {
     executable: Result<Executable, Failure>,
-    check: Mutex<Result<(), Failure>>,
+    check: Mutex<Result<(), DiscoveryError>>,
 }
 
 type Inventory = BTreeMap<&'static str, Located>;
 
 pub struct Discovery {
     client: Client,
-    cache: OnceCell<Inventory>,
+    scan: StdMutex<Option<watch::Receiver<Option<Arc<Inventory>>>>>,
 }
 
 impl Discovery {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            cache: OnceCell::new(),
+            scan: StdMutex::new(None),
         }
     }
 
-    async fn inventory(&self, cancel: &CancellationToken, activity: Activity) -> &Inventory {
-        self.cache
-            .get_or_init(|| async {
-                let mut checks = JoinSet::new();
-                for provider in providers::ALL
-                    .iter()
-                    .filter(|provider| provider.name != self.client.name())
-                {
-                    let cancel = cancel.clone();
-                    let activity = activity.clone();
-                    checks.spawn(async move {
-                        let executable = tokio::task::spawn_blocking(move || locate(provider))
-                            .await
-                            .expect("resolver finished");
-                        let check = match &executable {
-                            Ok(exe) => probe(exe, &cancel, activity).await,
-                            Err(error) => Err(error.clone()),
-                        };
-                        (
-                            provider.name,
-                            Located {
-                                executable,
-                                check: Mutex::new(check),
-                            },
-                        )
-                    });
-                }
-                checks.join_all().await.into_iter().collect()
-            })
-            .await
+    fn scan(
+        &self,
+        cancel: &CancellationToken,
+        activity: Activity,
+    ) -> watch::Receiver<Option<Arc<Inventory>>> {
+        let mut slot = self.scan.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(done) = &*slot {
+            return done.clone();
+        }
+        let (publish, done) = watch::channel(None);
+        let scan_cancel = cancel.child_token();
+        let client = self.client;
+        tokio::spawn(async move {
+            let mut checks = JoinSet::new();
+            for provider in providers::ALL
+                .iter()
+                .filter(|provider| provider.name != client.name())
+            {
+                let cancel = scan_cancel.clone();
+                let activity = activity.clone();
+                checks.spawn(async move {
+                    let executable = tokio::task::spawn_blocking(move || locate(provider))
+                        .await
+                        .expect("resolver finished");
+                    let check = match &executable {
+                        Ok(exe) => probe(exe, &cancel, None, activity).await,
+                        Err(error) => Err(DiscoveryError::from(error.clone())),
+                    };
+                    (
+                        provider.name,
+                        Located {
+                            executable,
+                            check: Mutex::new(check),
+                        },
+                    )
+                });
+            }
+            let inventory: Inventory = checks.join_all().await.into_iter().collect();
+            let _ = publish.send(Some(Arc::new(inventory)));
+            drop(activity);
+        });
+        *slot = Some(done.clone());
+        done
+    }
+
+    async fn inventory(
+        &self,
+        cancel: &CancellationToken,
+        deadline: Option<Instant>,
+        activity: Activity,
+    ) -> Result<(Arc<Inventory>, bool), DiscoveryError> {
+        let mut done = self.scan(cancel, activity);
+        let checked_before = done.borrow().is_some();
+        let inventory = wait_for(
+            async {
+                done.wait_for(Option::is_some)
+                    .await
+                    .expect("discovery scan completed")
+                    .clone()
+                    .expect("inventory published")
+            },
+            cancel,
+            deadline,
+        )
+        .await?;
+        Ok((inventory, checked_before))
     }
 
     pub async fn listed(
@@ -134,8 +187,10 @@ impl Discovery {
         cancel: &CancellationToken,
         activity: Activity,
     ) -> Vec<&'static str> {
-        self.inventory(cancel, activity)
-            .await
+        let Ok((inventory, _)) = self.inventory(cancel, None, activity).await else {
+            return Vec::new();
+        };
+        inventory
             .iter()
             .filter_map(|(&name, entry)| {
                 (!matches!(&entry.executable, Err(error) if error.kind == FailureKind::NotFound))
@@ -148,63 +203,96 @@ impl Discovery {
         &self,
         name: &str,
         cancel: &CancellationToken,
+        deadline: Instant,
         activity: Activity,
-    ) -> Result<Executable, Failure> {
-        let checked_before = self.cache.initialized();
-        let inventory = self.inventory(cancel, activity.clone()).await;
+    ) -> Result<Executable, DiscoveryError> {
+        let (inventory, checked_before) = self
+            .inventory(cancel, Some(deadline), activity.clone())
+            .await?;
         // The registry has already matched this tool against the visible provider declarations.
         let entry = &inventory[name];
-        let executable = entry.executable.as_ref().map_err(Clone::clone)?;
-        let mut check = entry.check.lock().await;
+        let executable = entry
+            .executable
+            .as_ref()
+            .map_err(|error| DiscoveryError::from(error.clone()))?;
+        let mut check = wait_for(entry.check.lock(), cancel, Some(deadline)).await?;
         // Only the request that started the shared scan can cancel its probes. An unrelated
         // request already waiting on that scan gets a fresh check under its own token.
         if let Err(previous) = &*check
             && (checked_before
-                || (previous.kind == FailureKind::Cancellation && !cancel.is_cancelled()))
+                || (previous.failure.kind == FailureKind::Cancellation && !cancel.is_cancelled()))
         {
-            *check = probe(executable, cancel, activity).await;
+            *check = probe(executable, cancel, Some(deadline), activity).await;
         }
         check.clone().map(|()| executable.clone())
+    }
+}
+
+async fn wait_for<T>(
+    fut: impl Future<Output = T>,
+    cancel: &CancellationToken,
+    deadline: Option<Instant>,
+) -> Result<T, DiscoveryError> {
+    let timeout = async {
+        match deadline {
+            Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(DiscoveryError::from(Failure::new(
+            FailureKind::Cancellation,
+            "Version check was cancelled.",
+        ))),
+        () = timeout => Err(DiscoveryError::from(Failure::new(
+            FailureKind::Timeout,
+            "Version check exceeded its deadline.",
+        ))),
+        value = fut => Ok(value),
     }
 }
 
 async fn probe(
     exe: &Executable,
     cancel: &CancellationToken,
+    deadline: Option<Instant>,
     activity: Activity,
-) -> Result<(), Failure> {
+) -> Result<(), DiscoveryError> {
     let mut args = exe.prefix.clone();
     args.push("--version".into());
+    let limit = Instant::now() + Duration::from_secs(10);
     let launch = Launch {
         program: exe.program.clone(),
         args,
         cwd: None,
         env_set: crate::delegation::env_set(),
         env_remove: crate::delegation::env_remove(),
-        deadline: Duration::from_secs(10),
+        deadline: deadline.map_or(limit, |call| call.min(limit)),
         capture_limit: 2048,
         temporary_files: Vec::new(),
     };
     let outcome = supervise::run(launch, cancel, activity)
         .await
+        .and_then(|mut done| done.error.take().map_or(Ok(done), Err))
         .map_err(|err| {
-            Failure::new(
+            DiscoveryError::from(Failure::new(
                 FailureKind::Launch,
                 format!(
                     "Version check could not run {}: {err}",
                     exe.program.display()
                 ),
-            )
+            ))
         })?;
     match outcome.ending {
-        Ending::TimedOut => Err(Failure::new(
+        Ending::TimedOut => Err(DiscoveryError::from(Failure::new(
             FailureKind::Timeout,
-            "Version check exceeded its deadline.",
-        )),
-        Ending::Cancelled => Err(Failure::new(
+            "Version check exceeded its deadline. On macOS, first-run Gatekeeper (AppleSystemPolicy) evaluation can exceed this limit; the next call retries the check.",
+        ))),
+        Ending::Cancelled => Err(DiscoveryError::from(Failure::new(
             FailureKind::Cancellation,
             "Version check was cancelled.",
-        )),
+        ))),
         Ending::Exited
             if outcome.code == Some(0) && outcome.stdout.total + outcome.stderr.total > 0 =>
         {
@@ -216,15 +304,28 @@ async fn probe(
             } else {
                 &outcome.stderr.bytes
             };
-            Err(Failure::new(
-                FailureKind::Launch,
-                format!(
-                    "Version check for {} failed (exit {:?}): {}",
-                    exe.program.display(),
-                    outcome.code,
-                    String::from_utf8_lossy(detail).trim()
+            let diagnostic = String::from_utf8_lossy(detail).trim().to_owned();
+            let status = exit_description(outcome.code, outcome.signal);
+            Err(DiscoveryError {
+                failure: Failure::new(
+                    FailureKind::Launch,
+                    format!(
+                        "Version check for {} failed ({status}).",
+                        exe.program.display(),
+                    ),
                 ),
-            ))
+                diagnostic: (!diagnostic.is_empty()).then_some(diagnostic),
+            })
         }
     }
+}
+
+pub(crate) fn exit_description(code: Option<i32>, signal: Option<i32>) -> String {
+    #[cfg(unix)]
+    if let Some(sig) = signal {
+        return format!("signal {sig}");
+    }
+    #[cfg(not(unix))]
+    let _ = signal;
+    format!("exit code {}", code.unwrap_or_default())
 }

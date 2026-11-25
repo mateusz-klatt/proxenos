@@ -15,15 +15,24 @@ pub struct Fleet {
 
 impl Fleet {
     pub fn new(clis: &[&str]) -> Self {
-        let root = std::env::temp_dir().join(format!("proxenos-test-{}", uuid::Uuid::new_v4()));
+        // TMPDIR may be mounted noexec, and copying creates a new inode that macOS
+        // AppleSystemPolicy must evaluate from scratch. Keep hard links under target/.
+        let stub = std::path::Path::new(env!("CARGO_BIN_EXE_proxenos-stub"));
+        let root = stub
+            .parent()
+            .unwrap()
+            .join(format!("proxenos-test-{}", uuid::Uuid::new_v4()));
         let bin = root.join("bin");
         fs::create_dir_all(&bin).unwrap();
         for cli in clis {
             let dest = bin.join(format!("{cli}{}", std::env::consts::EXE_SUFFIX));
-            let stub = env!("CARGO_BIN_EXE_proxenos-stub");
-            fs::hard_link(stub, &dest)
-                .or_else(|_| fs::copy(stub, dest).map(drop))
-                .unwrap();
+            fs::hard_link(stub, &dest).unwrap_or_else(|error| {
+                panic!(
+                    "hard-linking {} to {} failed: {error}",
+                    stub.display(),
+                    dest.display()
+                )
+            });
         }
         Self { root }
     }
@@ -75,8 +84,10 @@ impl Drop for Fleet {
 
 pub fn call(server: &mut Server, name: &str, args: Value) -> Value {
     let answer = server.call(7, name, args);
-    let envelope: Value = serde_json::from_str(text(&answer)).unwrap();
-    assert_eq!(envelope["schema_version"], 1);
+    let raw = text(&answer);
+    let envelope: Value = serde_json::from_str(raw)
+        .unwrap_or_else(|error| panic!("invalid JSON envelope ({error}): {answer}"));
+    assert_eq!(envelope["schema_version"], 1, "{envelope}");
     assert_eq!(
         answer["result"]["isError"] == true,
         envelope["observed"]["state"] != "finished",

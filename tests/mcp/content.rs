@@ -3,10 +3,23 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use crate::common::Server;
 use crate::provider_support::{Fleet, call, turn};
 
 fn file(result: &Value) -> PathBuf {
-    PathBuf::from(result["observed"]["content_file"].as_str().unwrap())
+    PathBuf::from(
+        result["observed"]["content_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing observed.content_file in envelope: {result}")),
+    )
+}
+
+fn failure_file(result: &Value) -> PathBuf {
+    PathBuf::from(
+        result["observed"]["failure_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing observed.failure_file in envelope: {result}")),
+    )
 }
 
 #[test]
@@ -119,4 +132,95 @@ fn the_file_carries_only_what_was_captured_from_the_final_message() {
     assert_eq!(result["observed"]["content_captured_bytes"], limit);
     assert_eq!(result["observed"]["content_file_bytes"], limit);
     assert_eq!(fs::read_to_string(file(&result)).unwrap(), answer[..limit]);
+}
+
+#[test]
+fn long_provider_failure_messages_and_reset_times_are_bounded_and_archived() {
+    let fleet = Fleet::new(&["agy"]);
+    let lead = "Quota exhausted. Resets at ";
+    let filler = "e".repeat((16 << 10) - lead.len() - 1);
+    let prefix = format!("{lead}{filler}");
+    let full_error = format!("{prefix}風 trailing failure detail\n");
+    let failed = json!({"status": "ERROR", "response": "", "error": full_error});
+    fleet.script("agy", json!([{"stdout": failed.to_string(), "code": 1}]));
+    let mut server = fleet.server("claude");
+    let result = call(&mut server, "antigravity", json!({"prompt": "fail long"}));
+    assert_eq!(result["observed"]["state"], "failed", "{result}");
+    assert_eq!(result["reported"]["failure"]["kind"], "quota", "{result}");
+    assert_eq!(result["reported"]["failure"]["message"], prefix);
+    assert_eq!(
+        result["observed"]["failure_captured_bytes"],
+        full_error.len()
+    );
+    assert_eq!(result["observed"]["failure_file_bytes"], full_error.len());
+    let reset = result["reported"]["failure"]["reset_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing reset_at in envelope: {result}"));
+    assert!(
+        reset.len() <= 16 << 10,
+        "reset_at was unbounded: {}",
+        reset.len()
+    );
+    let retained = failure_file(&result);
+    assert!(retained.is_absolute());
+    assert_eq!(fs::read_to_string(&retained).unwrap(), full_error);
+    let directory = retained.parent().unwrap();
+    assert!(server.finish().0.success());
+    assert!(!directory.exists());
+}
+
+#[test]
+fn relative_tmpdir_still_produces_absolute_scratch_and_archive_paths() {
+    let fleet = Fleet::new(&["agy"]);
+    let rel_tmp = fleet.root.join("rel-tmp");
+    let work = fleet.root.join("work");
+    fs::create_dir(&rel_tmp).unwrap();
+    fs::create_dir(&work).unwrap();
+    let long = "b".repeat((16 << 10) + 32);
+    fleet.script("agy", json!([turn(&long)]));
+    let mut command = fleet.command("claude");
+    for key in ["TMPDIR", "TMP", "TEMP"] {
+        command.env(key, "rel-tmp");
+    }
+    let mut server = Server::start_command(command);
+    server.initialize("2025-11-25");
+    let result = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "Answer.", "cwd": work}),
+    );
+    assert_eq!(result["observed"]["state"], "finished", "{result}");
+    let retained = file(&result);
+    assert!(retained.is_absolute(), "{result}");
+    assert!(
+        retained
+            .canonicalize()
+            .unwrap()
+            .starts_with(rel_tmp.canonicalize().unwrap()),
+        "archive path escaped relative temp root: {}",
+        retained.display()
+    );
+    let records = fleet.records();
+    let args = records.last().unwrap()["args"].as_array().unwrap();
+    let log = Path::new(
+        args.windows(2)
+            .find(|pair| pair[0] == "--log-file")
+            .unwrap()[1]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(
+        log.is_absolute(),
+        "log path was relative: {}",
+        log.display()
+    );
+    assert!(
+        log.parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            == rel_tmp.canonicalize().unwrap()
+    );
 }

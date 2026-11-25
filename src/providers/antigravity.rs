@@ -88,7 +88,7 @@ fn prepare(turn: &Turn) -> Result<(), String> {
 fn argv(turn: &Turn, log: &Path) -> CommandLine {
     // agy starts its own timer after it sends the turn. Leave room for startup under
     // the supervisor's deadline so the CLI can report a resumable print timeout.
-    let print_ms = turn.settings.timeout_ms.saturating_sub(30_000).max(5_000);
+    let print_ms = turn.timeout_ms.saturating_sub(30_000).max(5_000);
     let mut args = vec![
         "--output-format".into(),
         "json".into(),
@@ -171,9 +171,16 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
     let text = |key: &str| value[key].as_str().filter(|s| !s.trim().is_empty());
     let mut report = Report {
         thread_id: text("conversation_id").map(String::from),
-        content: text("response").map(String::from),
         ..Report::default()
     };
+    if expected.is_some() && expected != report.thread_id.as_deref() {
+        report.failure = Some(Failure::new(
+            FailureKind::Unknown,
+            "Antigravity did not confirm the requested conversation ID",
+        ));
+        return report;
+    }
+    report.content = text("response").map(String::from);
     if value["status"] != "SUCCESS" {
         let reason = text("error").unwrap_or(stderr.trim());
         let reason = if reason.is_empty() {
@@ -183,11 +190,6 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
         };
         report.failure =
             Some(classify(reason).unwrap_or_else(|| Failure::new(FailureKind::Unknown, reason)));
-    } else if expected.is_some() && expected != report.thread_id.as_deref() {
-        report.failure = Some(Failure::new(
-            FailureKind::Unknown,
-            "Antigravity did not confirm the requested conversation ID",
-        ));
     } else if report.content.is_none() {
         report.failure = Some(classify(stderr.trim()).unwrap_or_else(|| {
             Failure::new(

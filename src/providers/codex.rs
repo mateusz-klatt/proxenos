@@ -40,9 +40,18 @@ pub(super) const SPEC: Provider = Provider {
     parse,
 };
 
+fn is_canonical_uuid(id: &str) -> bool {
+    uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
+}
+
 fn prepare(turn: &Turn) -> Result<(), String> {
     if turn.prompt == "-" {
         return Err("Codex interprets a lone dash as a request to read stdin.".into());
+    }
+    if let Some(id) = &turn.thread_id
+        && !is_canonical_uuid(id)
+    {
+        return Err("Codex thread_id must be a canonical UUID.".into());
     }
     Ok(())
 }
@@ -210,6 +219,9 @@ fn parse(run: &Finished, final_message: &str, expected: Option<&str>) -> Report 
             let parsed = diagnostic(&stderr);
             (parsed.kind != FailureKind::Unknown).then_some(parsed)
         });
+    }
+    if !report.thread_id.as_deref().is_some_and(is_canonical_uuid) {
+        report.retry_missing_final = false;
     }
     report
 }

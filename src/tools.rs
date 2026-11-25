@@ -15,7 +15,8 @@ pub struct Registry {
     client: Client,
     pub discovery: Discovery,
     pub answers: crate::envelope::AnswerArchive,
-    pub starts: Mutex<HashMap<(&'static str, String), Settings>>,
+    /// `Some(settings)` remembers a unique start; `None` marks a conflicting duplicate ID.
+    pub starts: Mutex<HashMap<(&'static str, String), Option<Settings>>>,
 }
 
 impl Registry {
@@ -183,6 +184,7 @@ mod test_tools {
                 .map(str::to_owned)
         };
         let env = arguments.get("env").and_then(Value::as_object);
+        let started = std::time::Instant::now();
         let mut temporary_files = Vec::new();
         if let Some(path) = text("temp_file") {
             let file = supervise::cleanup::TemporaryFile::create(
@@ -209,7 +211,8 @@ mod test_tools {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
-            deadline: Duration::from_millis(millis(arguments, "deadline_ms").unwrap_or(0)),
+            deadline: started
+                + Duration::from_millis(millis(arguments, "deadline_ms").unwrap_or(0)),
             capture_limit: usize::try_from(millis(arguments, "capture_limit").unwrap_or(0))
                 .unwrap_or(usize::MAX),
             temporary_files,
@@ -224,13 +227,14 @@ mod test_tools {
         } else {
             cancel.clone()
         };
-        tokio::select! {
+        let mut finished = tokio::select! {
             biased;
             result = supervise::run(launch, &supervisor_cancel, activity) => result,
             () = cancel.cancelled(), if on_cancel == Some("drop") => {
                 Err(std::io::Error::other("caller dropped the supervisor"))
             }
-        }
+        }?;
+        finished.error.take().map_or(Ok(finished), Err)
     }
 
     fn run_outcome(result: std::io::Result<Finished>) -> ToolOutcome {

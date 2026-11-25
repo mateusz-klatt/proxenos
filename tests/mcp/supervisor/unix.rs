@@ -57,6 +57,8 @@ pub(super) mod platform {
     #[test]
     fn a_stalled_exec_allows_other_timers_and_a_queued_call_can_be_dropped() {
         // TMPDIR may be mounted noexec. The built stub is on an executable filesystem.
+        // This Linux-only test copies STUB once to obtain a distinct inode so taking a
+        // write lease (F_SETLEASE) does not block concurrent tests executing STUB.
         let directory = Directory::under(Path::new(STUB).parent().unwrap());
         let executable = directory.0.join("leased-stub");
         fs::copy(STUB, &executable).unwrap();

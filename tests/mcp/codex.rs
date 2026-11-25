@@ -18,9 +18,12 @@ fn invocations(fleet: &Fleet) -> Vec<Value> {
 fn argv(record: &Value) -> Vec<&str> {
     record["args"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| panic!("missing args array in invocation record: {record}"))
         .iter()
-        .map(|arg| arg.as_str().unwrap())
+        .map(|arg| {
+            arg.as_str()
+                .unwrap_or_else(|| panic!("non-string arg in invocation record: {record}"))
+        })
         .collect()
 }
 
@@ -45,7 +48,7 @@ fn codex_starts_and_resumes_with_the_same_settings_and_exact_prompt() {
         "codex",
         json!({
             "prompt":task, "mode":"advisory", "model":"test-model", "effort":"high",
-            "cwd":cwd, "access":"read-only", "instructions":instructions
+            "cwd":cwd, "access":"read-only", "instructions":instructions, "timeout_ms":5_000
         }),
     );
     assert_eq!(start["observed"]["state"], "finished", "{start}");
@@ -65,6 +68,13 @@ fn codex_starts_and_resumes_with_the_same_settings_and_exact_prompt() {
     );
     assert_eq!(reply["observed"]["state"], "finished", "{reply}");
     assert_eq!(reply["reported"]["content"], "The two paragraphs agree.");
+    assert!(
+        reply["observed"]["attempts"][0]["deadline_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("missing deadline_ms in envelope: {reply}"))
+            > 5_000,
+        "reply inherited the start timeout: {reply}"
+    );
     let refused = call(
         &mut server,
         "codex-reply",
@@ -358,4 +368,92 @@ fn codex_retries_only_an_explicit_missing_answer_diagnostic() {
     assert_eq!(retried["observed"]["state"], "finished", "{retried}");
     assert_eq!(retried["observed"]["attempts"].as_array().unwrap().len(), 2);
     assert_eq!(invocations(&fleet).len(), 5);
+}
+
+#[test]
+fn codex_rejects_non_uuid_thread_ids_on_reply_and_retry() {
+    let fleet = Fleet::new(&["codex"]);
+    let named_empty = EMPTY.replace(THREAD, "named-session");
+    fleet.script("codex", json!([{"stdout": named_empty}]));
+    let mut server = fleet.server("claude");
+    for bad_id in [
+        "named-session",
+        "EEB3A731-D53A-4444-8A6A-4D9D89E76073",
+        "eeb3a731d53a44448a6a4d9d89e76073",
+    ] {
+        let rejected = call(
+            &mut server,
+            "codex-reply",
+            json!({
+                "thread_id": bad_id, "prompt": "resume", "cwd": fleet.root,
+                "access": "read-only", "mode": "advisory"
+            }),
+        );
+        assert_eq!(
+            rejected["observed"]["failure"]["kind"], "invalid_request",
+            "{bad_id}: {rejected}"
+        );
+    }
+    assert!(
+        fleet.records().is_empty(),
+        "non-UUID reply IDs must fail before discovery or dispatch"
+    );
+    let no_retry = call(&mut server, "codex", json!({"prompt": "work"}));
+    assert_eq!(no_retry["observed"]["state"], "failed", "{no_retry}");
+    assert_eq!(
+        no_retry["observed"]["attempts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing attempts: {no_retry}"))
+            .len(),
+        1
+    );
+    assert_eq!(no_retry["reported"]["thread_id"], "named-session");
+    assert_eq!(invocations(&fleet).len(), 1);
+}
+
+#[test]
+fn codex_reads_an_atomically_replaced_final_message_file() {
+    let fleet = Fleet::new(&["codex"]);
+    let replaced = "Replaced atomically.\n";
+    fleet.script(
+        "codex",
+        json!([{"stdout": FINISHED, "replace_final_message": replaced}]),
+    );
+    let mut server = fleet.server("claude");
+    let result = call(&mut server, "codex", json!({"prompt": "write answer"}));
+    assert_eq!(result["observed"]["state"], "finished", "{result}");
+    assert_eq!(result["reported"]["content"], replaced);
+    assert_eq!(
+        result["observed"]["attempts"][0]["provider_file_bytes"],
+        replaced.len()
+    );
+    assert_eq!(
+        result["observed"]["attempts"][0]["provider_file_captured"],
+        replaced.len()
+    );
+}
+
+#[test]
+fn codex_retry_keeps_confirmed_thread_id_when_second_attempt_fails_early() {
+    let fleet = Fleet::new(&["codex"]);
+    fleet.script(
+        "codex",
+        json!([
+            {"stdout": EMPTY},
+            {"code": 1, "stderr": "transport dropped"}
+        ]),
+    );
+    let mut server = fleet.server("claude");
+    let result = call(&mut server, "codex", json!({"prompt": "check"}));
+    assert_eq!(result["observed"]["state"], "failed", "{result}");
+    assert_eq!(result["observed"]["failure"]["kind"], "abnormal_exit");
+    assert_eq!(
+        result["observed"]["attempts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing attempts: {result}"))
+            .len(),
+        2
+    );
+    assert_eq!(result["reported"]["thread_id"], THREAD, "{result}");
+    assert_eq!(result["reported"]["diagnostic"], "transport dropped");
 }

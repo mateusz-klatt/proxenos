@@ -2,13 +2,13 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::Activity;
-use crate::supervise::cleanup::{PrivateDirectory, TemporaryFile};
+use crate::supervise::cleanup::DirectoryLease;
 use crate::supervise::{self, Ending, Finished, Launch};
 
 // Input filenames can contain line breaks; status uses NUL termination.
@@ -18,6 +18,7 @@ const LIMIT: usize = 256 * 1024;
 pub(super) async fn snapshot(
     cwd: &Path,
     cancel: &CancellationToken,
+    deadline: Option<Instant>,
     activity: Activity,
 ) -> Option<Value> {
     // Never look up git in the provider's working directory or execute a shell launcher.
@@ -25,33 +26,36 @@ pub(super) async fn snapshot(
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(format!("git{}", std::env::consts::EXE_SUFFIX)))
         .find(|candidate| candidate.is_file())?;
-    let launch = |cwd: &Path, args: &[&str]| Launch {
-        program: program.clone(),
-        args: args.iter().map(OsString::from).collect(),
-        cwd: Some(cwd.into()),
-        env_remove: std::env::vars_os()
-            .map(|(key, _)| key)
-            .filter(|key| {
-                key.to_string_lossy()
-                    .to_ascii_uppercase()
-                    .starts_with("GIT_")
-            })
-            .collect(),
-        env_set: [
-            ("GIT_CONFIG_NOSYSTEM", "1"),
-            (
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            ),
-            ("GIT_ATTR_NOSYSTEM", "1"),
-            ("GIT_ALLOW_PROTOCOL", ""),
-            ("GIT_NO_LAZY_FETCH", "1"),
-        ]
-        .map(|(k, v)| (k.into(), v.into()))
-        .to_vec(),
-        deadline: Duration::from_secs(2),
-        capture_limit: LIMIT,
-        temporary_files: Vec::new(),
+    let launch = |cwd: &Path, args: &[&str]| {
+        let limit = Instant::now() + Duration::from_secs(2);
+        Launch {
+            program: program.clone(),
+            args: args.iter().map(OsString::from).collect(),
+            cwd: Some(cwd.into()),
+            env_remove: std::env::vars_os()
+                .map(|(key, _)| key)
+                .filter(|key| {
+                    key.to_string_lossy()
+                        .to_ascii_uppercase()
+                        .starts_with("GIT_")
+                })
+                .collect(),
+            env_set: [
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                (
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                ),
+                ("GIT_ATTR_NOSYSTEM", "1"),
+                ("GIT_ALLOW_PROTOCOL", ""),
+                ("GIT_NO_LAZY_FETCH", "1"),
+            ]
+            .map(|(k, v)| (k.into(), v.into()))
+            .to_vec(),
+            deadline: deadline.map_or(limit, |call| call.min(limit)),
+            capture_limit: LIMIT,
+            temporary_files: Vec::new(),
+        }
     };
     let query = launch(
         cwd,
@@ -96,12 +100,19 @@ pub(super) async fn snapshot(
     let config =
         format!("[core]\nrepositoryformatversion=1\n[extensions]\nobjectformat={format}\n");
     let head = format!("{}\n", commit.unwrap_or("ref: refs/heads/unborn"));
-    let view = tokio::task::spawn_blocking(move || {
-        let view = PrivateDirectory::create().ok()?;
-        fs::create_dir(view.path.join("refs")).ok()?;
-        fs::write(view.path.join("config"), config).ok()?;
-        fs::write(view.path.join("HEAD"), head).ok()?;
-        Some(view)
+    let root_owned = root.to_path_buf();
+    let setup_activity = activity.clone();
+    let (view, relative) = tokio::task::spawn_blocking(move || {
+        let view = DirectoryLease::create_blocking(setup_activity).ok()?;
+        fs::create_dir(view.path().join("refs")).ok()?;
+        fs::write(view.path().join("config"), config).ok()?;
+        fs::write(view.path().join("HEAD"), head).ok()?;
+        let physical = view.path().canonicalize().ok()?;
+        let relative = physical
+            .strip_prefix(root_owned.canonicalize().ok()?)
+            .ok()
+            .map(Path::to_path_buf);
+        Some((view, relative))
     })
     .await
     .expect("Git view setup worker finished")?;
@@ -118,25 +129,25 @@ pub(super) async fn snapshot(
             "--ignore-submodules=all",
         ],
     );
-    status
-        .temporary_files
-        .push(TemporaryFile::Directory(view.clone()));
+    status.temporary_files.push(view.for_child());
     status.env_set.extend([
-        ("GIT_DIR".into(), view.path.clone().into_os_string()),
+        ("GIT_DIR".into(), view.path().as_os_str().to_owned()),
         ("GIT_WORK_TREE".into(), root.into()),
         ("GIT_INDEX_FILE".into(), index.into()),
         ("GIT_OBJECT_DIRECTORY".into(), objects.into()),
     ]);
+    view.finish().await;
     let listing = supervise::run(status, cancel, activity).await.ok()?;
-    let physical = view.path.canonicalize().ok()?;
-    let relative = physical.strip_prefix(root.canonicalize().ok()?).ok();
     let mut changed = Vec::new();
     let mut untracked = Vec::new();
     for record in output(&listing, &[0])?.split_terminator('\0') {
         let path = record.get(3..)?;
         if record.starts_with("?? ") {
             // TMPDIR can itself be inside the worktree.
-            if !relative.is_some_and(|scratch| Path::new(path).starts_with(scratch)) {
+            if !relative
+                .as_deref()
+                .is_some_and(|scratch| Path::new(path).starts_with(scratch))
+            {
                 untracked.push(path);
             }
         } else {
@@ -147,7 +158,8 @@ pub(super) async fn snapshot(
 }
 
 fn output<'a>(run: &'a Finished, codes: &[i32]) -> Option<&'a str> {
-    if !matches!(run.ending, Ending::Exited)
+    if run.error.is_some()
+        || !matches!(run.ending, Ending::Exited)
         || !codes.contains(&run.code?)
         || run.stdout.total > LIMIT as u64
     {

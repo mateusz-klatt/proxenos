@@ -4,38 +4,119 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use crate::mcp::Activity;
 
 pub(crate) enum TemporaryFile {
     #[cfg(feature = "test-tools")]
     Reserved(ReservedFile),
-    // Both the parser and the reaper retain the directory. The last owner releases it.
-    Directory(std::sync::Arc<PrivateDirectory>),
+    // Removed only after both the supervisor clears it (reaped or never spawned) and the caller finishes.
+    Directory(Arc<PrivateDirectory>),
+}
+
+struct DirectoryState {
+    reaped: bool,
+    caller_done: bool,
 }
 
 pub(crate) struct PrivateDirectory {
-    pub path: PathBuf,
+    path: PathBuf,
+    state: Mutex<DirectoryState>,
 }
 
-impl PrivateDirectory {
-    pub fn create() -> io::Result<std::sync::Arc<Self>> {
-        let directory = std::env::temp_dir().join(format!("proxenos-run-{}", uuid::Uuid::new_v4()));
+pub(crate) struct DirectoryLease {
+    dir: Option<Arc<PrivateDirectory>>,
+    activity: Activity,
+}
+
+pub(crate) fn temp_root() -> io::Result<PathBuf> {
+    std::path::absolute(std::env::temp_dir())
+}
+
+impl DirectoryLease {
+    pub fn create_blocking(activity: Activity) -> io::Result<Self> {
+        let directory = temp_root()?.join(format!("proxenos-run-{}", uuid::Uuid::new_v4()));
         create_private_directory(&directory)?;
-        Ok(std::sync::Arc::new(Self { path: directory }))
+        Ok(Self {
+            dir: Some(Arc::new(PrivateDirectory {
+                path: directory,
+                state: Mutex::new(DirectoryState {
+                    reaped: true,
+                    caller_done: false,
+                }),
+            })),
+            activity,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.dir.as_ref().expect("lease owns its directory").path
+    }
+
+    pub fn for_child(&self) -> TemporaryFile {
+        let dir = self.dir.as_ref().expect("lease owns its directory");
+        dir.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reaped = false;
+        TemporaryFile::Directory(Arc::clone(dir))
+    }
+
+    fn release(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let dir = self.dir.take()?;
+        let remove = {
+            let mut state = dir.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.caller_done = true;
+            state.reaped
+        };
+        if !remove {
+            return None;
+        }
+        let activity = self.activity.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            dir.remove_blocking();
+            drop(activity);
+        }))
+    }
+
+    pub async fn finish(mut self) {
+        if let Some(task) = self.release() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        }
     }
 }
 
-pub(crate) fn create_private_directory(directory: &std::path::Path) -> io::Result<()> {
+impl Drop for DirectoryLease {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+impl PrivateDirectory {
+    fn mark_reaped(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.reaped = true;
+        state.caller_done
+    }
+
+    fn remove_blocking(&self) {
+        #[cfg(windows)]
+        let removed =
+            retry_sharing_violation(|| fs::remove_dir_all(&self.path), Duration::from_secs(1));
+        #[cfg(not(windows))]
+        let removed = fs::remove_dir_all(&self.path);
+        report_error(&self.path, removed);
+    }
+}
+
+pub(crate) fn create_private_directory(directory: &Path) -> io::Result<()> {
     let builder = &mut fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(builder, 0o700);
     builder.create(directory)
-}
-
-impl Drop for PrivateDirectory {
-    fn drop(&mut self) {
-        report_error(&self.path, fs::remove_dir_all(&self.path));
-    }
 }
 
 #[cfg(feature = "test-tools")]
@@ -43,14 +124,14 @@ pub(crate) struct ReservedFile {
     path: PathBuf,
     reservation: PathBuf,
     #[cfg(windows)]
-    retry_budget: std::time::Duration,
+    retry_budget: Duration,
 }
 
 impl TemporaryFile {
     #[cfg(feature = "test-tools")]
     pub(crate) async fn create(
         path: PathBuf,
-        #[cfg(windows)] retry_budget: std::time::Duration,
+        #[cfg(windows)] retry_budget: Duration,
     ) -> io::Result<Self> {
         tokio::task::spawn_blocking(move || {
             let name = path.file_name().ok_or(ErrorKind::InvalidInput)?;
@@ -81,7 +162,11 @@ pub(crate) fn remove_files_blocking(files: Vec<TemporaryFile>) {
         match file {
             #[cfg(feature = "test-tools")]
             TemporaryFile::Reserved(file) => file.remove(),
-            TemporaryFile::Directory(directory) => drop(directory),
+            TemporaryFile::Directory(directory) => {
+                if directory.mark_reaped() {
+                    directory.remove_blocking();
+                }
+            }
         }
     }
 }
@@ -89,9 +174,10 @@ pub(crate) fn remove_files_blocking(files: Vec<TemporaryFile>) {
 #[cfg(feature = "test-tools")]
 impl ReservedFile {
     fn remove(&self) {
-        let removed = fs::remove_file(&self.path);
         #[cfg(windows)]
-        let removed = retry_shared_file(&self.path, removed, self.retry_budget);
+        let removed = retry_sharing_violation(|| fs::remove_file(&self.path), self.retry_budget);
+        #[cfg(not(windows))]
+        let removed = fs::remove_file(&self.path);
         // No further unlink will target this name. Return the reservation before writing a
         // diagnostic, which can block when a client stops reading stderr.
         let released = fs::remove_dir(&self.reservation);
@@ -100,7 +186,7 @@ impl ReservedFile {
     }
 }
 
-fn report_error(path: &std::path::Path, result: io::Result<()>) {
+fn report_error(path: &Path, result: io::Result<()>) {
     if let Err(error) = result
         && error.kind() != ErrorKind::NotFound
     {
@@ -112,17 +198,17 @@ fn report_error(path: &std::path::Path, result: io::Result<()>) {
     }
 }
 
-#[cfg(all(windows, feature = "test-tools"))]
-fn retry_shared_file(
-    path: &std::path::Path,
-    mut removed: std::io::Result<()>,
-    budget: std::time::Duration,
-) -> std::io::Result<()> {
-    use std::time::{Duration, Instant};
+#[cfg(windows)]
+fn retry_sharing_violation(
+    mut remove: impl FnMut() -> io::Result<()>,
+    budget: Duration,
+) -> io::Result<()> {
+    use std::time::Instant;
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
-    // Terminating a job can return while its processes still hold this file without delete sharing.
+    // Terminating a job can return while its processes still hold a file without delete sharing.
     let started = Instant::now();
+    let mut removed = remove();
     while removed
         .as_ref()
         .is_err_and(|error| error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()))
@@ -132,7 +218,7 @@ fn retry_shared_file(
             break;
         }
         std::thread::sleep(remaining.min(Duration::from_millis(25)));
-        removed = std::fs::remove_file(path);
+        removed = remove();
     }
     removed
 }

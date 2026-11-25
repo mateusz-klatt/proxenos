@@ -12,7 +12,6 @@ use serde_json::{Map, Value, json};
 use crate::delegation::Attempt;
 use crate::mcp::ToolOutcome;
 use crate::providers::{Provider, Report, Turn};
-use crate::supervise::Ending;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +72,10 @@ impl Envelope {
         }
     }
 
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
     pub fn elapsed(&self) -> std::time::Duration {
         self.started.elapsed()
     }
@@ -90,10 +93,7 @@ impl Envelope {
             passed.as_object_mut().unwrap().remove("mode");
             passed.as_object_mut().unwrap().remove("instructions");
         }
-        if !matches!(result.ending, Ending::TimedOut | Ending::Cancelled)
-            || result.code.is_some()
-            || result.signal.is_some()
-        {
+        if result.spawned {
             if self.observed["passed"].is_null() {
                 self.observed["passed"] = passed;
             }

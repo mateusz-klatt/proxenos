@@ -96,7 +96,7 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
             .then(|| (key.to_owned(), json!(value.to_string_lossy())))
         })
         .collect();
-    let record = json!({"cli":cli, "args":args, "cwd":std::env::current_dir()?, "env":env});
+    let record = json!({"cli":cli, "args":args, "cwd":std::env::current_dir()?, "env":env, "pid":std::process::id()});
     let mut log = File::options()
         .create(true)
         .read(true)
@@ -126,9 +126,33 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
             .ok_or("missing -o")?;
         fs::write(&args[pos + 1], message)?;
     }
+    if let Some(message) = step["replace_final_message"].as_str() {
+        let pos = args
+            .iter()
+            .position(|arg| arg == "-o")
+            .ok_or("missing -o")?;
+        let target = Path::new(&args[pos + 1]);
+        let staging = target.with_extension("tmp");
+        fs::write(&staging, message)?;
+        fs::rename(&staging, target)?;
+    }
+    if step["remove_output"] == true {
+        let pos = args
+            .iter()
+            .position(|arg| arg == "-o" || arg == "--log-file")
+            .ok_or("missing output flag")?;
+        fs::remove_file(&args[pos + 1])?;
+    }
     io::stdout().write_all(step["stdout"].as_str().unwrap_or("").as_bytes())?;
     io::stdout().flush()?;
     io::stderr().write_all(step["stderr"].as_str().unwrap_or("").as_bytes())?;
+    io::stderr().flush()?;
+    if let Some(ready) = step["ready"].as_str() {
+        fs::write(ready, [])?;
+    }
+    if let Some(wait) = step["wait_for"].as_str() {
+        wait_for_file(wait)?;
+    }
     thread::sleep(Duration::from_millis(
         step["sleep_ms"].as_u64().unwrap_or(0),
     ));
