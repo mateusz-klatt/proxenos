@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::common::{Server, WAIT, text};
-use crate::provider_support::{Fleet, call, turn};
+use crate::provider_support::{Fleet, assert_observed_failure, call, turn};
 
 fn install(file: &Path) {
     fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -72,7 +72,7 @@ fn absent_at_discovery_stays_absent_after_install_until_the_server_restarts() {
     install(&path);
     assert!(listed(&mut server).is_empty());
     let absent = call(&mut server, "codex", json!({"prompt":"before restart"}));
-    assert_eq!(absent["observed"]["failure"]["kind"], "not_found");
+    assert_observed_failure(&absent, "not_found", "Could not find codex");
     assert!(fleet.records().is_empty());
     let mut restarted = fleet.server("claude");
     assert_eq!(listed(&mut restarted), ["codex", "codex-reply"]);
@@ -89,12 +89,8 @@ fn failed_version_check_stays_listed_and_recovers_on_call() {
     let mut server = fleet.server("claude");
     assert_eq!(listed(&mut server), ["antigravity", "antigravity-reply"]);
     let failed = call(&mut server, "antigravity", json!({"prompt":"first"}));
-    let failure = &failed["observed"]["failure"];
-    assert_eq!(failure["kind"], "launch", "{failed}");
-    let message = failure["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing failure message in envelope: {failed}"));
-    assert!(message.contains("exit code 17"), "{failed}");
+    assert_observed_failure(&failed, "launch", "exit code 17");
+    let message = failed["observed"]["failure"]["message"].as_str().unwrap();
     assert!(
         !message.contains("stub initialization failed"),
         "observed failure leaked CLI stderr: {failed}"
@@ -111,10 +107,8 @@ fn failed_version_check_stays_listed_and_recovers_on_call() {
         json!({"stdout":"version unavailable","code":1}),
     );
     let failed = call(&mut server, "antigravity", json!({"prompt":"again"}));
-    let message = failed["observed"]["failure"]["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing failure message in envelope: {failed}"));
-    assert!(message.contains("exit code 1"), "{failed}");
+    assert_observed_failure(&failed, "launch", "exit code 1");
+    let message = failed["observed"]["failure"]["message"].as_str().unwrap();
     assert!(
         !message.contains("version unavailable"),
         "observed failure leaked CLI stdout: {failed}"
@@ -126,7 +120,9 @@ fn failed_version_check_stays_listed_and_recovers_on_call() {
     fs::remove_file(fleet.root.join("agy.version")).unwrap();
     fleet.script("agy", json!([turn("answer")]));
     let success = call(&mut server, "antigravity", json!({"prompt":"after repair"}));
+    assert_eq!(success["observed"]["state"], "finished", "{success}");
     assert_eq!(success["reported"]["content"], "answer");
+    fleet.assert_steps_remaining("agy", 0);
     assert_eq!(
         fleet.records().len(),
         5,
@@ -145,7 +141,7 @@ fn version_probe_timeout_reaches_the_call_as_a_typed_failure() {
         .unwrap();
     assert_eq!(frame["id"], 17);
     let failed: Value = serde_json::from_str(text(&frame)).unwrap();
-    assert_eq!(failed["observed"]["failure"]["kind"], "timeout", "{failed}");
+    assert_observed_failure(&failed, "timeout", "Version check exceeded its deadline");
     assert_eq!(fleet.records().len(), 1);
 }
 
@@ -184,7 +180,7 @@ fn cancelling_a_list_stops_parallel_probes_but_the_waiting_call_rechecks() {
         .unwrap();
     assert_eq!(reply["id"], 24);
     let answer: Value = serde_json::from_str(text(&reply)).unwrap();
-    assert_eq!(answer["observed"]["failure"]["kind"], "timeout", "{answer}");
+    assert_observed_failure(&answer, "timeout", "Version check exceeded its deadline");
     assert_eq!(listed(&mut server).len(), 4);
     let records = fleet.records();
     assert_eq!(records.len(), 3);
@@ -205,8 +201,7 @@ fn closing_input_cancels_the_running_version_probe() {
     server.close_input();
     let reply = server.response(3);
     let envelope: Value = serde_json::from_str(text(&reply)).unwrap();
-    assert_eq!(envelope["observed"]["failure"]["kind"], "cancellation");
-    assert_eq!(envelope["observed"]["state"], "cancelled");
+    assert_observed_failure(&envelope, "cancellation", "Version check was cancelled");
     assert_eq!(fleet.records().len(), 1);
 }
 
@@ -223,13 +218,7 @@ fn an_unlaunchable_first_path_match_wins_over_a_working_fallback() {
     install(&fallback);
     let mut server = fleet.server("claude");
     let answer = call(&mut server, "antigravity", json!({"prompt":"path order"}));
-    assert_eq!(answer["observed"]["failure"]["kind"], "launch");
-    assert!(
-        answer["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Version check")
-    );
+    assert_observed_failure(&answer, "launch", "Version check");
     assert!(fleet.records().is_empty());
     fs::remove_file(broken).unwrap();
     let mut fresh = fleet.server("claude");
@@ -261,7 +250,7 @@ fn empty_and_relative_path_entries_are_skipped() {
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["cli"], "agy");
     let missing = call(&mut server, "codex", json!({"prompt": "should not run"}));
-    assert_eq!(missing["observed"]["failure"]["kind"], "not_found");
+    assert_observed_failure(&missing, "not_found", "Could not find codex");
     assert_eq!(fleet.records().len(), 1);
 }
 
@@ -289,7 +278,7 @@ fn discovery_waits_are_bounded_by_each_callers_deadline_and_cancellation() {
         "antigravity",
         json!({"prompt": "short wait", "timeout_ms": 150}),
     );
-    assert_eq!(timed["observed"]["failure"]["kind"], "timeout", "{timed}");
+    assert_observed_failure(&timed, "timeout", "Version check exceeded its deadline");
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "caller waited on the shared scan past its deadline: {:?}",
@@ -336,7 +325,7 @@ fn discovery_waits_are_bounded_by_each_callers_deadline_and_cancellation() {
         "antigravity",
         json!({"prompt": "blocked on mutex", "timeout_ms": 150}),
     );
-    assert_eq!(timed["observed"]["failure"]["kind"], "timeout", "{timed}");
+    assert_observed_failure(&timed, "timeout", "Version check exceeded its deadline");
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "caller blocked on check mutex past its deadline: {:?}",
@@ -347,6 +336,7 @@ fn discovery_waits_are_bounded_by_each_callers_deadline_and_cancellation() {
     let recovered: Value = serde_json::from_str(text(&first)).unwrap();
     assert_eq!(recovered["observed"]["state"], "finished", "{recovered}");
     assert_eq!(recovered["reported"]["content"], "recovered");
+    fleet2.assert_steps_remaining("agy", 0);
 }
 
 #[test]
@@ -369,6 +359,7 @@ fn resolve_waits_only_for_its_own_provider_probe() {
     );
     assert_eq!(fast["observed"]["state"], "finished", "{fast}");
     assert_eq!(fast["reported"]["content"], "fast path");
+    fleet.assert_steps_remaining("agy", 0);
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "fast provider waited on slow probe: {:?}",
@@ -403,11 +394,12 @@ fn an_early_caller_timeout_does_not_cancel_the_shared_discovery_probe() {
     }
     server.start_call(2, "antigravity", json!({"prompt": "waits for probe"}));
     let first: Value = serde_json::from_str(text(&server.response(1))).unwrap();
-    assert_eq!(first["observed"]["failure"]["kind"], "timeout", "{first}");
+    assert_observed_failure(&first, "timeout", "Version check exceeded its deadline");
     fs::write(&release, []).unwrap();
     let second: Value = serde_json::from_str(text(&server.response(2))).unwrap();
     assert_eq!(second["observed"]["state"], "finished", "{second}");
     assert_eq!(second["reported"]["content"], "healthy");
+    fleet.assert_steps_remaining("agy", 0);
     let version_probes = fleet
         .records()
         .into_iter()
@@ -446,16 +438,10 @@ mod unix_signals {
         let pid = fleet.records()[0]["pid"].as_i64().unwrap() as i32;
         sigkill(pid);
         let probe_failed: Value = serde_json::from_str(text(&server.response(1))).unwrap();
-        assert_eq!(
-            probe_failed["observed"]["failure"]["kind"], "launch",
-            "{probe_failed}"
-        );
-        let probe_msg = probe_failed["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("missing failure message: {probe_failed}"));
-        assert!(
-            probe_msg.contains(&format!("signal {}", libc::SIGKILL)),
-            "expected signal number in message: {probe_failed}"
+        assert_observed_failure(
+            &probe_failed,
+            "launch",
+            &format!("signal {}", libc::SIGKILL),
         );
 
         fs::remove_file(fleet.root.join("agy.version")).unwrap();
@@ -470,21 +456,16 @@ mod unix_signals {
         let pid = fleet.records().last().unwrap()["pid"].as_i64().unwrap() as i32;
         sigkill(pid);
         let turn_failed: Value = serde_json::from_str(text(&server.response(2))).unwrap();
-        assert_eq!(
-            turn_failed["observed"]["failure"]["kind"], "abnormal_exit",
-            "{turn_failed}"
+        assert_observed_failure(
+            &turn_failed,
+            "abnormal_exit",
+            &format!("signal {}", libc::SIGKILL),
         );
         assert_eq!(
             turn_failed["observed"]["attempts"][0]["signal"],
             libc::SIGKILL
         );
-        let turn_msg = turn_failed["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("missing failure message: {turn_failed}"));
-        assert!(
-            turn_msg.contains(&format!("signal {}", libc::SIGKILL)),
-            "expected signal number in message: {turn_failed}"
-        );
+        fleet.assert_steps_remaining("agy", 0);
     }
 }
 
@@ -556,15 +537,10 @@ mod windows {
             let mut server = fleet.server("claude");
             assert_eq!(listed(&mut server), ["antigravity", "antigravity-reply"]);
             let failed = call(&mut server, "antigravity", json!({"prompt":"unsupported"}));
-            assert_eq!(
-                failed["observed"]["failure"]["kind"],
-                "unsupported_launcher"
-            );
-            assert!(
-                failed["observed"]["failure"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Cannot follow batch launcher")
+            assert_observed_failure(
+                &failed,
+                "unsupported_launcher",
+                "Cannot follow batch launcher",
             );
             assert!(fleet.records().is_empty());
         }
@@ -633,13 +609,7 @@ mod windows {
                 fs::write(expected, []).unwrap();
             } else {
                 let err = call(&mut server, "codex", json!({"prompt":"missing node"}));
-                assert!(
-                    err["observed"]["failure"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("PROXENOS_NODE_BIN"),
-                    "{err}"
-                );
+                assert_observed_failure(&err, "unsupported_launcher", "PROXENOS_NODE_BIN");
                 assert!(fleet.records().is_empty());
             }
         }

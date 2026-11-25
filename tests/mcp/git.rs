@@ -7,7 +7,7 @@ use std::{env, fs};
 use serde_json::json;
 
 use crate::common::{Server, spawning, text};
-use crate::provider_support::{Fleet, call, turn};
+use crate::provider_support::{Fleet, assert_observed_failure, call, turn};
 
 struct Repository {
     fleet: Fleet,
@@ -122,7 +122,8 @@ fn git_records_commit_and_paths_before_and_after_a_provider_timeout() {
     }
     fs::write(subdir.join("during turn"), "new").unwrap();
     let result: serde_json::Value = serde_json::from_str(text(&server.response(7))).unwrap();
-    assert_eq!(result["observed"]["failure"]["kind"], "timeout", "{result}");
+    assert_observed_failure(&result, "timeout", "exceeded the call's deadline");
+    repo.fleet.assert_steps_remaining("agy", 0);
     for when in ["before", "after"] {
         let snap = &result["observed"]["git"][when];
         assert_eq!(snap["commit"], oid.trim(), "{result}");
@@ -166,6 +167,7 @@ fn git_handles_an_unborn_repo_and_omits_an_unavailable_worktree() {
         start["observed"]["git"]["before"],
         json!({"commit":null,"changed":["staged"],"untracked":[]})
     );
+    repo.fleet.assert_steps_remaining("agy", 1);
     let outside = call(
         &mut server,
         "antigravity",
@@ -173,6 +175,14 @@ fn git_handles_an_unborn_repo_and_omits_an_unavailable_worktree() {
     );
     assert_eq!(outside["observed"]["state"], "finished", "{outside}");
     assert!(outside["observed"]["git"].is_null());
+    repo.fleet.assert_steps_remaining("agy", 0);
+    let turns = repo
+        .fleet
+        .records()
+        .into_iter()
+        .filter(|record| record["cli"] == "agy" && record["args"] != json!(["--version"]))
+        .count();
+    assert_eq!(turns, 2);
 }
 
 #[test]
@@ -184,7 +194,7 @@ fn unavailable_scratch_space_omits_git_observations_and_prevents_dispatch() {
         "antigravity",
         json!({"cwd": repo.repo, "prompt": "check"}),
     );
-    assert_eq!(result["observed"]["failure"]["kind"], "launch");
+    assert_observed_failure(&result, "launch", "");
     assert!(result["observed"]["git"].is_null());
     assert_eq!(repo.fleet.records().len(), 1);
     assert_eq!(repo.fleet.records()[0]["args"], json!(["--version"]));
@@ -200,4 +210,12 @@ fn git_omits_an_unsupported_object_format_without_affecting_the_call() {
     let result = call(&mut server, "antigravity", json!({"prompt":"check"}));
     assert_eq!(result["observed"]["state"], "finished", "{result}");
     assert!(result["observed"]["git"].is_null());
+    fleet.assert_steps_remaining("git", 0);
+    fleet.assert_steps_remaining("agy", 0);
+    let git_runs = fleet
+        .records()
+        .into_iter()
+        .filter(|record| record["cli"] == "git")
+        .count();
+    assert_eq!(git_runs, 2);
 }

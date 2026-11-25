@@ -16,7 +16,7 @@ mod provider_support;
 #[path = "mcp/git.rs"]
 mod git;
 
-use provider_support::{Fleet, call};
+use provider_support::{Fleet, assert_observed_failure, assert_reported_failure, call};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -61,7 +61,11 @@ fn a_chain_that_has_used_either_bridge_stops_before_discovery() {
         let mut server = common::Server::start_command(cmd);
         server.initialize("2025-11-25");
         let failure = call(&mut server, "codex", json!({"prompt":"nested"}));
-        assert_eq!(failure["observed"]["failure"]["kind"], "depth_limit");
+        assert_observed_failure(
+            &failure,
+            "depth_limit",
+            "delegated CLI cannot start another",
+        );
         assert!(fleet.records().is_empty());
     }
 }
@@ -82,16 +86,19 @@ fn only_supported_settings_reach_the_cli_and_coordination_is_opt_in() {
         .env("PROXENOS_STUB_MARKER", "keep");
     let mut server = common::Server::start_command(cmd);
     server.initialize("2025-11-25");
-    for args in [
-        json!({}),
-        json!({"prompt":""}),
-        json!({"prompt":"go","effort":"high"}),
-        json!({"prompt":"go","timeout_ms":0}),
-        json!({"prompt":"go","mode":"manage"}),
-        json!({"prompt":"go","coordination":{"other":true}}),
+    for (args, detail) in [
+        (json!({}), "Missing prompt"),
+        (json!({"prompt":""}), "prompt"),
+        (json!({"prompt":"go","effort":"high"}), "effort"),
+        (json!({"prompt":"go","timeout_ms":0}), "timeout_ms"),
+        (json!({"prompt":"go","mode":"manage"}), "mode"),
+        (
+            json!({"prompt":"go","coordination":{"other":true}}),
+            "coordination",
+        ),
     ] {
         let rejected = call(&mut server, "antigravity", args);
-        assert_eq!(rejected["observed"]["failure"]["kind"], "invalid_request");
+        assert_observed_failure(&rejected, "invalid_request", detail);
         assert!(rejected["observed"]["passed"].is_null());
     }
     let unknown = call(
@@ -99,13 +106,9 @@ fn only_supported_settings_reach_the_cli_and_coordination_is_opt_in() {
         "antigravity-reply",
         json!({"prompt":"resume","thread_id":"old"}),
     );
-    assert!(
-        unknown["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no settings")
-    );
+    assert_observed_failure(&unknown, "invalid_request", "no settings");
     assert!(fleet.records().is_empty());
+    fleet.assert_steps_remaining("agy", 2);
     for coord in [false, true] {
         let mut args = json!({"prompt":"Respond briefly."});
         if coord {
@@ -113,6 +116,7 @@ fn only_supported_settings_reach_the_cli_and_coordination_is_opt_in() {
         }
         let response = call(&mut server, "antigravity", args);
         assert_eq!(response["observed"]["state"], "finished");
+        fleet.assert_steps_remaining("agy", usize::from(!coord));
         assert!(response["not_claimed"].as_array().unwrap().len() >= 3);
         assert!(
             !response["reported"]
@@ -140,6 +144,12 @@ fn only_supported_settings_reach_the_cli_and_coordination_is_opt_in() {
         assert_eq!(record["env"]["PROXENOS_STUB_MARKER"], "keep");
         assert!(record["env"]["IRIS_EXECUTION"].is_null() && record["env"]["CLAUDECODE"].is_null());
     }
+    let turns = fleet
+        .records()
+        .into_iter()
+        .filter(|record| record["args"] != json!(["--version"]))
+        .count();
+    assert_eq!(turns, 2);
 }
 
 #[test]
@@ -152,16 +162,17 @@ fn launch_failure_and_abnormal_exit_report_different_evidence() {
         "antigravity",
         json!({"prompt":"run","cwd":fleet.root.join("gone")}),
     );
-    assert_eq!(failed["observed"]["failure"]["kind"], "launch");
+    assert_observed_failure(&failed, "launch", "");
     assert!(failed["observed"]["passed"].is_null());
+    fleet.assert_steps_remaining("agy", 1);
     let exit = call(&mut server, "antigravity", json!({"prompt":"run"}));
-    assert_eq!(exit["observed"]["failure"]["kind"], "abnormal_exit");
+    assert_observed_failure(&exit, "abnormal_exit", "exit code 37");
     let attempt = &exit["observed"]["attempts"][0];
     assert_eq!(attempt["exit_code"], 37);
     assert_eq!(attempt["stderr_bytes"], 11);
     assert_eq!(exit["reported"]["diagnostic"], "worker died");
     assert!(attempt["last_output_ms"].is_number());
-    assert!(exit["reported"]["failure"].is_null());
+    fleet.assert_steps_remaining("agy", 0);
 }
 
 #[test]
@@ -185,11 +196,12 @@ fn timeout_and_disconnect_reap_the_turn_and_return_its_observations() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let timed: Value = serde_json::from_str(common::text(&server.response(7))).unwrap();
-    assert_eq!(timed["observed"]["failure"]["kind"], "timeout", "{timed}");
+    assert_observed_failure(&timed, "timeout", "exceeded the call's deadline");
     assert_eq!(
         timed["observed"]["attempts"][0]["stdout_bytes"], 13,
         "{timed}"
     );
+    fleet.assert_steps_remaining("agy", 1);
     server.start_call(32, "antigravity", json!({"prompt":"cancel me"}));
     let until = Instant::now() + common::WAIT;
     while !ready2.exists() {
@@ -201,12 +213,18 @@ fn timeout_and_disconnect_reap_the_turn_and_return_its_observations() {
     server.close_input();
     let response = server.response(32);
     let cancelled: Value = serde_json::from_str(common::text(&response)).unwrap();
-    assert_eq!(cancelled["observed"]["state"], "cancelled", "{cancelled}");
-    assert_eq!(cancelled["observed"]["failure"]["kind"], "cancellation");
+    assert_observed_failure(&cancelled, "cancellation", "was cancelled");
     assert_eq!(
         cancelled["observed"]["attempts"][0]["stderr_bytes"], 13,
         "{cancelled}"
     );
+    fleet.assert_steps_remaining("agy", 0);
+    let turns = fleet
+        .records()
+        .into_iter()
+        .filter(|record| record["args"] != json!(["--version"]))
+        .count();
+    assert_eq!(turns, 2);
 }
 
 #[test]
@@ -224,10 +242,7 @@ fn time_spent_in_discovery_can_exhaust_the_deadline_before_a_turn_launches() {
         "antigravity",
         json!({"prompt":"run", "timeout_ms":150}),
     );
-    assert_eq!(
-        expired["observed"]["failure"]["kind"], "timeout",
-        "{expired}"
-    );
+    assert_observed_failure(&expired, "timeout", "Version check exceeded its deadline");
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "discovery ignored the call deadline: {:?}",
@@ -254,10 +269,7 @@ fn call_deadline_applies_through_before_snapshot_and_retry_attempts() {
         "antigravity",
         json!({"prompt": "run", "timeout_ms": 150}),
     );
-    assert_eq!(
-        expired["observed"]["failure"]["kind"], "timeout",
-        "{expired}"
-    );
+    assert_observed_failure(&expired, "timeout", "exceeded the call's deadline");
     assert!(expired["observed"]["passed"].is_null(), "{expired}");
     assert!(
         expired["observed"]["access_mechanism"].is_null(),
@@ -295,10 +307,7 @@ fn call_deadline_applies_through_before_snapshot_and_retry_attempts() {
         "codex",
         json!({"prompt": "work", "timeout_ms": 1500}),
     );
-    assert_eq!(
-        retried["observed"]["failure"]["kind"], "timeout",
-        "{retried}"
-    );
+    assert_observed_failure(&retried, "timeout", "exceeded the call's deadline");
     assert_eq!(
         retried["observed"]["attempts"]
             .as_array()
@@ -317,6 +326,13 @@ fn call_deadline_applies_through_before_snapshot_and_retry_attempts() {
         retried["reported"]["thread_id"], "eeb3a731-d53a-4444-8a6a-4d9d89e76073",
         "{retried}"
     );
+    codex_fleet.assert_steps_remaining("codex", 0);
+    let execs = codex_fleet
+        .records()
+        .into_iter()
+        .filter(|record| record["args"][0] == "exec")
+        .count();
+    assert_eq!(execs, 2);
 }
 
 #[test]
@@ -333,6 +349,7 @@ fn conflicting_starts_for_the_same_thread_id_refuse_replies() {
     );
     assert_eq!(full["observed"]["state"], "finished", "{full}");
     assert_eq!(full["reported"]["thread_id"], thread);
+    fleet.assert_steps_remaining("codex", 1);
     let ro = call(
         &mut server,
         "codex",
@@ -340,6 +357,7 @@ fn conflicting_starts_for_the_same_thread_id_refuse_replies() {
     );
     assert_eq!(ro["observed"]["state"], "finished", "{ro}");
     assert_eq!(ro["reported"]["thread_id"], thread);
+    fleet.assert_steps_remaining("codex", 0);
 
     for reply_args in [
         json!({"thread_id": thread, "prompt": "would escalate"}),
@@ -349,17 +367,7 @@ fn conflicting_starts_for_the_same_thread_id_refuse_replies() {
         }),
     ] {
         let refused = call(&mut server, "codex-reply", reply_args);
-        assert_eq!(
-            refused["observed"]["failure"]["kind"], "invalid_request",
-            "{refused}"
-        );
-        assert!(
-            refused["observed"]["failure"]["message"]
-                .as_str()
-                .unwrap_or_else(|| panic!("missing failure message: {refused}"))
-                .contains("conflicting"),
-            "{refused}"
-        );
+        assert_observed_failure(&refused, "invalid_request", "conflicting");
     }
     let execs: Vec<_> = fleet
         .records()
@@ -381,20 +389,15 @@ fn post_spawn_output_capture_failure_keeps_dispatch_evidence() {
         ]),
     );
     let mut server = fleet.server("claude");
-    for (prompt, expected_detail) in [("delete output", ""), ("dir output", "not a regular file")] {
+    for (index, (prompt, expected_detail)) in [
+        ("delete output", "Could not read the provider output file"),
+        ("dir output", "not a regular file"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let failed = call(&mut server, "codex", json!({"prompt": prompt}));
-        assert_eq!(failed["observed"]["state"], "failed", "{failed}");
-        assert_eq!(
-            failed["observed"]["failure"]["kind"], "capture",
-            "post-spawn read error must not be reported as launch: {failed}"
-        );
-        assert!(
-            failed["observed"]["failure"]["message"]
-                .as_str()
-                .unwrap_or_else(|| panic!("missing failure message: {failed}"))
-                .contains(expected_detail),
-            "{failed}"
-        );
+        assert_observed_failure(&failed, "capture", expected_detail);
         assert!(failed["observed"]["passed"].is_object(), "{failed}");
         assert!(
             failed["observed"]["access_mechanism"].is_string(),
@@ -414,7 +417,14 @@ fn post_spawn_output_capture_failure_keeps_dispatch_evidence() {
                 .unwrap()
                 > 0
         );
+        fleet.assert_steps_remaining("codex", 1 - index);
     }
+    let execs = fleet
+        .records()
+        .into_iter()
+        .filter(|record| record["args"][0] == "exec")
+        .count();
+    assert_eq!(execs, 2);
 }
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -488,16 +498,12 @@ mod linux_supervision {
         assert!(log.exists(), "provider scratch must exist while stub runs");
         server.close_input();
         let failed: Value = serde_json::from_str(common::text(&server.response(9))).unwrap();
-        assert_eq!(failed["observed"]["state"], "failed", "{failed}");
-        assert_eq!(
-            failed["observed"]["failure"]["kind"], "unknown",
-            "post-spawn supervision failure must not be reported as launch: {failed}"
-        );
+        assert_observed_failure(&failed, "unknown", "os error 1");
         assert!(
             failed["observed"]["failure"]["message"]
                 .as_str()
-                .unwrap_or_else(|| panic!("missing failure message: {failed}"))
-                .contains("os error 1"),
+                .unwrap()
+                .contains("Supervision failed"),
             "{failed}"
         );
         assert!(failed["observed"]["passed"].is_object(), "{failed}");
@@ -511,6 +517,7 @@ mod linux_supervision {
             "{failed}"
         );
         assert_eq!(failed["observed"]["attempts"][0]["signal"], libc::SIGKILL);
+        fleet.assert_steps_remaining("agy", 0);
         assert!(!log.exists(), "reaped provider scratch was not removed");
         assert!(server.wait_for_exit(common::EXIT_WAIT).0.success());
     }
@@ -527,17 +534,10 @@ fn fifo_replacement_of_output_file_fails_without_blocking() {
     );
     let mut server = fleet.server("claude");
     let failed = call(&mut server, "codex", json!({"prompt": "fifo output"}));
-    assert_eq!(failed["observed"]["state"], "failed", "{failed}");
-    assert_eq!(failed["observed"]["failure"]["kind"], "capture", "{failed}");
-    assert!(
-        failed["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("missing failure message: {failed}"))
-            .contains("not a regular file"),
-        "{failed}"
-    );
+    assert_observed_failure(&failed, "capture", "not a regular file");
     assert!(failed["observed"]["passed"].is_object(), "{failed}");
     assert_eq!(failed["observed"]["attempts"][0]["exit_code"], 0);
+    fleet.assert_steps_remaining("codex", 0);
 }
 
 #[test]
@@ -559,14 +559,7 @@ fn preflight_respects_call_deadline_and_cancellation() {
             "cwd": fleet.root, "timeout_ms": 150
         }),
     );
-    assert_eq!(timed["observed"]["failure"]["kind"], "timeout", "{timed}");
-    assert!(
-        timed["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("missing failure message: {timed}"))
-            .contains("preflight"),
-        "{timed}"
-    );
+    assert_observed_failure(&timed, "timeout", "preflight");
     assert_eq!(timed["observed"]["attempts"], json!([]));
 
     // Part B: connection EOF cancels post-discovery preflight cleanly.
@@ -594,19 +587,9 @@ fn preflight_respects_call_deadline_and_cancellation() {
     }
     server2.close_input();
     let cancelled: Value = serde_json::from_str(common::text(&server2.response(20))).unwrap();
-    assert_eq!(cancelled["observed"]["state"], "cancelled", "{cancelled}");
-    assert_eq!(
-        cancelled["observed"]["failure"]["kind"], "cancellation",
-        "{cancelled}"
-    );
-    assert!(
-        cancelled["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("missing failure message: {cancelled}"))
-            .contains("preflight"),
-        "{cancelled}"
-    );
+    assert_observed_failure(&cancelled, "cancellation", "preflight");
     assert_eq!(cancelled["observed"]["attempts"], json!([]));
+    fleet2.assert_steps_remaining("git", 0);
 }
 
 #[test]
@@ -641,21 +624,27 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
         json!({"prompt": "1", "model": "m1"}),
     );
     assert_eq!(s1["observed"]["state"], "finished", "{s1}");
+    fleet.assert_steps_remaining("agy", 5);
     let failed = call(
         &mut server,
         "antigravity",
         json!({"prompt": "bad", "model": "m-bad"}),
     );
-    assert_eq!(failed["observed"]["state"], "failed", "{failed}");
+    assert_reported_failure(
+        &failed,
+        Some(("abnormal_exit", "exit code 1")),
+        "timeout",
+        "timeout waiting for response",
+    );
+    assert_eq!(failed["reported"]["thread_id"], "failed", "{failed}");
+    fleet.assert_steps_remaining("agy", 4);
     let unremembered_failed = call(
         &mut server,
         "antigravity-reply",
         json!({"thread_id": "failed", "prompt": "retry"}),
     );
-    assert_eq!(
-        unremembered_failed["observed"]["failure"]["kind"], "invalid_request",
-        "failed start must not be recorded in starts: {unremembered_failed}"
-    );
+    assert_observed_failure(&unremembered_failed, "invalid_request", "no settings");
+    fleet.assert_steps_remaining("agy", 4);
 
     let s2 = call(
         &mut server,
@@ -663,12 +652,14 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
         json!({"prompt": "2", "model": "m2"}),
     );
     assert_eq!(s2["observed"]["state"], "finished", "{s2}");
+    fleet.assert_steps_remaining("agy", 3);
     let s3 = call(
         &mut server,
         "antigravity",
         json!({"prompt": "3", "model": "m3"}),
     );
     assert_eq!(s3["observed"]["state"], "finished", "{s3}");
+    fleet.assert_steps_remaining("agy", 2);
 
     // Limit is 2, so s1 was evicted while s2 and s3 remain remembered.
     let evicted = call(
@@ -676,17 +667,8 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
         "antigravity-reply",
         json!({"thread_id": "s1", "prompt": "evicted"}),
     );
-    assert_eq!(
-        evicted["observed"]["failure"]["kind"], "invalid_request",
-        "oldest start was not evicted: {evicted}"
-    );
-    assert!(
-        evicted["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("missing failure message: {evicted}"))
-            .contains("no settings"),
-        "{evicted}"
-    );
+    assert_observed_failure(&evicted, "invalid_request", "no settings");
+    fleet.assert_steps_remaining("agy", 2);
 
     let kept = call(
         &mut server,
@@ -695,6 +677,7 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
     );
     assert_eq!(kept["observed"]["state"], "finished", "{kept}");
     assert_eq!(kept["observed"]["passed"]["model"], "m2", "{kept}");
+    fleet.assert_steps_remaining("agy", 1);
 
     let explicit = call(
         &mut server,
@@ -709,6 +692,13 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
         explicit["observed"]["passed"]["model"], "m1-explicit",
         "{explicit}"
     );
+    fleet.assert_steps_remaining("agy", 0);
+    let turns = fleet
+        .records()
+        .into_iter()
+        .filter(|record| record["args"] != json!(["--version"]))
+        .count();
+    assert_eq!(turns, 6);
 }
 
 #[cfg(windows)]
@@ -751,6 +741,7 @@ fn windows_provider_directory_cleanup_retries_after_sharing_violation() {
     let done: Value = serde_json::from_str(common::text(&server.response(11))).unwrap();
     releaser.join().unwrap();
     assert_eq!(done["observed"]["state"], "finished", "{done}");
+    fleet.assert_steps_remaining("agy", 0);
     assert!(
         !log.exists(),
         "provider scratch survived after sharing violation cleared"
@@ -766,12 +757,13 @@ fn incomplete_capture_reports_why_the_terminal_record_was_unavailable() {
     fleet.script("agy", json!([long]));
     let mut server = fleet.server("claude");
     let envelope = call(&mut server, "antigravity", json!({"prompt":"report"}));
-    assert_eq!(envelope["observed"]["failure"]["kind"], "capture");
+    assert_observed_failure(&envelope, "capture", "capture limit");
     assert!(envelope["reported"]["content"].is_null());
     let attempt = &envelope["observed"]["attempts"][0];
     assert!(
         attempt["stdout_bytes"].as_u64().unwrap() > attempt["stdout_captured"].as_u64().unwrap()
     );
+    fleet.assert_steps_remaining("agy", 0);
 }
 
 #[test]

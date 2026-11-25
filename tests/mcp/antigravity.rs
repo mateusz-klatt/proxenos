@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::common::Server;
-use crate::provider_support::{Fleet, call};
+use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_failure, call};
 
 const FINISHED: &str = include_str!("../fixtures/antigravity/finished.json");
 const PRINT_TIMEOUT: &str = include_str!("../fixtures/antigravity/timeout.json");
@@ -63,10 +63,8 @@ fn start_and_reply_pass_the_model_workspace_permissions_and_new_guidance() {
         "antigravity",
         json!({"prompt":"Use a tier.", "effort":"high"}),
     );
-    assert_eq!(
-        unsupported["observed"]["failure"]["kind"],
-        "invalid_request"
-    );
+    assert_observed_failure(&unsupported, "invalid_request", "effort");
+    fleet.assert_steps_remaining("agy", 3);
     let start = call(
         &mut server,
         "antigravity",
@@ -82,6 +80,7 @@ fn start_and_reply_pass_the_model_workspace_permissions_and_new_guidance() {
     );
     assert_eq!(start["reported"]["thread_id"], ID);
     assert!(start["reported"]["model"].is_null());
+    fleet.assert_steps_remaining("agy", 2);
     let reply = call(
         &mut server,
         "antigravity-reply",
@@ -91,6 +90,7 @@ fn start_and_reply_pass_the_model_workspace_permissions_and_new_guidance() {
     );
     assert_eq!(reply["observed"]["state"], "finished", "{reply}");
     assert_eq!(reply["observed"]["passed"]["model"], "fixture-model");
+    fleet.assert_steps_remaining("agy", 1);
     let override_reply = call(
         &mut server,
         "antigravity-reply",
@@ -102,6 +102,7 @@ fn start_and_reply_pass_the_model_workspace_permissions_and_new_guidance() {
         override_reply["observed"]["state"], "finished",
         "{override_reply}"
     );
+    fleet.assert_steps_remaining("agy", 0);
     let records = delegated(&fleet);
     assert_eq!(records.len(), 3);
     assert!(
@@ -194,19 +195,16 @@ fn a_model_free_start_requires_the_caller_to_name_a_reply_model() {
     let mut server = fleet.server("claude");
     let start = call(&mut server, "antigravity", json!({"prompt": "Start."}));
     assert_eq!(start["observed"]["state"], "finished");
+    fleet.assert_steps_remaining("agy", 1);
     let reply = json!({"prompt": "Continue.", "thread_id": ID});
     let refused = call(&mut server, "antigravity-reply", reply.clone());
-    assert_eq!(refused["observed"]["state"], "failed");
-    assert!(
-        refused["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("model")
-    );
+    assert_observed_failure(&refused, "invalid_request", "model");
+    fleet.assert_steps_remaining("agy", 1);
     let mut explicit = reply;
     explicit["model"] = json!("user-choice");
     let ok = call(&mut server, "antigravity-reply", explicit);
     assert_eq!(ok["observed"]["state"], "finished");
+    fleet.assert_steps_remaining("agy", 0);
     let records = delegated(&fleet);
     assert_eq!(records.len(), 2);
     assert!(argument(&records[0], "--model").is_none());
@@ -229,33 +227,21 @@ fn unknown_conversations_cannot_reach_any_child_even_on_a_first_call() {
     let fleet = Fleet::new(&["agy"]);
     let mut server = fleet.server("claude");
     let missing = resume(&mut server, ID, &fleet.root);
-    assert!(
-        missing["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Cannot inspect"),
-        "{missing}"
-    );
+    assert_observed_failure(&missing, "invalid_request", "Cannot inspect");
     let directory = store(&fleet);
     fs::create_dir_all(directory.join("folder.db")).unwrap();
     fs::write(directory.join("Case-Sensitive.db"), []).unwrap();
     fs::write(directory.join("sidecar.db-wal"), []).unwrap();
-    for id in [
-        "case-sensitive",
-        "folder",
-        "sidecar",
-        "unknown-id",
-        "a/b",
-        "../escape",
+    for (id, detail) in [
+        ("case-sensitive", "No exact regular conversation file"),
+        ("folder", "No exact regular conversation file"),
+        ("sidecar", "No exact regular conversation file"),
+        ("unknown-id", "No exact regular conversation file"),
+        ("a/b", "conversation identifier"),
+        ("../escape", "conversation identifier"),
     ] {
         let failed = resume(&mut server, id, &fleet.root);
-        assert_eq!(failed["observed"]["state"], "failed", "{id}: {failed}");
-        assert!(
-            !failed["observed"]["failure"]["message"]
-                .as_str()
-                .unwrap()
-                .is_empty()
-        );
+        assert_observed_failure(&failed, "invalid_request", detail);
     }
     #[cfg(unix)]
     {
@@ -265,7 +251,11 @@ fn unknown_conversations_cannot_reach_any_child_even_on_a_first_call() {
         )
         .unwrap();
         let failed = resume(&mut server, "alias", &fleet.root);
-        assert_eq!(failed["observed"]["state"], "failed");
+        assert_observed_failure(
+            &failed,
+            "invalid_request",
+            "No exact regular conversation file",
+        );
     }
     assert!(
         fleet.records().is_empty(),
@@ -282,10 +272,10 @@ fn both_directory_overrides_are_honoured_with_the_proxenos_one_first() {
     fs::write(legacy_store.join(format!("{ID}.pb")), []).unwrap();
     fs::create_dir(&new_store).unwrap();
     fleet.script("agy", json!([{"stdout": FINISHED}, {"stdout": FINISHED}]));
-    for (own, found) in [
-        ("  ".into(), true),
-        (new_store.clone(), false),
-        (legacy_store.clone(), true),
+    for (own, found, remaining) in [
+        ("  ".into(), true, 1),
+        (new_store.clone(), false, 1),
+        (legacy_store.clone(), true, 0),
     ] {
         let mut command = fleet.command("claude");
         command
@@ -294,7 +284,16 @@ fn both_directory_overrides_are_honoured_with_the_proxenos_one_first() {
         let mut server = Server::start_command(command);
         server.initialize("2025-11-25");
         let result = resume(&mut server, ID, &fleet.root);
-        assert_eq!(result["observed"]["state"] == "finished", found, "{result}");
+        if found {
+            assert_eq!(result["observed"]["state"], "finished", "{result}");
+        } else {
+            assert_observed_failure(
+                &result,
+                "invalid_request",
+                "No exact regular conversation file",
+            );
+        }
+        fleet.assert_steps_remaining("agy", remaining);
     }
     assert_eq!(delegated(&fleet).len(), 2);
 }
@@ -318,14 +317,34 @@ fn print_status_and_permission_diagnostics_classify_only_the_failed_turn() {
         {"stdout":"{\"response\":\"An answer without a status.\"}"},
         {"stderr":"Unauthenticated", "code":1}
     ]));
-    for (i, kind) in [
-        "timeout",
-        "quota",
-        "authentication",
-        "unknown",
-        "unknown",
-        "refusal",
-        "unknown",
+    for (i, (observed, kind, detail)) in [
+        (
+            Some(("abnormal_exit", "exit code 1")),
+            "timeout",
+            "timeout waiting for response",
+        ),
+        (
+            Some(("abnormal_exit", "exit code 1")),
+            "quota",
+            "Quota exhausted",
+        ),
+        (
+            Some(("abnormal_exit", "exit code 1")),
+            "authentication",
+            "Authentication required",
+        ),
+        (
+            Some(("abnormal_exit", "exit code 1")),
+            "unknown",
+            "Invalid model selection",
+        ),
+        (
+            Some(("abnormal_exit", "exit code 1")),
+            "unknown",
+            "unsuccessful status",
+        ),
+        (None, "refusal", "command\" permission"),
+        (None, "unknown", "empty response"),
     ]
     .into_iter()
     .enumerate()
@@ -335,8 +354,7 @@ fn print_status_and_permission_diagnostics_classify_only_the_failed_turn() {
             "antigravity",
             json!({"prompt":"Check classification."}),
         );
-        assert_eq!(result["observed"]["state"], "failed", "{result}");
-        assert_eq!(result["reported"]["failure"]["kind"], kind, "{result}");
+        assert_reported_failure(&result, observed, kind, detail);
         if i == 0 {
             assert_eq!(result["reported"]["thread_id"], ID);
         }
@@ -346,6 +364,7 @@ fn print_status_and_permission_diagnostics_classify_only_the_failed_turn() {
                 "2030-04-02T15:00:00Z"
             );
         }
+        fleet.assert_steps_remaining("agy", 9 - i);
     }
     let success = call(
         &mut server,
@@ -354,14 +373,28 @@ fn print_status_and_permission_diagnostics_classify_only_the_failed_turn() {
     );
     assert_eq!(success["observed"]["state"], "finished");
     assert_eq!(success["reported"]["content"], "quota exceeded");
+    assert!(success["reported"]["failure"].is_null(), "{success}");
+    fleet.assert_steps_remaining("agy", 2);
     let no_status = call(
         &mut server,
         "antigravity",
         json!({"prompt":"Missing status."}),
     );
-    assert_eq!(no_status["observed"]["state"], "failed");
+    assert_observed_failure(
+        &no_status,
+        "unknown",
+        "without evidence of a completed turn",
+    );
+    fleet.assert_steps_remaining("agy", 1);
     let auth = call(&mut server, "antigravity", json!({"prompt":"Login."}));
-    assert_eq!(auth["reported"]["failure"]["kind"], "authentication");
+    assert_reported_failure(
+        &auth,
+        Some(("abnormal_exit", "exit code 1")),
+        "authentication",
+        "Unauthenticated",
+    );
+    fleet.assert_steps_remaining("agy", 0);
+    assert_eq!(delegated(&fleet).len(), 10);
 }
 
 #[test]
@@ -404,9 +437,9 @@ fn a_reply_checks_the_confirmed_id_as_well_as_the_store() {
         ]),
     );
     let mut server = fleet.server("claude");
-    for expect_id in [Some(ID), Some(ID), Some(ID), None] {
+    for (index, expect_id) in [Some(ID), Some(ID), Some(ID), None].into_iter().enumerate() {
         let result = resume(&mut server, "old-thread", &fleet.root);
-        assert_eq!(result["observed"]["state"], "failed", "{result}");
+        assert_reported_failure(&result, None, "unknown", "conversation ID");
         assert_eq!(
             result["reported"]["thread_id"].as_str(),
             expect_id,
@@ -424,26 +457,26 @@ fn a_reply_checks_the_confirmed_id_as_well_as_the_store() {
             result["observed"]["content_captured_bytes"].is_null(),
             "{result}"
         );
-        assert!(
-            result["reported"]["failure"]["message"]
-                .as_str()
-                .unwrap_or_else(|| panic!("missing reported failure message: {result}"))
-                .contains("conversation ID"),
-            "{result}"
-        );
+        fleet.assert_steps_remaining("agy", 4 - index);
     }
     let quota = resume(&mut server, "old-thread", &fleet.root);
-    assert_eq!(quota["observed"]["state"], "failed", "{quota}");
+    assert_reported_failure(
+        &quota,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        "Quota exhausted",
+    );
     assert!(quota["reported"]["thread_id"].is_null(), "{quota}");
     assert!(
         quota["reported"]["content"].is_null(),
         "error reply without id must not populate content: {quota}"
     );
-    assert_eq!(quota["reported"]["failure"]["kind"], "quota", "{quota}");
     assert_eq!(
         quota["reported"]["failure"]["reset_at"], "2030-04-02T15:00:00Z",
         "{quota}"
     );
+    fleet.assert_steps_remaining("agy", 0);
+    assert_eq!(delegated(&fleet).len(), 5);
 }
 
 #[test]
@@ -461,19 +494,19 @@ fn invalid_or_oversized_antigravity_conversation_ids_are_dropped() {
     );
     let mut server = fleet.server("claude");
     let rejected = resume(&mut server, &oversized, &fleet.root);
-    assert_eq!(
-        rejected["observed"]["failure"]["kind"], "invalid_request",
-        "{rejected}"
-    );
+    assert_observed_failure(&rejected, "invalid_request", "conversation identifier");
     assert!(fleet.records().is_empty());
-    for _ in 0..2 {
+    fleet.assert_steps_remaining("agy", 2);
+    for index in 0..2 {
         let start = call(&mut server, "antigravity", json!({"prompt": "start"}));
         assert_eq!(start["observed"]["state"], "finished", "{start}");
         assert!(
             start["reported"]["thread_id"].is_null(),
             "invalid/oversized conversation_id was not dropped: {start}"
         );
+        fleet.assert_steps_remaining("agy", 1 - index);
     }
+    assert_eq!(delegated(&fleet).len(), 2);
 }
 
 #[test]
@@ -511,10 +544,12 @@ fn a_conversation_removed_during_discovery_never_receives_the_reply() {
     fs::write(&release, []).unwrap();
     let answer = server.response(41);
     let result: Value = serde_json::from_str(crate::common::text(&answer)).unwrap();
-    assert_eq!(
-        result["observed"]["failure"]["kind"], "invalid_request",
-        "{result}"
+    assert_observed_failure(
+        &result,
+        "invalid_request",
+        "No exact regular conversation file",
     );
+    fleet.assert_steps_remaining("agy", 1);
     let records = fleet.records();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["args"], json!(["--version"]));

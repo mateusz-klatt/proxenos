@@ -612,12 +612,14 @@ startup, and Windows SmartScreen.
 - During the migration, the same scenarios are replayed against claude-delegator 3.5.0 and the
   results compared, apart from a short list of intended differences.
 - No test starts a real agent CLI or spends a model call.
-- On Intel macOS the linker does not sign binaries ad hoc, as it does on arm64. AppleSystemPolicy
-  then evaluates the unsigned stub each time it runs from a new path, and under load it killed the
-  stub with SIGKILL in 21 of 50 runs of the provider tests (measured on 2026-11-25). There, the
-  tests copy the stub once per process, sign the copy ad hoc with `/usr/bin/codesign`, and link
-  only to that copy. This changes nothing in what ships: releases are signed with the Developer ID
-  (D11).
+- On an Intel Mac, local runs of the provider tests can fail because macOS AppleSystemPolicy
+  kills the stub under a provider name with SIGKILL during exec. It was measured on 2026-11-25 at
+  14 to 21 failing runs in 30 to 50, with the stub unsigned or signed ad hoc, and was not
+  reproduced outside `cargo test`. Proxenos does not send that signal: its own stops end as
+  `timed_out` or `cancelled`. Adding the terminal to System Settings → Privacy & Security →
+  Developer Tools is expected to stop the evaluation, but that is not yet measured. CI on arm64
+  macOS is unaffected. Tests that expect a failure assert its kind, so an unexpected kill cannot
+  pass as an expected failure.
 
 ### D13. Migration
 
