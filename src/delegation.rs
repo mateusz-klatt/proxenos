@@ -18,7 +18,7 @@ use crate::discovery::{Executable, exit_description};
 use crate::envelope::{CAPTURE_LIMIT, Envelope, Failure, FailureKind};
 use crate::mcp::{Activity, ToolOutcome};
 use crate::providers::{DEFAULT_TIMEOUT_MS, Provider, RememberedStart, Report, Turn};
-use crate::sessions::{self, SessionLookup};
+use crate::sessions::{self, SaveOutcome, SessionLookup};
 use crate::supervise::cleanup::DirectoryLease;
 use crate::supervise::{self, Ending, Finished, Launch};
 use crate::tools::Registry;
@@ -382,20 +382,23 @@ impl Registry {
                 .await
                 .expect("session saver finished");
                 match saved {
-                    Ok(true) => self.starts.lock().unwrap().cache(p.name, id.clone(), None),
-                    Ok(false) => self
-                        .starts
-                        .lock()
-                        .unwrap()
-                        .cache(p.name, id.clone(), desired),
+                    Ok(SaveOutcome::Ambiguous) => {
+                        self.starts.lock().unwrap().cache(p.name, id.clone(), None);
+                    }
+                    Ok(SaveOutcome::Saved | SaveOutcome::Unconfigured) => {
+                        self.starts
+                            .lock()
+                            .unwrap()
+                            .cache(p.name, id.clone(), desired);
+                    }
                     Err(error) => {
-                        if error.kind() == io::ErrorKind::InvalidData {
-                            self.starts.lock().unwrap().remove(p.name, id);
-                        } else {
-                            self.starts
-                                .lock()
-                                .unwrap()
-                                .cache(p.name, id.clone(), desired);
+                        {
+                            let mut starts = self.starts.lock().unwrap();
+                            if desired.is_none() {
+                                starts.cache(p.name, id.clone(), None);
+                            } else {
+                                starts.remove(p.name, id);
+                            }
                         }
                         write_diagnostic(format!("could not save session settings: {error}")).await;
                     }

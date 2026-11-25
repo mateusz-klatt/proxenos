@@ -61,6 +61,12 @@ pub enum SessionLookup {
     Corrupt(String),
 }
 
+pub enum SaveOutcome {
+    Saved,
+    Ambiguous,
+    Unconfigured,
+}
+
 fn absolute_env(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).map(PathBuf::from).filter(|path| {
         path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
@@ -151,18 +157,17 @@ fn stored_from(start: &RememberedStart) -> io::Result<(StoredSettings, Option<St
 }
 
 /// Persists a confirmed start or an ambiguity tombstone (`entry == None`).
-/// Returns `Ok(true)` when the durable record is ambiguous (including on a cross-restart conflict).
+/// Returns `SaveOutcome::Unconfigured` when no durable state directory is configured,
+/// `SaveOutcome::Ambiguous` when the durable record is ambiguous (including on a cross-restart
+/// conflict), or `SaveOutcome::Saved` when persisted cleanly.
 pub fn save(
     provider: &Provider,
     thread_id: &str,
     entry: Option<RememberedStart>,
-) -> io::Result<bool> {
-    let base = state_base().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "state directory environment variable is unavailable",
-        )
-    })?;
+) -> io::Result<SaveOutcome> {
+    let Some(base) = state_base() else {
+        return Ok(SaveOutcome::Unconfigured);
+    };
     let desired = entry.as_ref().map(stored_from).transpose()?;
     let provider_dir = ensure_provider_dir(&base, provider.name)?;
     let key = encode_thread_id(thread_id);
@@ -219,7 +224,11 @@ pub fn save(
     file.write_all(&encoded)?;
     drop(file);
     fs::rename(&staging, &target)?;
-    Ok(ambiguous)
+    Ok(if ambiguous {
+        SaveOutcome::Ambiguous
+    } else {
+        SaveOutcome::Saved
+    })
 }
 
 struct Staging(PathBuf);

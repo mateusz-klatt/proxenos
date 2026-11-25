@@ -17,6 +17,8 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
     if let Some(directory) = std::env::var_os("PROXENOS_STUB_DIR") {
         return replay(Path::new(&directory));
     }
+    #[cfg(unix)]
+    let mut held_memory = Vec::new();
     for step in std::env::args().skip(1) {
         let (name, value) = step.split_once(':').unwrap_or((&step, ""));
         match name {
@@ -26,6 +28,8 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
             "flood-err" => io::stderr().write_all(&vec![0xfe; value.parse()?])?,
             "sleep" => thread::sleep(Duration::from_millis(value.parse()?)),
             "burn" => burn_cpu(value.parse()?),
+            #[cfg(unix)]
+            "alloc" => held_memory.push(alloc_and_touch(value.parse()?)?),
             "close-output" => platform::close_output()?,
             "stdin" => {
                 let count = io::copy(&mut io::stdin().lock(), &mut io::sink())?;
@@ -48,6 +52,16 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
             "session" => platform::report_session()?,
             #[cfg(unix)]
             "await-term" => platform::await_term(value)?,
+            #[cfg(unix)]
+            "delayed-grandchild" => {
+                let (path, delay) = value.split_once(':').ok_or("missing delay")?;
+                let mut copy = Command::new(std::env::current_exe()?);
+                copy.arg("ignore-term")
+                    .arg(format!("hold:{path}"))
+                    .arg(format!("await-term:{path}.term"))
+                    .arg(format!("sleep:{delay}"));
+                spawn_and_wait_ready(&mut copy, path)?;
+            }
             #[cfg(unix)]
             "escape" => {
                 let mut copy = Command::new(std::env::current_exe()?);
@@ -117,13 +131,7 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
     }
     let mut held_memory = Vec::<u8>::new();
     if let Some(bytes) = step["alloc_bytes"].as_u64() {
-        let len = bytes as usize;
-        held_memory.try_reserve_exact(len)?;
-        held_memory.resize(len, 0);
-        for chunk in held_memory.chunks_mut(4096) {
-            chunk[0] = 1;
-        }
-        std::hint::black_box(&held_memory);
+        held_memory = alloc_and_touch(bytes as usize)?;
     }
     if let Some(ms) = step["burn_cpu_ms"].as_u64() {
         burn_cpu(ms);
@@ -191,6 +199,17 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
     ));
     std::hint::black_box(&held_memory);
     Ok(ExitCode::from(step["code"].as_u64().unwrap_or(0) as u8))
+}
+
+fn alloc_and_touch(len: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut memory = Vec::new();
+    memory.try_reserve_exact(len)?;
+    memory.resize(len, 0);
+    for chunk in memory.chunks_mut(4096) {
+        chunk[0] = 1;
+    }
+    std::hint::black_box(&memory);
+    Ok(memory)
 }
 
 fn burn_cpu(ms: u64) {

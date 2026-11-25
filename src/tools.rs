@@ -352,6 +352,7 @@ mod test_tools {
                     "stderr_total": finished.stderr.total,
                     "elapsed_ms": finished.elapsed.as_millis(),
                     "last_output_ms": finished.last_output.map(|at| at.as_millis()),
+                    "peak_memory_bytes": finished.accounting.peak_memory_bytes,
                 })
                 .to_string(),
                 is_error: false,

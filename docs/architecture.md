@@ -247,7 +247,12 @@ out) as well as live turn output—is the next step.
 
 - **Unix**: the child calls `setsid` before it executes the CLI. It leads its own session and
   process group and starts without a controlling terminal. On a stop, Proxenos sends SIGTERM to
-  the group and gives it three seconds before SIGKILL, even when the leader exits first.
+  the group and gives it up to three seconds before SIGKILL, ending the grace early only when
+  `waitid` confirms the leader has exited and process-group enumeration positively confirms that
+  no non-zombie member remains in the group (falling back to the full three seconds if enumeration
+  fails or fills its buffer), and still sending the final SIGKILL while the leader PID stays
+  reserved. Even when the leader exits first, live descendants keep the remainder of the grace;
+  a descendant that left the group (`setsid`) is still outside this mechanism.
   Proxenos observes the leader's exit with `waitid` and keeps its PID reserved until the last
   group signal, so a reused PID cannot take that signal to another group. Launches run on
   blocking workers. Their pipe setup and native spawn are serialized, with cancellation and

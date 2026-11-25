@@ -867,12 +867,12 @@ fn save_refuses_to_overwrite_corrupt_session_file() {
     let sentinel = "{corrupt-sentinel-must-not-be-overwritten";
     fs::write(&session_file, sentinel).unwrap();
 
-    // Even in the same server that previously cached AGY_ID, a confirmed start fails closed on
-    // disk, leaves the corrupt bytes untouched, and evicts the stale cache entry.
+    // Even in the same server that previously cached AGY_ID, a non-conflicting confirmed start
+    // fails closed on disk, leaves the corrupt bytes untouched, and evicts the stale cache entry.
     let same_server_start = call(
         &mut server1,
         "antigravity",
-        json!({"prompt": "second", "model": "m2"}),
+        json!({"prompt": "second", "model": "m1"}),
     );
     assert_eq!(same_server_start["observed"]["state"], "finished");
     assert_eq!(fs::read_to_string(&session_file).unwrap(), sentinel);
@@ -1196,4 +1196,147 @@ fn save_refuses_session_payload_above_size_limit() {
         "oversized payload must not be written: {json_files:?}"
     );
     assert!(server.finish().0.success());
+}
+
+#[test]
+fn save_error_never_caches_unverified_settings_or_clears_ambiguity() {
+    // Part A (P1): a tombstone on disk + `.lock` obstructed by a directory (non-InvalidData error
+    // on Unix and Windows). A fresh server running a confirmed start must NOT cache an unverified
+    // `Some` in StartStore; the subsequent reply must go back to disk and be refused.
+    let fleet = Fleet::new(&["codex"]);
+    fleet.script(
+        "codex",
+        json!([
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED}
+        ]),
+    );
+    let mut seed = fleet.server("claude");
+    assert_eq!(
+        call(
+            &mut seed,
+            "codex",
+            json!({"prompt": "s1", "access": "full"})
+        )["observed"]["state"],
+        "finished"
+    );
+    assert_eq!(
+        call(
+            &mut seed,
+            "codex",
+            json!({"prompt": "s2", "access": "read-only"})
+        )["observed"]["state"],
+        "finished"
+    );
+    assert!(seed.finish().0.success());
+
+    let session_file = single_session_file(&sessions_root(&fleet.root).join("codex"));
+    let lock_path = session_file.with_extension("lock");
+    fs::remove_file(&lock_path).unwrap();
+    fs::create_dir(&lock_path).unwrap();
+
+    let mut fresh = fleet.server("claude");
+    let start = call(
+        &mut fresh,
+        "codex",
+        json!({"prompt": "s3", "access": "full"}),
+    );
+    assert_eq!(start["observed"]["state"], "finished", "{start}");
+    assert!(
+        fresh.stderr().contains("could not save session settings"),
+        "{}",
+        fresh.stderr()
+    );
+    let before_reply = fleet.records().len();
+    let refused_while_obstructed = call(
+        &mut fresh,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "must not bypass disk"}),
+    );
+    assert_eq!(
+        refused_while_obstructed["observed"]["failure"]["kind"], "invalid_request",
+        "{refused_while_obstructed}"
+    );
+    assert_eq!(
+        fleet.records().len(),
+        before_reply,
+        "reply must not dispatch from unverified cache while save failed"
+    );
+
+    // Removing the lock obstruction still exposes the on-disk ambiguity tombstone.
+    fs::remove_dir(&lock_path).unwrap();
+    let refused_tombstone = call(
+        &mut fresh,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "still ambiguous on disk"}),
+    );
+    assert_eq!(
+        refused_tombstone["observed"]["failure"]["kind"], "invalid_request",
+        "{refused_tombstone}"
+    );
+    assert!(
+        refused_tombstone["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting"),
+        "{refused_tombstone}"
+    );
+    assert_eq!(fleet.records().len(), before_reply);
+    assert!(fresh.finish().0.success());
+
+    // Part B (P1): an in-memory ambiguity marker (`desired == None`) must NOT be erased when
+    // `sessions::save` fails (including with InvalidData on a corrupt disk file).
+    let fleet2 = Fleet::new(&["codex"]);
+    fleet2.script(
+        "codex",
+        json!([{"stdout": CODEX_FINISHED}, {"stdout": CODEX_FINISHED}]),
+    );
+    let mut server2 = fleet2.server("claude");
+    assert_eq!(
+        call(
+            &mut server2,
+            "codex",
+            json!({"prompt": "a1", "access": "full"})
+        )["observed"]["state"],
+        "finished"
+    );
+    let session2 = single_session_file(&sessions_root(&fleet2.root).join("codex"));
+    fs::write(&session2, "{corrupt-while-ambiguity-triggered").unwrap();
+    // Conflicting second start sets desired = None in memory, while save fails with InvalidData.
+    assert_eq!(
+        call(
+            &mut server2,
+            "codex",
+            json!({"prompt": "a2", "access": "read-only"})
+        )["observed"]["state"],
+        "finished"
+    );
+    // Even if the corrupt file disappears afterward, StartStore kept `None` and refuses replies.
+    fs::remove_file(&session2).unwrap();
+    let before_reply2 = fleet2.records().len();
+    let refused_mem = call(
+        &mut server2,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "must stay ambiguous in memory",
+            "cwd": fleet2.root,
+            "access": "read-only",
+            "mode": "advisory"
+        }),
+    );
+    assert_eq!(
+        refused_mem["observed"]["failure"]["kind"], "invalid_request",
+        "{refused_mem}"
+    );
+    assert!(
+        refused_mem["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting"),
+        "{refused_mem}"
+    );
+    assert_eq!(fleet2.records().len(), before_reply2);
+    assert!(server2.finish().0.success());
 }
