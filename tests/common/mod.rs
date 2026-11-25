@@ -115,8 +115,16 @@ impl Server {
 
     /// Every frame left on standard output, once the server has closed it.
     pub fn frames_until_end(&mut self) -> Vec<Value> {
-        let deadline = Instant::now() + WAIT;
-        std::iter::from_fn(|| self.next_frame(deadline)).collect()
+        let deadline = Instant::now() + EXIT_WAIT;
+        let mut frames = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => frames.push(serde_json::from_str(&line).expect("JSON")),
+                Err(RecvTimeoutError::Disconnected) => return frames,
+                Err(RecvTimeoutError::Timeout) => panic!("standard output did not end"),
+            }
+        }
     }
 
     /// Sends a call without waiting for its answer.

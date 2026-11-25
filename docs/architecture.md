@@ -143,11 +143,16 @@ Measured on 2026-11-24 with a throwaway server on Linux, `rmcp` 3.11.0, features
 What the `mcp` module has to do itself, because the library does not:
 
 - **End of input.** The library waits a fixed five seconds after standard input closes before it
-  cancels running calls. Proxenos copies standard input into the library itself, and stops
-  running calls the moment it ends.
+  cancels running calls. Proxenos reads standard input itself, as soon as bytes arrive, and passes
+  them on; it stops running calls the moment the input ends, whatever the library is doing.
 - **Read and write failures.** The library ends quietly when it cannot read or write. Proxenos
-  copies standard output from the library too, so that a failure in either direction ends serving
-  with exit status 1 and says why; exit status 0 means the client closed the connection.
+  takes the library's answers from it frame by frame as they are written, and writes them to
+  standard output itself, so that a failure in either direction stops serving and ends it with
+  exit status 1 and the reason; exit status 0 means the client closed the connection. After a
+  failed write nothing more reaches the library.
+- **A client that does not read.** Answers wait in memory, in order, up to 64 MiB, so that the
+  library is never blocked by such a client and does not cut an answer short. Past that, serving
+  has failed.
 - **Cancellation.** The library signals a token and does not stop the handler. Every handler
   waits on that token.
 - **Panics.** A handler that panics is never answered. Proxenos catches the panic and answers
@@ -157,9 +162,9 @@ What the `mcp` module has to do itself, because the library does not:
   library refuses them. Proxenos does not offer that revision: a client that asks for it is
   offered 2025-11-25, which it may accept or not.
 - **Calls still running when the connection ends.** The library stops waiting for them after five
-  seconds, or at the first answer it cannot write. Proxenos tells them to stop and waits for them.
-  Ten seconds after the end of the input, whatever is still running or still unwritten, for a
-  client that no longer reads, is abandoned and serving has failed.
+  seconds. Proxenos tells them to stop and waits for them. Ten seconds after the end of the input
+  or the first failure, whatever is still running or still unwritten is abandoned and serving has
+  failed.
 
 Known differences from claude-delegator, accepted: a line that is not JSON is ignored instead of
 answered with a parse error, and a `tools/call` without a name is "method not found" instead of
