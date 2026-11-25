@@ -3,7 +3,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,16 @@ pub const WAIT: Duration = Duration::from_secs(10);
 pub const EXIT_WAIT: Duration = Duration::from_secs(30);
 
 pub const NEW_VERSION: &str = "2026-07-28";
+
+/// Held while a test starts a process. Where the standard library creates a pipe and marks it
+/// close-on-exec in two steps, as on macOS, a process that another thread starts in between
+/// inherits that end without the mark, and keeps it open for as long as it runs. A test that
+/// closes a child's output then sees no failed write, and one that closes a child's input sees the
+/// child never exit. Measured on macOS: without the lock, 5 of 20 runs of the MCP tests failed.
+pub fn spawning() -> MutexGuard<'static, ()> {
+    static SPAWNING: Mutex<()> = Mutex::new(());
+    SPAWNING.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The per-request `_meta` of the 2026-07-28 revision.
 pub fn meta(version: &str) -> Value {
@@ -53,6 +63,7 @@ impl Server {
     }
 
     fn spawn(args: &[&str]) -> (Self, ChildStdout, Sender<String>) {
+        let spawning = spawning();
         let mut child = Command::new(env!("CARGO_BIN_EXE_proxenos"))
             .args(args)
             .stdin(Stdio::piped())
@@ -60,6 +71,7 @@ impl Server {
             .stderr(Stdio::piped())
             .spawn()
             .expect("the binary starts");
+        drop(spawning);
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");

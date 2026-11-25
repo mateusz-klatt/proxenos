@@ -260,9 +260,10 @@ fn a_failed_write_stops_calls_and_makes_serving_fail() {
     server.wait_for_stderr("test_wait: started");
 
     drop(stdout);
-    // A write succeeds while any process still holds the read end, and a process that another
-    // test starts at this moment can hold a copy for a while. So answers are asked for until one
-    // fails to be written. Input is still open: cancellation shows the failed write halted serving.
+    // A write succeeds while any process still holds the read end. A process that another test
+    // is starting at this moment holds a copy until it executes the binary (measured on Linux), so
+    // answers are asked for until one fails to be written. Input is still open: cancellation shows
+    // that the failed write halted serving.
     let deadline = Instant::now() + Duration::from_secs(10);
     for id in 3.. {
         if server.stderr().contains("test_wait: cancelled") {
@@ -274,7 +275,7 @@ fn a_failed_write_stops_calls_and_makes_serving_fail() {
     }
     let mut stdin = server.take_input();
     let late = json!({
-        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "jsonrpc": "2.0", "id": "after-the-failure", "method": "tools/call",
         "params": { "name": "test_wait", "arguments": { "ms": 0 } }
     });
     let _ = writeln!(stdin, "{late}");
@@ -358,11 +359,16 @@ fn output_that_piles_up_unread_past_its_limit_makes_serving_fail() {
 #[test]
 fn input_that_cannot_be_read_makes_serving_fail() {
     let directory = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).expect("a directory opens");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_proxenos"))
+    let spawning = common::spawning();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_proxenos"))
         .args(["mcp", "--client", "claude"])
         .stdin(directory)
-        .output()
-        .expect("the binary runs");
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary starts");
+    drop(spawning);
+    let output = child.wait_with_output().expect("the binary runs");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("reading the input failed"), "{stderr}");
@@ -392,21 +398,30 @@ fn a_connection_that_cannot_be_served_is_a_failure() {
 #[test]
 fn a_failed_handshake_is_reported_while_output_is_blocked() {
     let (mut server, _unread) = Server::mcp_with_unread_output();
-    // Answers to pings before initialize, more than a pipe holds and none of them read.
-    for id in 0..20_000 {
-        server.send(&json!({ "jsonrpc": "2.0", "id": id, "method": "ping" }));
-    }
-    server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
-    // Input stays open: the handshake failure alone ends serving, and the reason survives
-    // the drain that the blocked output cuts short.
+    let mut stdin = server.take_input();
+    // On its own thread, so that the wait below is bounded even if the server stops reading.
+    let writing = std::thread::spawn(move || {
+        // Answers to pings before initialize, more than a pipe holds and none of them read.
+        let pings = (0..20_000).map(|id| json!({ "jsonrpc": "2.0", "id": id, "method": "ping" }));
+        let wrong = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        for frame in pings.chain([wrong]) {
+            if writeln!(stdin, "{frame}").is_err() {
+                break;
+            }
+        }
+        stdin // Input stays open until the child exits.
+    });
+    // The handshake failure alone ends serving, and its reason survives the drain that the
+    // blocked output cuts short.
     let (status, _) = server.wait_for_exit(Duration::from_secs(20));
+    drop(writing.join().expect("the input writer finishes"));
     assert_eq!(status.code(), Some(1));
     let stderr = server.stderr();
     let reason = stderr
         .lines()
         .find(|line| line.starts_with("proxenos: ") && !line.contains("serving MCP"));
     assert!(
-        reason.is_some_and(|line| !line.contains("did not finish within")),
+        reason.is_some_and(|line| line.contains("initialized") && !line.contains("did not finish")),
         "{stderr}"
     );
 }
