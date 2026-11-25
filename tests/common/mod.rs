@@ -3,7 +3,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,15 @@ pub const WAIT: Duration = Duration::from_secs(10);
 pub const EXIT_WAIT: Duration = Duration::from_secs(30);
 
 pub const NEW_VERSION: &str = "2026-07-28";
+
+/// Held while a test starts a process. Where the standard library cannot create a pipe and mark it
+/// close-on-exec in one step, as on macOS, a process started on another thread in between inherits
+/// that pipe. A test that closes its end of a child's output then sees no failed write, because a
+/// sibling still holds the pipe open.
+pub fn spawning() -> MutexGuard<'static, ()> {
+    static SPAWNING: Mutex<()> = Mutex::new(());
+    SPAWNING.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The per-request `_meta` of the 2026-07-28 revision.
 pub fn meta(version: &str) -> Value {
@@ -53,6 +62,7 @@ impl Server {
     }
 
     fn spawn(args: &[&str]) -> (Self, ChildStdout, Sender<String>) {
+        let spawning = spawning();
         let mut child = Command::new(env!("CARGO_BIN_EXE_proxenos"))
             .args(args)
             .stdin(Stdio::piped())
@@ -60,6 +70,7 @@ impl Server {
             .stderr(Stdio::piped())
             .spawn()
             .expect("the binary starts");
+        drop(spawning);
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");

@@ -349,11 +349,16 @@ fn output_that_piles_up_unread_past_its_limit_makes_serving_fail() {
 #[test]
 fn input_that_cannot_be_read_makes_serving_fail() {
     let directory = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).expect("a directory opens");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_proxenos"))
+    let spawning = common::spawning();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_proxenos"))
         .args(["mcp", "--client", "claude"])
         .stdin(directory)
-        .output()
-        .expect("the binary runs");
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary starts");
+    drop(spawning);
+    let output = child.wait_with_output().expect("the binary runs");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("reading the input failed"), "{stderr}");
