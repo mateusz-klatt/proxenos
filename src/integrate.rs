@@ -101,27 +101,25 @@ struct ResolvedSettingsPath {
 }
 
 fn resolve_settings_target(path: &Path) -> Result<ResolvedSettingsPath, IntegrateError> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let resolved = fs::canonicalize(path)
-                .map(state::normalize_path)
-                .map_err(|err| {
-                    IntegrateError::Message(format!(
-                        "Refusing to modify Claude Code settings symlink {}: target cannot be resolved ({err}).",
-                        path.display()
-                    ))
-                })?;
-            let target_str = state::path_string(&resolved).map_err(io_err(&resolved))?;
-            Ok(ResolvedSettingsPath {
-                target: resolved,
-                symlink_target: Some(target_str),
-            })
-        }
-        Ok(_) | Err(_) => Ok(ResolvedSettingsPath {
-            target: path.to_path_buf(),
-            symlink_target: None,
-        }),
+    if fs::read_link(path).is_ok() {
+        let resolved = fs::canonicalize(path)
+            .map(state::normalize_path)
+            .map_err(|err| {
+                IntegrateError::Message(format!(
+                    "Refusing to modify Claude Code settings symlink {}: target cannot be resolved ({err}).",
+                    path.display()
+                ))
+            })?;
+        let target_str = state::path_string(&resolved).map_err(io_err(&resolved))?;
+        return Ok(ResolvedSettingsPath {
+            target: resolved,
+            symlink_target: Some(target_str),
+        });
     }
+    Ok(ResolvedSettingsPath {
+        target: path.to_path_buf(),
+        symlink_target: None,
+    })
 }
 
 fn read_optional(path: &Path) -> Result<Option<FileData>, IntegrateError> {

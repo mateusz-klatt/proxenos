@@ -1200,6 +1200,36 @@ fn settings_symlink_is_preserved_across_integrate_and_remove_and_dangling_link_i
     }
     fs::create_dir_all(sb.settings_path().parent().unwrap()).unwrap();
     if !try_file_symlink(&target, &sb.settings_path()).unwrap() {
+        // Unprivileged Windows host without SeCreateSymbolicLinkPrivilege: exercise both the
+        // resolved-link and dangling-link paths in resolve_settings_target via directory junctions,
+        // which Windows allows without elevated privileges.
+        #[cfg(windows)]
+        {
+            let mk_junction = |dest: &Path, link: &Path| {
+                let status = Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(dest)
+                    .status()
+                    .expect("cmd mklink /J runs");
+                assert!(status.success(), "mklink /J failed: {status}");
+            };
+            mk_junction(&dotfiles, &sb.settings_path());
+            let dir_refused = sb.run(&["integrate", "claude-code"]);
+            assert_eq!(dir_refused.status.code(), Some(1));
+
+            let sb_dangling = Sandbox::new();
+            let gone = sb_dangling.root.join("gone-dir");
+            fs::create_dir_all(&gone).unwrap();
+            fs::create_dir_all(sb_dangling.settings_path().parent().unwrap()).unwrap();
+            mk_junction(&gone, &sb_dangling.settings_path());
+            fs::remove_dir(&gone).unwrap();
+            let dangling_refused = sb_dangling.run(&["integrate", "claude-code"]);
+            assert_eq!(dangling_refused.status.code(), Some(1));
+            assert!(
+                String::from_utf8_lossy(&dangling_refused.stderr).contains("cannot be resolved")
+            );
+        }
         return;
     }
 
@@ -1358,7 +1388,8 @@ fn symlinked_binary_keeps_link_path_and_doctor_warns_on_path_mismatch() {
             expected_path_link
         );
     } else {
-        // Unprivileged Windows fallback without symlink privilege: still test bare-name PATH lookup.
+        // Unprivileged Windows fallback without symlink privilege: still test bare-name PATH
+        // lookup and matching-PATH doctor check.
         let path_bin = sb.hard_link_binary("path-bin");
         let mut by_name = sb.command_for(Path::new("proxenos"), &["integrate", "claude-code"]);
         by_name.env("PATH", &path_link_dir);
@@ -1372,21 +1403,38 @@ fn symlinked_binary_keeps_link_path_and_doctor_warns_on_path_mismatch() {
             read_json(&mcp_path)["mcpServers"]["proxenos"]["command"],
             absolute_path_string(&path_bin)
         );
+
+        let mut ok_doc = sb.command_for(&path_bin, &["doctor", "--json"]);
+        ok_doc.env("PATH", &path_link_dir);
+        let ok_out = ok_doc.output().unwrap();
+        assert!(ok_out.status.success());
+        let ok_report: Value = serde_json::from_slice(&ok_out.stdout).unwrap();
+        assert_eq!(
+            find_check(&ok_report, "claude-code.registration")["status"],
+            "ok",
+            "{ok_report}"
+        );
     }
 
     // 3. Bare argv[0] when PATH has no matching entry falls back to current_exe().
     #[cfg(unix)]
-    let fallback_out = {
+    let (fallback_out, expected_fallback) = {
         use std::os::unix::process::CommandExt;
         let mut cmd = sb.command_for(&target_bin, &["integrate", "claude-code"]);
         cmd.arg0("proxenos");
-        cmd.output().unwrap()
+        (cmd.output().unwrap(), canonical_path_string(&target_bin))
     };
     #[cfg(windows)]
-    let fallback_out = {
-        let mut cmd = sb.command_for(Path::new("proxenos.exe"), &["integrate", "claude-code"]);
-        cmd.current_dir(target_bin.parent().unwrap());
-        cmd.output().unwrap()
+    let (fallback_out, expected_fallback) = {
+        // On Windows, Rust's Command does not search the child's current_dir; with child PATH set
+        // to an absent directory, CreateProcessW resolves bare `proxenos.exe` from Cargo's test
+        // environment (proxenos_bin()) and passes bare argv[0] = "proxenos.exe" while the child's
+        // own PATH has no match, exercising the current_exe() fallback.
+        let out = sb
+            .command_for(Path::new("proxenos.exe"), &["integrate", "claude-code"])
+            .output()
+            .unwrap();
+        (out, absolute_path_string(proxenos_bin()))
     };
     assert!(
         fallback_out.status.success(),
@@ -1395,7 +1443,7 @@ fn symlinked_binary_keeps_link_path_and_doctor_warns_on_path_mismatch() {
     );
     assert_eq!(
         read_json(&mcp_path)["mcpServers"]["proxenos"]["command"],
-        canonical_path_string(&target_bin)
+        expected_fallback
     );
 
     // 4. Doctor warns (exits 0) when `proxenos` on PATH resolves to a different binary.
