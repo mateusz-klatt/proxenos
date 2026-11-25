@@ -168,8 +168,9 @@ What the `mcp` module has to do itself, because the library does not:
 - **Calls still running when the connection ends.** When rmcp sees the end of its input it gives
   handlers five seconds to finish. A call cancelled by the end of input gets a reply if it
   finishes within that drain. A call that finishes later gets no reply. Proxenos still waits for
-  running calls to clean up. Ten seconds after Proxenos sees the end of input or the first
-  failure, it abandons any remaining calls and output and exits with a failure.
+  running calls to clean up. Ten seconds after Proxenos sees the end of input, the first
+  failure, or the library stopping, it abandons any remaining calls and output and exits with a
+  failure. When a failure was already recorded, that failure is the one reported.
 
 Known differences from claude-delegator, accepted: a line that is not JSON is ignored instead of
 answered with a parse error, and a `tools/call` without a name is "method not found" instead of

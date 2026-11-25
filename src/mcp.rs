@@ -118,6 +118,9 @@ pub async fn serve<S: Service>(service: S) -> Served {
             Err(ServerInitializeError::ConnectionClosed(_)) => None,
             Err(error) => Some(error.to_string()),
         };
+        // Kept before the cleanup below, which the deadline may cut short. Output still drains:
+        // a client that reads may be owed the answer that explains the failure.
+        stopper.record(failure);
         // rmcp stops draining after five seconds. Whatever is still running is told to stop and
         // waited for: each call holds a sender until it finishes, and the handler that owned the
         // last one is gone by now. So is rmcp's end of the output pipe, so the collector and then
@@ -132,21 +135,20 @@ pub async fn serve<S: Service>(service: S) -> Served {
                 let _ = writer.await;
             } => (),
         }
-        failure
     };
     let deadline = async {
         stopper.shutdown.cancelled().await;
         tokio::time::sleep(STOP_WITHIN).await;
     };
-    let failure = tokio::select! {
-        failure = serving => failure,
-        () = deadline => Some(format!(
-            "running calls and pending output did not finish within {} s of the end of the input",
+    tokio::select! {
+        () = serving => (),
+        () = deadline => stopper.record(Some(format!(
+            "running calls and pending output did not finish within {} s of the end of serving",
             STOP_WITHIN.as_secs()
-        )),
-    };
+        ))),
+    }
     let fault = lock(&stopper.fault).take();
-    fault.or(failure).map_or(Served::Ended, Served::Failed)
+    fault.map_or(Served::Ended, Served::Failed)
 }
 
 /// Ends serving: with a failure, everything stops; without one, the input has ended.
@@ -165,6 +167,12 @@ impl Stopper {
             self.halt.cancel();
         }
         self.shutdown.cancel();
+    }
+
+    /// Keeps the first failure without halting anything.
+    fn record(&self, failure: Option<String>) {
+        let mut fault = lock(&self.fault);
+        *fault = fault.take().or(failure);
     }
 
     /// Orders a synchronous operation against halt on another worker. No lock spans an await.
@@ -352,12 +360,14 @@ impl<S: Service> ServerHandler for Handler<S> {
         // it ends that task, not the server, and can be answered.
         let mut task = tokio::spawn(async move {
             let _running = running;
-            let call = stopper
-                .unless_halted(|| service.call(call_name.to_string(), arguments, call_cancel))
+            // The tool's work runs when its future is polled, so the lock covers only the check.
+            stopper
+                .unless_halted(|| ())
                 .ok_or(ErrorData::internal_error(
                     "The MCP connection has failed.",
                     None,
                 ))?;
+            let call = service.call(call_name.to_string(), arguments, call_cancel);
             call.await.map_err(|UnknownTool| {
                 ErrorData::invalid_params(format!("Unknown tool: {call_name}"), None)
             })
