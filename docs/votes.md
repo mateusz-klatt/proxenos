@@ -97,14 +97,16 @@ waiter and leaves the delegation running. At most three delegations at once per 
 and CPU are always accounted; a memory limit is opt-in; a floor of free host memory is left out.
 
 **Differed.** The longest single wait (20 seconds for GPT, up to 120 for Gemini), and what
-happens above the limit of three (an immediate refusal, or a short queue).
+happens above the limit of three (an immediate refusal, or a short queue). Both went to vote 6.
 
 **What each reported about its own CLI as a client.** These come from reading source or
 documentation and were not run. Codex: tool calls of one turn may overlap when a tool declares
 itself read-only or the server's registration opts in, and otherwise run one at a time. Its limit
 for one call is configurable; its guide gave 60 seconds as the default and the source of release
 0.172.0 used 300. Antigravity: tool calls of one turn run in parallel, with a default limit of
-180 seconds that can be changed.
+180 seconds that can be changed. Kimi Code, as Kimi reported in vote 6: one call is limited to 60
+seconds by default, which can be changed, and its documentation does not say whether the calls of
+one turn overlap or whether a cancellation is sent.
 
 **Users.** All seven sessions that answered the question in vote 5 asked for this.
 
@@ -142,16 +144,17 @@ the first milestone should contain. Asked because vote 1 had run on weaker model
 
 | Point | GPT (Astra) | Gemini (Neon) | Taken for now |
 |---|---|---|---|
-| MCP layer | Keep `rmcp`, with both lifecycles covered through the compiled binary. | Replace it with an owned module of about 300 lines, or hold the first milestone until real clients have been tested. If it stays: behind one internal boundary, with tests on raw frames. | `rmcp`, by the owner: "rmcp narazie" (for now). |
-| Where a session's settings are remembered | In the server's memory, until 24 hours idle or the server exits. | In a file per session, for 7 days. | A file, chosen by Claude (Fable 5.2, max): a reply often comes after the client has restarted. |
-| Providers in the first milestone | Codex only. | Codex and Antigravity. | Both, chosen by Claude (Fable 5.2, max): GPT also asked for two unlike reply contracts before the provider interface is fixed. |
-| A long answer | A bounded preview, the rest read in pages. | A bounded excerpt, the rest in a file. | A file, chosen by Claude (Fable 5.2, max). |
-| How the result may change | A schema version from the first release. | Additive changes only, without a version field. | A version field, chosen by Claude (Fable 5.2, max). |
-| A warning before starting on a provider at its quota | First version, from a fresh reading. | Later. | Later, chosen by Claude (Fable 5.2, max). |
-| The strongest model as each provider's default | Not Proxenos's business to choose everyone's default. | First version. | The strongest, chosen by Claude (Fable 5.2, max), as one user also asked. |
-| Named file inputs | Later. | Not Proxenos's job. | Later, chosen by Claude (Fable 5.2, max). |
+| MCP layer | Keep `rmcp`, with both lifecycles covered through the compiled binary. | Replace it with an owned module of about 300 lines, or hold the first milestone until real clients have been tested. If it stays: behind one internal boundary, with tests on raw frames. | `rmcp`, by the owner: "rmcp narazie" (for now). Vote 6: seven of nine keep it for the first milestone. |
+| Where a session's settings are remembered | In the server's memory, until 24 hours idle or the server exits. | In a file per session, for 7 days. | A file, chosen by Claude (Fable 5.2, max): a reply often comes after the client has restarted. Vote 6: eight of nine for a file. |
+| Providers in the first milestone | Codex only. | Codex and Antigravity. | Both, chosen by Claude (Fable 5.2, max): GPT also asked for two unlike reply contracts before the provider interface is fixed. Vote 6: eight of nine for both. |
+| A long answer | A bounded preview, the rest read in pages. | A bounded excerpt, the rest in a file. | A file, chosen by Claude (Fable 5.2, max). Vote 6: six of nine for it. Still provisional. |
+| How the result may change | A schema version from the first release. | Additive changes only, without a version field. | A version field, chosen by Claude (Fable 5.2, max). Vote 6: eight of nine for it. |
+| A warning before starting on a provider at its quota | First version, from a fresh reading. | Later. | Later, chosen by Claude (Fable 5.2, max). Vote 6: eight of nine for later. |
+| The strongest model as each provider's default | Not Proxenos's business to choose everyone's default. | First version. | The strongest, chosen by Claude (Fable 5.2, max), as one user also asked. Vote 6: seven of nine against it. D8 is now written to the proposal of ADR 002, in which Proxenos chooses no model. The owner has not decided it. |
+| Named file inputs | Later. | Not Proxenos's job. | Later, chosen by Claude (Fable 5.2, max). Vote 6: four of nine for later, five for not Proxenos's job. Still provisional. |
 
-Every "chosen by Claude" above is provisional and goes to the next vote.
+Every "chosen by Claude" above was provisional and went to the next vote, which was vote 6. The
+last column now says what that vote made of it.
 
 **Owner.** "idziemy z tym co mamy teraz, pozniej robimy konsensus" (we go with what we have now
 and reach consensus later).
@@ -180,10 +183,334 @@ few times a week and sixty times a night.
 | The strongest model as the default | 1 | First version (D8), provisionally. |
 | A reply that can change the mode | 1 | First version (D19): an explicit override. |
 
+## Vote 6: the architecture, put to the families that had not voted, and to more models of one that had (2026-11-24 and 25, UTC)
+
+**Question.** Judge each of D1 to D19 as sound, to change or wrong, and name the three most likely
+to be regretted in a year. Rank at most nine roles and mark three to ship first. Take a side, or a
+third position, on every row of vote 4's "Differed" table and on the two points where vote 3
+differed. Say what the first milestone must prove before another provider is ported. The brief was
+written by Claude (Fable 5.2, max). Its own choices in vote 4 were among the things voted on, and
+it is counted in no tally below.
+
+Asked because ADR 001 reopens a vote for a family that was absent. The owner had said: "a jak
+jakas rodzina modeli wroci pozniej (np grok za 2 dni) to ponownie glosujemy" (when a model family
+comes back later, Grok in two days for example, we vote again). Kimi had missed votes 1, 3 and 4,
+and xAI all four. Three families new to the record were asked as well, a fourth was tried, and so
+were two more models of Gemini.
+
+| Voter | Asked through | Of D1 to D19: sound, change, wrong | Would change | Most likely regretted, in its order |
+|---|---|---|---|---|
+| Kimi (K3.1 Pro) | Kimi Code | 14, 5, 0 | D2, D7, D8, D13, D17 | D7, D8, D17 |
+| Gemini (Gemini 4 Argon, high) | Antigravity | 13, 6, 0 | D2, D8, D9, D12, D17, D19 | D12, D7, D9 |
+| Gemini (Gemini 4 Hydrogen, xhigh) | Antigravity | 14, 5, 0 | D2, D4, D8, D13, D17 | D8, D4, D7 |
+| DeepSeek (DeepSeek V4 Pro) | Kimi Code, with Ollama's hosted models as its provider | 18, 1, 0 | D8 | D8, D4, D17 |
+| Zhipu (GLM 5.2) | The same | 17, 2, 0 | D4, D8 | D4, D8, D2 |
+| Microsoft (MAI Code 2, max) | Copilot CLI, with its shell and write tools denied | 17, 2, 0 | D8, D17 | D4, D8, D17 |
+| xAI (Grok 4.7, xhigh) | The same | 16, 3, 0 | D6, D8, D17 | D6, D8, D17 |
+| Alibaba (Qwen 3.5 397B) | Kimi Code, with Ollama's hosted models as its provider | No answer. See the end of this vote. | | |
+
+Kimi Code takes no effort setting, so none was chosen for the models asked through it. For Grok
+`max` was asked for, and xhigh is the highest at which Copilot runs that model.
+
+Each voter answered alone, in a checkout at `main`, and was told to write its own verdicts before
+it opened this file. Five answers say that they did; the two Gemini answers do not say. Nobody
+checked. The brief named the two open points of vote 3, and Kimi's named the rows of vote 4 as
+well. The architecture itself gives the objection to the choice taken on six of those eight rows.
+So on these points no first verdict was unprompted.
+
+Kimi was not asked to rank the roles again, because its roster is in vote 2. It was asked to
+describe Kimi Code as a client instead.
+
+**Verdicts.** No voter called a decision wrong. Nine decisions were called sound by all seven: D1,
+D3, D5, D10, D11, D14, D15, D16 and D18. D8 is the only one that all seven would change, and six
+of them put it among the three most likely to be regretted. Five would change D17, three D2, two
+each D4 and D13, and one each D6, D7, D9, D12 and D19. Among the regrets D4 and D17 are named four
+times each, and D7 three times.
+
+What the changes ask for:
+
+- D8, all seven. Six would not have Proxenos choose the strongest model as a provider's default.
+  Gemini (Argon) would keep that default, add an explicit value that passes no model, and rest
+  the catalogue on verified overlays instead of a free listing of models from each CLI. The count
+  is in the table below.
+- D17, five (Kimi, both Gemini answers, Microsoft and xAI): settle the two points that vote 3 left
+  open. Microsoft asks only for the refusal of a fourth delegation.
+- D2, three: Kimi and Gemini (Argon) want the file of a long answer to have a lifetime of its own.
+  Gemini (Hydrogen) wants pages in place of the file, and stated defaults for `mode` and `access`.
+- D4, two: Gemini (Hydrogen) would replace `rmcp`. Zhipu would keep it and write down what ends it.
+- D13, two: Kimi and Gemini (Hydrogen) want the six release targets built in the first milestone.
+  Gemini (Hydrogen) also wants the open measurements on real clients taken in it.
+- One voter each: D6 (xAI), D7 (Kimi), and D9, D12 and D19 (Gemini (Argon)). They are described
+  further down.
+
+**Agreed by all seven.**
+
+- A fourth delegation is refused at once and is not queued.
+- A session's settings are kept in a file. Codex and Antigravity are both built in the first
+  milestone. The result carries a schema version from the first release. A warning before
+  starting on a provider at its quota comes later.
+- The first milestone proves both MCP lifecycles, the supervisor on three operating systems
+  against a stub grandchild that tries to outlive its delegation, a reply that gets its start's
+  settings back, and the two providers, against stub CLIs at full coverage. That is the core of
+  D13's first step. The test of the supervisor holds within D6's limits: on Unix a descendant
+  that leaves the process group is not reached.
+
+**The differed rows of vote 4, over nine positions**: the two of vote 4 and the seven of this
+vote. The counts are of answers. Three of the nine are Gemini's (Neon, Argon and Hydrogen), so by
+family the count is of seven, and the notes say where the Gemini answers part.
+
+| Point | With GPT (Astra) | With Gemini (Neon) | A third position |
+|---|---|---|---|
+| MCP layer | Keep `rmcp`. Six: GPT (Astra), Kimi, Gemini (Argon), DeepSeek, Microsoft, xAI. | An owned module. Two: Gemini (Hydrogen), and Gemini (Neon), whose alternative was to hold the first milestone until real clients have been tested. | One, Zhipu: keep `rmcp` for the first milestone, and write down now what would end it. |
+| Where a session's settings are remembered | In the server's memory. One: GPT (Astra). | In a file. Seven: Gemini (Neon), Kimi, Gemini (Argon), Gemini (Hydrogen), DeepSeek, Zhipu, Microsoft. | One, xAI: a file, kept until 24 hours without use and not for seven days. While the server lives, its memory comes first. |
+| Providers in the first milestone | Codex only. One: GPT (Astra). | Codex and Antigravity. Eight: Gemini (Neon) and all seven of this vote. | |
+| A long answer | A bounded preview, the rest read in pages. Two: GPT (Astra), Gemini (Hydrogen). | A bounded excerpt, the rest in a file. Six: Gemini (Neon), Kimi on a condition, Gemini (Argon), DeepSeek, Microsoft, xAI. | One, Zhipu: the file only if a tool of Proxenos can read it back to the model in pages, and otherwise pages. |
+| How the result may change | A schema version from the first release. Eight: GPT (Astra) and all seven of this vote. | Additive changes only. One: Gemini (Neon). | |
+| A warning before starting on a provider at its quota | First version. One: GPT (Astra). | Later. Eight: Gemini (Neon) and all seven of this vote. | |
+| The strongest model as each provider's default | Not Proxenos's business. Seven: GPT (Astra), Kimi, Gemini (Hydrogen), DeepSeek, Zhipu, Microsoft, xAI. | The strongest. One: Gemini (Neon). | One, Gemini (Argon): the strongest, with a value `default` that passes no model. |
+| Named file inputs | Later. Four: GPT (Astra), DeepSeek, Zhipu, Microsoft. | Not Proxenos's job. Five: Gemini (Neon), Kimi, Gemini (Argon), Gemini (Hydrogen), xAI. | |
+
+- **The default model.** The six of this vote on GPT's side said what runs instead: the
+  provider's own default. Five of them said how, by passing no model unless one is named (Kimi,
+  Gemini (Hydrogen), DeepSeek, Microsoft, xAI). Kimi, Gemini (Hydrogen) and Microsoft count a
+  model set in the user's configuration as named. Gemini (Hydrogen) and xAI would still let the
+  catalogue say which model is the strongest. The reasons given were quota and money spent
+  without the caller knowing, a default that moves with every catalogue, and a top model that a
+  smaller subscription does not include. Six families are whole on this side. The three Gemini
+  answers took three positions.
+- **The MCP layer.** Seven of nine keep `rmcp` for the first milestone. Three of those who keep
+  it, DeepSeek, Zhipu and Microsoft, still name D4 among their three regrets. The Gemini answers
+  part: Argon keeps it, Hydrogen would replace it, and Neon would replace it or hold the first
+  milestone until real clients have been tested.
+- **A session's settings.** Eight of nine keep them in a file. On how long, three named seven days
+  (Gemini (Neon), Gemini (Argon), Microsoft) and xAI 24 hours without use. xAI wants the file for
+  a reply that comes after a restart, and the server's memory to come first while it lives.
+- **A long answer.** Kimi is for the file on a condition: that D2 defines a retention that is
+  secure and stable. Three voters, one in each column, named the same weakness of the file: the
+  model that asked may be unable to read it, inside a sandbox (Gemini (Hydrogen), xAI) or for
+  want of a tool that reads it back (Zhipu). xAI keeps the file all the same and would not add
+  pages to make up for it. The Gemini answers part: Neon and Argon for the file, Hydrogen for
+  pages.
+- **Named file inputs.** By family four are for later (GPT, DeepSeek, Zhipu, Microsoft) and three
+  for not Proxenos's job (Gemini in all three answers, Kimi, xAI). Kimi would look again once a
+  measured workflow shows that something is missing.
+
+**The differed points of vote 3, over nine positions**: GPT (Astra) and Gemini (Carbon) from vote
+3, and the seven of this vote.
+
+| Point | With GPT (Astra) | With Gemini (Carbon) | A third position |
+|---|---|---|---|
+| The longest single `await` | 20 seconds. Four: GPT (Astra), Kimi, Microsoft, xAI. | Up to 120 seconds. Two: Gemini (Carbon), Zhipu. | Three, each with its own figure. Gemini (Hydrogen): 45 seconds by default, under a ceiling of 60. Gemini (Argon): 55 by default, configurable up to 120. DeepSeek: 60. |
+| Above three delegations | An immediate refusal. Eight: GPT (Astra) and all seven of this vote. | A short queue. One: Gemini (Carbon). | |
+
+- **The longest wait.** No figure has a majority of the answers. Seven of the nine keep one wait
+  at or under 60 seconds by default, and the six of this vote among them argue from a client's own
+  limit for one call. The three in the middle each called 20 seconds needless polling. By family
+  four of seven choose 20 seconds (GPT, Kimi, Microsoft, xAI), and the three Gemini answers gave
+  three figures. GPT (Astra) had called its 20 seconds a cap to start with. Kimi's first verdict
+  was 60 seconds. It changed to 20 after reading the record and its own documentation: a default
+  limit of 60 seconds for one call needs room below it.
+- **Above three.** Eight are for the immediate refusal. Four answers of this vote call it `busy`
+  (Kimi, Gemini (Argon), Zhipu, xAI). GPT (Astra)'s refusal is in vote 3, and its answer there
+  used the same word. The reasons against a queue were a state that the handles do not have, a
+  wait hidden inside the caller's own time limit, and rules of order and cancellation that
+  nothing yet needs.
+
+**What the count shows.**
+
+- Against a choice taken in vote 4: the strongest model as the default. Seven oppose it. Two keep
+  it: Gemini (Neon), and Gemini (Argon) with an explicit value that passes no model.
+- For a choice taken in vote 4, eight to one each: the file for a session's settings, both
+  providers in the first milestone, the schema version, and the quota warning later.
+- For a choice taken in vote 4, with less behind it: the file for a long answer, six of nine.
+- Divided: named file inputs, with five for not Proxenos's job and four for later, which was the
+  choice taken; and the longest wait.
+- Settled between the two positions of vote 3: the refusal above three delegations, eight to one.
+- The owner's own choice of `rmcp`: kept by seven of nine for the first milestone.
+
+**Roles.** Six rosters. Each voter was told to write its own before it opened this file.
+
+| Voter | Roster | Ship first, in its order | Cut |
+|---|---|---|---|
+| Gemini (Argon) | Eight. Plan Reviewer takes in Scope Analyst and Challenger. | Code Reviewer, Claim Verifier, Debugger | Scope Analyst, and Challenger as a role of its own |
+| Gemini (Hydrogen) | Nine. Keeps Challenger. | Code Reviewer, Debugger, Claim Verifier | Scope Analyst |
+| DeepSeek | Nine. Keeps Scope Analyst. | Code Reviewer, Debugger, Claim Verifier | Challenger: a stance that any role can be given through `instructions` |
+| Zhipu | Eight. Challenger is a duty of Plan Reviewer. | Code Reviewer, Debugger, Claim Verifier | Scope Analyst, and Challenger as a role of its own |
+| Microsoft | Nine. Keeps Scope Analyst. Challenger is part of Plan Reviewer. | Code Reviewer, Debugger, Claim Verifier | Challenger as a role of its own |
+| xAI | Nine. Keeps Scope Analyst and Challenger, and puts Architect last. | Claim Verifier, Code Reviewer, Challenger | The cross-discipline role. Debugger is fourth, because it has to run code. |
+
+All six keep a test role of its own. Five keep a cross-discipline role, under four names and one
+description. Microsoft's answer holds two rankings: the one written before it opened this file
+keeps Challenger eighth and has no cross-discipline role, and its final table folds Challenger
+into Plan Reviewer and puts a cross-discipline role ninth. The first three are the same in both.
+The final table is the one counted, as vote 2 counted Kimi's final roster.
+
+Over the ten rosters of votes 2 and 6, from seven families:
+
+- Code review, debugging, verification of claims, architecture, security and plan review are in
+  all ten.
+- To ship first: Code Reviewer in ten, Debugger in nine, Claim Verifier in nine. Eight name
+  exactly those three. Gemini (Carbon) has a plan critic in place of the claim verifier, and xAI
+  Challenger in place of the debugger.
+- Scope Analyst: five keep it (GPT (Astra), Kimi, DeepSeek, Microsoft, xAI) and five cut it (the
+  four Gemini answers and Zhipu).
+- Challenger: a role of its own for three (Gemini (Neon), Gemini (Hydrogen), xAI), a duty of Plan
+  Reviewer or of it and Architect for six, and left to `instructions` by DeepSeek.
+- A test role of its own: nine. Gemini (Carbon) alone puts testing into the verifier.
+- A redesigned cross-discipline role: nine. xAI cuts it: an analogy tied to the repository is
+  better than a polymath, and a test still cannot show it wrong.
+- Size: nine roles in seven rosters, eight in two, seven in one.
+
+**What Kimi reported about Kimi Code as a client.** From its documentation, and not run. One MCP
+tool call is limited to 60 seconds by default, and the limit can be changed for one server and for
+all of them. A model is given both the text and the structured content of a result, and the
+structured copy is left out when the text is known to hold the same JSON value. The documentation
+does not say whether the calls of one turn overlap, nor whether a call that is timed out or
+interrupted sends a cancellation. Kimi reported that its own session offered parallel execution
+for wrapped tool calls, and did not take that as proof for MCP calls. Its conclusion: Proxenos
+must not rely on either, and a call with `wait: true` can outlast the default limit and leave the
+caller without a handle.
+
+**The first milestone.** Beyond what all seven agree on: four put the test of success in the same
+place. Both providers must pass with the shared provider trait unchanged (Gemini (Argon)) and
+with the shared contract code unchanged (Microsoft), and a third would then need only its own
+declaration and seams (Zhipu, xAI). Two want real clients tried in that milestone (Kimi, Gemini
+(Hydrogen)), and Kimi each real provider CLI once as well. xAI would not wait for live clients,
+because a live client spends a model call. xAI also wants the milestone to show the losses: a
+hard kill on macOS leaves children, and a new server knows no old handles. It adds that the
+milestone cannot show that the other five CLIs fit.
+
+**Raised by more than one voter, outside those rows.**
+
+- The file of a long answer needs a lifetime of its own. D6 removes temporary files once the
+  child is reaped, and a file removed then would leave the caller a path to nothing (Kimi, Gemini
+  (Argon)). xAI would remove it when the kept result expires. Kimi adds that only the user should
+  be able to read it, and that its place and its size be stated.
+- One file for each session, not one file for all. Servers that update different sessions then
+  write different files; servers that resume the same session still share its file. Gemini
+  (Argon) asks for it as a change to D19; Gemini (Hydrogen) and Microsoft say "per session" when
+  they take the side of the file, as Gemini (Neon) did in vote 4. D19 says "a file", and Gemini
+  (Argon) read that as one shared file. Nobody argued for a shared one.
+- D7 is among the three regrets of Kimi and of both Gemini answers: installers change their shims
+  without notice. Kimi's change is to recognise only known, fixed layouts and to report any other
+  launcher as unsupported.
+- The limit of three delegations: a guess made before any workload exists (DeepSeek, among its
+  regrets), and to be made configurable with three as the default (Gemini (Hydrogen)).
+- Handles and results that end with the server are among the regrets of Microsoft and xAI. D17
+  states that loss. xAI adds that a daemon to prevent it would be a different product.
+- The six release targets built early (Kimi, Gemini (Hydrogen)). Zhipu notes the same under D11,
+  which already calls the cross-builds the first thing to try. D13's first step does not list
+  them.
+
+**Raised by one voter.**
+
+- xAI, on D6: on Linux, set the parent-death signal in the child before it executes, and then
+  check that the parent is still there, so that a kill of Proxenos does not leave a CLI spending
+  quota. It names the limits itself: not on macOS, and the direct child only.
+- Kimi, on D17: with a client that ends a call after 60 seconds, an unconditional `wait: true` is
+  unsafe. It prefers a handle returned before a bounded wait that works on every client, or else
+  a larger limit for the server, configured in the client and verified.
+- Zhipu, on D4: an exit written down now. `rmcp` is replaced by the owned module if any of the
+  four gaps that Proxenos fills needs more work, if a real client breaks on it, or if `rmcp` makes
+  a breaking release.
+- Gemini (Argon), on D12: allow tests inside the process beside those through the binary. Failure
+  branches of system calls cannot be reached through the binary alone without code in it that
+  exists only to inject faults. Gemini (Neon) asked for the same in vote 4.
+- Gemini (Argon), on D9: report usage only for a provider with a measured local reading, and
+  answer "unsupported" for the others. It also expects those readings, private to each CLI, to
+  break on minor updates.
+- Gemini (Argon), on D2: leave out the two git snapshots when read-only is enforced by a sandbox
+  of the operating system. And on D17: the refusal names the delegations that are running.
+- Gemini (Hydrogen), on D2: state the defaults of `mode` and `access`, and make them advisory, and
+  read-only where a provider supports it. D2 names no default for either. And on D13: say what
+  "the four hosts" are.
+- xAI, on D17: a child that is still being reaped holds its place among the three.
+- Zhipu, on D19: `doctor` reports records that have expired or been altered.
+- xAI, on the roles: its first three can all stay advisory, so they do not depend on what each
+  provider enforces for writing.
+
+**Checked afterwards by Claude (Fable 5.2, max).**
+
+- The two pages of Kimi Code's documentation that Kimi cited were read on 2026-11-25. They give
+  60 000 milliseconds as the default limit of one tool call, one setting for a single server and
+  two for all servers, and the sentence on structured content. They say nothing on whether calls
+  overlap, and mention cancelling a tool only for the handling of attachments. Nothing was run.
+- The parent-death signal that xAI proposes follows the thread that started the child, not the
+  parent process: Linux sends it when that thread ends. The thread that starts a child must
+  therefore live for as long as that child should keep running. Not tried.
+- Zhipu's reason for 120 seconds was that 20 "cuts off delegations still making progress". Under
+  D17 a wait that ends leaves the delegation running.
+- DeepSeek's 60 seconds is the shortest client limit on record itself, and so leaves no room under
+  it. Its own reason was that a wait longer than the client's limit times out on the client's
+  side.
+- DeepSeek's paragraph on the first milestone has the reply rules the wrong way round: it gives
+  Codex a reply that must name a model and Antigravity one that must not. D5 has Antigravity's
+  reply name a model and Cursor's not. None of its positions rests on this.
+- Gemini (Argon)'s point on D9 holds for at least one provider: claude-delegator found no reading
+  of usage for Cursor that runs no model, only its plan.
+
+**The attempt with Qwen.** Alibaba (Qwen 3.5 397B) was asked the same question through Kimi Code,
+with Ollama's hosted models as its provider. After about six minutes the client ended with "Prompt
+turn ended with reason: failed" and no answer. Its log was searched for the model's name and for a
+failed request, and held neither. The cause is not known. The attempt is recorded and counted
+nowhere: there is no position to count, and a route that failed says nothing about what the model
+would have answered.
+
+**Taken for now, by Claude (Fable 5.2, max).** Where the count is clear, the architecture now
+follows it. Where it is not, the choice stays provisional and the architecture says so. The owner
+has ruled on none of this.
+
+- D8, as a proposal in ADR 002 that the owner has not decided: Proxenos chooses no model. On a
+  start it passes the one that the call or the user's overlay names, and otherwise none. Seven of
+  nine opposed the strongest model as the default. Five of them said to pass no model unless one
+  is named, and three of those let the user's configuration name it.
+- D17 and D2: a fourth delegation is refused at once. Eight of nine. The failure takes the kind
+  busy, the word that five of the eight used.
+- D17: one `await` lasts at most 20 seconds. Provisional. It is the largest group of answers and
+  the choice of four of seven families, and it leaves the most room under the shortest client
+  limit on record. A longer wait can run past the limit that a client is configured with.
+- No longer marked as a choice of Claude's: the file for a session's settings (D19), both
+  providers in the first milestone (D5), the schema version (D2), and the quota warning later.
+- Still provisional: the file for a long answer (D2), and named file inputs (section 3).
+- Limits that voters showed and the architecture did not state. The file of a long answer must
+  outlive the child's temporary files, and a client in a sandbox may be unable to read it (D2). A
+  call that waits can be ended by the client's own limit and leave no handle (D17, section 4).
+  `usage` has no windows to report for a CLI that gives none (D9).
+- Opened by the proposal for D8, and put to no voter: what a reply does when it must name a
+  model and its start passed none. D19 and ADR 002 record it as not decided.
+- For the users of vote 5: the one who asked for the strongest model as the default can request
+  it by naming it, in the call or in the overlay. The warning before dispatch stays later.
+  Handing one delegate's result to the next as a file stays provisional, with file inputs.
+- Not changed, because one voter or a few raised it and the count does not carry it: the
+  parent-death signal (D6), known shim layouts only (D7), tests inside the process (D12), the six
+  targets in the first milestone (D13), one file for each session (D19), a configurable limit of
+  delegations (D17), stated defaults for `mode` and `access` (D2), and an exit written down for
+  `rmcp` (D4), which is the owner's to decide. D15 still describes the roster as vote 2 left it.
+
+**Owner.** No ruling on this vote yet. `rmcp` stays, as he decided in vote 4. The roster is still
+not decided.
+
+**Recorded as** the revisions of D2, D5, D8, D9, D17 and D19, and of sections 3, 4 and 5. The
+revision of D8 is the proposal of ADR 002.
+
 ## Waiting for another vote
 
-- **Kimi**: votes 1, 3 and 4. It has answered vote 2.
-- **xAI**, when its quota returns: votes 1 to 4. In particular the MCP layer, the ninth role and
-  every provisional choice of vote 4.
+Of the families that can be reached, none is waiting.
+
+- **Kimi** has voted on what it missed. Vote 6 holds its verdicts on D1 to D19, which is where the
+  decisions of votes 1, 3 and 4 now stand, and its side on every point where votes 3 and 4
+  differed. Its roster is in vote 2.
+- **xAI** has voted on all four. Vote 6 holds the same from it, and its roster.
+- **DeepSeek, Zhipu and Microsoft** joined the record in vote 6 and answered what xAI answered.
+- **Alibaba** has voted on nothing. Its one attempt, in vote 6, returned no answer. It is asked
+  again when its model can be reached.
+
+Vote 6 did not put the four differences of vote 1 to anyone one by one. The owner had decided the
+topology and the parameters there, and kept `rmcp` in vote 4. On the releases Claude (Fable 5.2,
+max) recommended GoReleaser, and the owner specified the signing. A voter's verdicts on D1, D2, D4
+and D11 are its answer. None of the seven would change D1 or D11, what three of them would change
+in D2 is not its names, and D4 is the row on the MCP layer.
+
+What single voters raised in vote 6 has not been put to the others.
 
 Vote 5 is a survey of users and is not reopened.
