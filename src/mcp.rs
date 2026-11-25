@@ -4,20 +4,27 @@
 //! adds what the library does not do itself: it stops waiting the moment standard input ends,
 //! hands every call a cancellation token, and answers a call whose handler panicked.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
+    Tool,
 };
 use rmcp::service::{RequestContext, ServerInitializeError};
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// How long [`serve`] waits, once the connection has ended, for running calls to finish.
+const CALLS_STOP_WITHIN: Duration = Duration::from_secs(10);
 
 /// A tool as the server lists it.
 pub struct ToolSpec {
@@ -59,18 +66,23 @@ pub enum Served {
 }
 
 /// Serves `service` over standard input and output until the client closes the connection.
+///
+/// It returns only once every call it started has finished, so that what a call owns, such as a
+/// child process, is cleaned up before the runtime goes away.
 pub async fn serve<S: Service>(service: S) -> Served {
     let shutdown = CancellationToken::new();
+    let (active, mut finished) = mpsc::channel::<()>(1);
     let handler = Handler {
         service: Arc::new(service),
         shutdown: shutdown.clone(),
+        active,
     };
     let (stdin, stdout) = rmcp::transport::stdio();
     let reader = EndSignal {
         inner: stdin,
-        ended: shutdown,
+        ended: shutdown.clone(),
     };
-    match handler.serve((reader, stdout)).await {
+    let outcome = match handler.serve((reader, stdout)).await {
         Ok(running) => served(
             running
                 .waiting()
@@ -82,7 +94,14 @@ pub async fn serve<S: Service>(service: S) -> Served {
         // Standard input ended before a lifecycle was chosen: nothing was asked.
         Err(ServerInitializeError::ConnectionClosed(_)) => Served::Ended,
         Err(error) => Served::Failed(error.to_string()),
-    }
+    };
+    // rmcp stops draining after five seconds or at the first failed write. Whatever is still
+    // running is told to stop, and waited for: each call holds a sender until it finishes, and
+    // the handler that owned the last one is gone by now. The wait is bounded, so that a call
+    // that ignores its token cannot keep the process alive.
+    shutdown.cancel();
+    let _ = tokio::time::timeout(CALLS_STOP_WITHIN, finished.recv()).await;
+    outcome
 }
 
 fn served(failure: Option<String>) -> Served {
@@ -92,6 +111,8 @@ fn served(failure: Option<String>) -> Served {
 struct Handler<S> {
     service: Arc<S>,
     shutdown: CancellationToken,
+    /// Cloned into every running call; [`serve`] waits until no clone is left.
+    active: mpsc::Sender<()>,
 }
 
 impl<S: Service> ServerHandler for Handler<S> {
@@ -99,6 +120,17 @@ impl<S: Service> ServerHandler for Handler<S> {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
             Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    /// Every revision rmcp knows except 2025-03-26, which requires a server to accept JSON-RPC
+    /// batches; rmcp refuses them. A client that asks for it is offered the newest instead.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(&[
+            ProtocolVersion::V_2024_11_05,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2026_07_28,
+        ])
     }
 
     async fn list_tools(
@@ -122,13 +154,19 @@ impl<S: Service> ServerHandler for Handler<S> {
     ) -> Result<CallToolResponse, ErrorData> {
         let name = request.name.to_string();
         let cancel = self.shutdown.child_token();
-        // The handler runs as its own task so that a panic in it ends that task, not the
-        // server, and can be answered.
-        let mut task = tokio::spawn(Arc::clone(&self.service).call(
-            name.clone(),
-            request.arguments.unwrap_or_default(),
-            cancel.clone(),
-        ));
+        // If rmcp drops this request, the call is told to stop rather than left running.
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let service = Arc::clone(&self.service);
+        let arguments = request.arguments.unwrap_or_default();
+        let call_name = name.clone();
+        let call_cancel = cancel.clone();
+        let running = self.active.clone();
+        // The call runs as its own task, and is created inside it, so that a panic anywhere in
+        // it ends that task, not the server, and can be answered.
+        let mut task = tokio::spawn(async move {
+            let _running = running;
+            service.call(call_name, arguments, call_cancel).await
+        });
         let joined = tokio::select! {
             joined = &mut task => joined,
             () = context.ct.cancelled() => {

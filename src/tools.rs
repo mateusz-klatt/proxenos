@@ -111,11 +111,12 @@ mod test_tools {
             "test_panic" => panic!("test_panic was called"),
             "test_wait" => {
                 let ms = arguments.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                // The tests read these lines to know the call is running, and how it ended.
+                eprintln!("proxenos test_wait: started");
                 let text = tokio::select! {
                     () = tokio::time::sleep(Duration::from_millis(ms)) => "waited",
                     () = cancel.cancelled() => "cancelled",
                 };
-                // The tests read this line to see that the handler stopped.
                 eprintln!("proxenos test_wait: {text}");
                 ToolOutcome {
                     text: text.to_owned(),

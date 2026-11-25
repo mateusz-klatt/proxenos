@@ -63,6 +63,19 @@ fn an_earlier_revision_is_served_after_initialize() {
 }
 
 #[test]
+fn the_revision_that_requires_batches_is_not_offered() {
+    // 2025-03-26 requires a server to accept JSON-RPC batches, which rmcp refuses.
+    let (mut server, answer) = Server::initialized("2025-03-26");
+    assert_eq!(answer["result"]["protocolVersion"], "2025-11-25");
+    let discovered = server.request(1, "server/discover", json!({ "_meta": meta(NEW_VERSION) }));
+    let supported = discovered["result"]["supportedVersions"].clone();
+    assert_eq!(
+        supported,
+        json!(["2024-11-05", "2025-06-18", "2025-11-25", NEW_VERSION])
+    );
+}
+
+#[test]
 fn the_2026_revision_is_served_without_initialize() {
     let mut server = Server::mcp();
     let discovered = server.request(1, "server/discover", json!({ "_meta": meta(NEW_VERSION) }));
@@ -127,16 +140,11 @@ fn a_panicking_tool_is_answered_and_the_server_carries_on() {
 }
 
 #[test]
-fn a_cancelled_call_stops_its_handler() {
+fn a_cancelled_call_stops_its_handler_and_gets_no_answer() {
     let (mut server, _) = Server::initialized("2025-11-25");
-    server.send(&json!({
-        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
-        "params": { "name": "test_wait", "arguments": { "ms": 60_000 } }
-    }));
-    // Make sure the call is running before it is cancelled.
+    server.start_call(7, "test_wait", json!({ "ms": 60_000 }));
+    server.wait_for_stderr("test_wait: started");
     let started = Instant::now();
-    let pong = server.call(8, "test_echo", json!({}));
-    assert_eq!(text(&pong), "{}");
     server.send(&json!({
         "jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": { "requestId": 7, "reason": "test" }
@@ -144,9 +152,10 @@ fn a_cancelled_call_stops_its_handler() {
     server.wait_for_stderr("test_wait: cancelled");
     assert!(started.elapsed() < Duration::from_secs(30));
 
-    // The cancelled request gets no answer; the next one does.
-    let next = server.call(9, "test_echo", json!({ "n": 9 }));
-    assert_eq!(next["id"], 9);
+    // The frame after the cancellation answers the next request, not the cancelled one.
+    server.start_call(9, "test_echo", json!({ "n": 9 }));
+    let next = server.exact_next_frame();
+    assert_eq!(next["id"], 9, "{next}");
 }
 
 #[test]
@@ -159,16 +168,38 @@ fn a_finished_wait_is_answered() {
 #[test]
 fn the_end_of_input_stops_a_running_call_at_once() {
     let (mut server, _) = Server::initialized("2025-11-25");
-    server.send(&json!({
-        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-        "params": { "name": "test_wait", "arguments": { "ms": 60_000 } }
-    }));
-    let pong = server.call(6, "test_echo", json!({}));
-    assert_eq!(text(&pong), "{}");
+    server.start_call(5, "test_wait", json!({ "ms": 60_000 }));
+    server.wait_for_stderr("test_wait: started");
     let (status, took) = server.finish();
     assert!(status.success(), "{status}");
     // rmcp alone would wait five seconds before cancelling the call.
     assert!(took < Duration::from_secs(3), "exit took {took:?}");
+    assert!(
+        server.stderr().contains("test_wait: cancelled"),
+        "{}",
+        server.stderr()
+    );
+}
+
+#[test]
+fn the_server_waits_for_every_running_call_before_it_exits() {
+    let (mut server, _) = Server::initialized("2025-11-25");
+    for id in 1..=3 {
+        server.start_call(id, "test_wait", json!({ "ms": 60_000 }));
+    }
+    let deadline = Instant::now() + common::WAIT;
+    while server.stderr().matches("test_wait: started").count() < 3 {
+        assert!(Instant::now() < deadline, "{}", server.stderr());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (status, _) = server.finish();
+    assert!(status.success(), "{status}");
+    assert_eq!(
+        server.stderr().matches("test_wait: cancelled").count(),
+        3,
+        "{}",
+        server.stderr()
+    );
 }
 
 #[test]
@@ -185,6 +216,9 @@ fn a_connection_that_cannot_be_served_is_a_failure() {
     server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
     let (status, _) = server.finish();
     assert_eq!(status.code(), Some(1));
-    server.wait_for_stderr("proxenos: ");
-    assert!(server.stderr().lines().count() >= 2, "{}", server.stderr());
+    let stderr = server.stderr();
+    let reason = stderr
+        .lines()
+        .find(|line| line.starts_with("proxenos: ") && !line.contains("serving MCP"));
+    assert!(reason.is_some(), "{stderr}");
 }

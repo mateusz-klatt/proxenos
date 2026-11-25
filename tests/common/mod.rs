@@ -27,6 +27,7 @@ pub struct Server {
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     stderr: Arc<Mutex<String>>,
+    stderr_reader: Option<thread::JoinHandle<()>>,
 }
 
 impl Server {
@@ -51,7 +52,7 @@ impl Server {
         });
         let captured = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&captured);
-        thread::spawn(move || {
+        let stderr_reader = thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 let mut text = sink.lock().expect("stderr lock");
                 text.push_str(&line);
@@ -63,6 +64,7 @@ impl Server {
             stdin,
             lines,
             stderr: captured,
+            stderr_reader: Some(stderr_reader),
         }
     }
 
@@ -100,6 +102,20 @@ impl Server {
     pub fn request(&mut self, id: i64, method: &str, params: Value) -> Value {
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
         self.response(id)
+    }
+
+    /// The next frame, which must arrive in time.
+    pub fn exact_next_frame(&mut self) -> Value {
+        self.next_frame(Instant::now() + WAIT)
+            .expect("a frame arrives in time")
+    }
+
+    /// Sends a call without waiting for its answer.
+    pub fn start_call(&mut self, id: i64, name: &str, arguments: Value) {
+        self.send(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }));
     }
 
     /// The next response with `id`; other frames before it are skipped.
@@ -160,7 +176,12 @@ impl Server {
         let deadline = started + WAIT;
         loop {
             if let Some(status) = self.child.try_wait().expect("the child can be waited on") {
-                return (status, started.elapsed());
+                let took = started.elapsed();
+                // The process has exited, so its standard error is closed: read all of it.
+                if let Some(reader) = self.stderr_reader.take() {
+                    reader.join().expect("the stderr reader ends");
+                }
+                return (status, took);
             }
             assert!(Instant::now() < deadline, "the server did not exit");
             thread::sleep(Duration::from_millis(10));

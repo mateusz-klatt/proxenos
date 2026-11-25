@@ -149,6 +149,12 @@ What the `mcp` module has to do itself, because the library does not:
 - **Panics.** A handler that panics is never answered. Proxenos catches the panic and answers
   with an error.
 - **Identity.** The server name and version are set; the default is the library's own.
+- **Batches.** The revision of 2025-03-26 requires a server to accept JSON-RPC batches, and the
+  library refuses them. Proxenos does not offer that revision: a client that asks for it is
+  offered 2025-11-25, which it may accept or not.
+- **Calls still running when the connection ends.** The library stops waiting for them after five
+  seconds, or at the first answer it cannot write. Proxenos tells them to stop and waits up to ten
+  seconds for them to finish before it exits.
 
 Known differences from claude-delegator, accepted: a line that is not JSON is ignored instead of
 answered with a parse error, and a `tools/call` without a name is "method not found" instead of
