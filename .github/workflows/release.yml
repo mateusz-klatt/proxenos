@@ -1129,6 +1129,7 @@ jobs:
               hashes[name] = digest.lower()
 
           max_member_bytes = 128 * 1024 * 1024
+          expected_tar_modes = {"LICENSE": 0o644, "NOTICE": 0o644, "proxenos": 0o755}
           for arch in ("amd64", "arm64"):
               name = f"proxenos_{version}_darwin_{arch}.tar.gz"
               archive_path = bundle / name
@@ -1141,8 +1142,20 @@ jobs:
                   if sorted(names) != ["LICENSE", "NOTICE", "proxenos"] or len(names) != 3:
                       raise SystemExit(f"{name}: unexpected tar members {names}")
                   for m in members:
-                      if not m.isfile() or m.size > max_member_bytes:
-                          raise SystemExit(f"{name}: invalid or oversized member {m.name}")
+                      if (
+                          not m.isfile()
+                          or m.size > max_member_bytes
+                          or (m.mode & 0o7000) != 0
+                          or m.mode != expected_tar_modes[m.name]
+                          or m.uid != 0
+                          or m.gid != 0
+                          or m.uname != "root"
+                          or m.gname != "root"
+                      ):
+                          raise SystemExit(
+                              f"{name}: invalid member metadata or size for {m.name} "
+                              f"(mode={oct(m.mode)}, uid={m.uid}, gid={m.gid}, uname={m.uname!r}, gname={m.gname!r})"
+                          )
                   f = tf.extractfile(tf.getmember("proxenos"))
                   assert f is not None
                   data = f.read(max_member_bytes + 1)
@@ -1482,6 +1495,7 @@ jobs:
               raise SystemExit(f"checksums.txt subjects do not match expected inventory: {seen}")
 
           max_member_bytes = 128 * 1024 * 1024
+          expected_tar_modes = {"LICENSE": 0o644, "NOTICE": 0o644, "proxenos": 0o755}
           tar_expectations = {
               f"proxenos_{version}_linux_amd64.tar.gz": os.environ["EXPECTED_LINUX_AMD64_SHA256"],
               f"proxenos_{version}_linux_arm64.tar.gz": os.environ["EXPECTED_LINUX_ARM64_SHA256"],
@@ -1495,8 +1509,20 @@ jobs:
                   if len(names) != 3 or sorted(names) != ["LICENSE", "NOTICE", "proxenos"]:
                       raise SystemExit(f"{archive_name}: unexpected tar members {names}")
                   for m in members:
-                      if not m.isfile() or m.size > max_member_bytes:
-                          raise SystemExit(f"{archive_name}: invalid or oversized member {m.name}")
+                      if (
+                          not m.isfile()
+                          or m.size > max_member_bytes
+                          or (m.mode & 0o7000) != 0
+                          or m.mode != expected_tar_modes[m.name]
+                          or m.uid != 0
+                          or m.gid != 0
+                          or m.uname != "root"
+                          or m.gname != "root"
+                      ):
+                          raise SystemExit(
+                              f"{archive_name}: invalid member metadata or size for {m.name} "
+                              f"(mode={oct(m.mode)}, uid={m.uid}, gid={m.gid}, uname={m.uname!r}, gname={m.gname!r})"
+                          )
                   f = tf.extractfile(tf.getmember("proxenos"))
                   if f is None:
                       raise SystemExit(f"{archive_name}: missing proxenos member")
@@ -1509,6 +1535,7 @@ jobs:
                       f"{archive_name}: embedded proxenos SHA-256 mismatch ({actual_bin_sha} != {expected_bin_sha})"
                   )
 
+          expected_zip_modes = {"LICENSE": 0o644, "NOTICE": 0o644, "proxenos.exe": 0o755}
           zip_expectations = {
               f"proxenos_{version}_windows_amd64.zip": os.environ["EXPECTED_WINDOWS_AMD64_SHA256"],
               f"proxenos_{version}_windows_arm64.zip": os.environ["EXPECTED_WINDOWS_ARM64_SHA256"],
@@ -1520,9 +1547,18 @@ jobs:
                   if len(names) != 3 or sorted(names) != ["LICENSE", "NOTICE", "proxenos.exe"]:
                       raise SystemExit(f"{archive_name}: unexpected zip members {names}")
                   for info in infos:
-                      mode = (info.external_attr >> 16) & 0o170000
-                      if info.is_dir() or mode == 0o120000 or info.file_size > max_member_bytes:
-                          raise SystemExit(f"{archive_name}: invalid or oversized member {info.filename}")
+                      unix_mode = info.external_attr >> 16
+                      if (
+                          info.is_dir()
+                          or info.file_size > max_member_bytes
+                          or (unix_mode & 0o170000) == 0o120000
+                          or (unix_mode & 0o7000) != 0
+                          or info.external_attr != (expected_zip_modes[info.filename] << 16)
+                      ):
+                          raise SystemExit(
+                              f"{archive_name}: invalid member metadata or size for {info.filename} "
+                              f"(external_attr=0x{info.external_attr:08x})"
+                          )
                   with zf.open("proxenos.exe", "r") as f:
                       data = f.read(max_member_bytes + 1)
                   if len(data) > max_member_bytes:
@@ -1723,9 +1759,20 @@ jobs:
               summary.write(
                   f"### Draft release `{tag}` ready for publication\n\n"
                   f"- Release ID: `{release_id}`\n"
+                  f"- Tag: `{tag}`\n"
                   f"- Dispatched commit SHA: `{commit}`\n"
                   f"- Prerelease: `{final.get('prerelease')}`\n"
                   f"- Verified assets uploaded: `14`\n\n"
-                  f"Before pressing **Publish**, run `git ls-remote origin refs/tags/{tag}` and verify the output is empty or resolves to `{commit}`.\n"
+                  f"Do **not** click **Publish** in the GitHub UI. First verify that the tag does not exist and that the draft still points at `{commit}`:\n\n"
+                  f"```sh\n"
+                  f"# 1. Must return empty (do not compare SHAs; annotated tags return the tag object SHA):\n"
+                  f"git ls-remote origin 'refs/tags/{tag}'\n\n"
+                  f"# 2. Must show draft=true, tag_name={tag}, target_commitish={commit}:\n"
+                  f"gh api repos/{repo}/releases/{release_id} --jq '{{draft, tag_name, target_commitish, assets: (.assets | length)}}'\n"
+                  f"```\n\n"
+                  f"Then publish with one owner-authorised API request that sets every field explicitly:\n\n"
+                  f"```sh\n"
+                  f"gh api -X PATCH repos/{repo}/releases/{release_id} -F draft=false -f tag_name={tag} -f target_commitish={commit}\n"
+                  f"```\n"
               )
           PY

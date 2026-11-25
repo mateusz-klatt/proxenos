@@ -365,33 +365,50 @@ a non-empty `version` input runs:
   `windows-latest`, parallel, no permissions, no secrets)**: both jobs download that same shared
   `release-bundle` artifact ID, reject any extra files, subdirectories or symlinks, check
   `checksums.txt`'s SHA-256, verify their platform's final archives against `checksums.txt`, inspect
-  archive members and headers, compare each embedded executable's SHA-256 against its own signing
-  job (`sign-macos` or `sign-windows`), check `lipo -archs` (`x86_64` for amd64 and `arm64` for
-  arm64) on macOS and PE machine types on Windows, natively verify signatures (`codesign` and
-  `spctl` against the pinned Developer ID on macOS; `signtool` and `Get-AuthenticodeSignature`
-  against the pinned Certum thumbprint on Windows), run the native binary with `--version`, and
-  output the verified `checksums.txt` SHA-256. Both jobs must pass before publication runs.
+  archive members and headers, enforce exact tar member metadata on macOS (`0755` for `proxenos`,
+  `0644` for `LICENSE` and `NOTICE`, `root:root`, uid/gid `0`, no setuid/setgid/sticky bits),
+  compare each embedded executable's SHA-256 against its own signing job (`sign-macos` or
+  `sign-windows`), check `lipo -archs` (`x86_64` for amd64 and `arm64` for arm64) on macOS and PE
+  machine types on Windows, natively verify signatures (`codesign` and `spctl` against the pinned
+  Developer ID on macOS; `signtool` and `Get-AuthenticodeSignature` against the pinned Certum
+  thumbprint on Windows), run the native binary with `--version`, and output the verified
+  `checksums.txt` SHA-256. Both jobs must pass before publication runs.
 - **Checksum signing, provenance and draft release (`publish`, `ubuntu-latest`, `contents: write`,
   `id-token: write`, `attestations: write`, no Cargo, no `environment: release`)**: runs isolated
   Python (`python3 -I`) from outside the downloaded bundle directory, downloads the same shared
   `release-bundle` artifact ID, rejects any unexpected entry (including subdirectories and symlinks),
   asserts `checksums.txt`'s SHA-256 equals both `verify-macos-archives` and `verify-windows` outputs
-  and matches all 12 subject files, inspects all six final archives to confirm each embedded
-  executable's SHA-256 matches its own build or signing job (`build-linux-windows`, `sign-macos`, or
-  `sign-windows`) so any cross-architecture or target swap is caught before signing, checks
-  **before** `cosign` signing and provenance attestation that neither tag `v<version>` nor any
-  release (draft or published) exists, verifies the pinned `cosign` SHA-256, signs `checksums.txt`
-  keylessly (`checksums.txt.sigstore.json`), records GitHub build provenance
-  (`actions/attest-build-provenance` with `subject-checksums`) for the **12 archive and SBOM files
-  listed in `checksums.txt`** (not `checksums.txt` itself), creates a new **draft** release
-  (`tag_name: v<version>`, `target_commitish: <dispatched sha>`, `prerelease` when `version`
-  contains `-`), verifies draft state by numeric release ID, uploads all 14 assets to that numeric
-  draft ID, re-verifies draft state and asset count, and prints the release ID and dispatched commit
-  SHA clearly in the run summary.
+  and matches all 12 subject files, inspects all six final archives before signing to enforce the
+  packager's member metadata (on all four `.tar.gz` archives: mode `0755` for `proxenos`, `0644` for
+  `LICENSE` and `NOTICE`, `root:root`, uid/gid `0`, no setuid/setgid/sticky bits; on both `.zip`
+  archives: exact `external_attr` mode metadata `0755` for `proxenos.exe` and `0644` for `LICENSE`
+  and `NOTICE`, with no special or symlink bits) and to confirm each embedded executable's SHA-256
+  matches its own build or signing job (`build-linux-windows`, `sign-macos`, or `sign-windows`) so
+  any cross-architecture or target swap is caught before signing, checks **before** `cosign` signing
+  and provenance attestation that neither tag `v<version>` nor any release (draft or published)
+  exists, verifies the pinned `cosign` SHA-256, signs `checksums.txt` keylessly
+  (`checksums.txt.sigstore.json`), records GitHub build provenance (`actions/attest-build-provenance`
+  with `subject-checksums`) for the **12 archive and SBOM files listed in `checksums.txt`** (not
+  `checksums.txt` itself), creates a new **draft** release (`tag_name: v<version>`,
+  `target_commitish: <dispatched sha>`, `prerelease` when `version` contains `-`), verifies draft
+  state by numeric release ID, uploads all 14 assets to that numeric draft ID, re-verifies draft
+  state and asset count, and prints the copy-ready verification and `PATCH` publication commands
+  with the real release ID, tag and dispatched commit SHA in the run summary.
 
-Publishing the draft: before pressing **Publish**, the owner runs `git ls-remote origin
-refs/tags/v<version>` and verifies that the output is empty, or resolves to the dispatched commit
-SHA printed in `publish`'s run summary. Only then does the owner publish the draft.
+Publishing the draft: the owner does **not** click **Publish** in the GitHub UI (a writer could have
+changed a pending draft's `target_commitish` without creating the tag ref). Before publishing, the
+owner runs two checks:
+
+1. `git ls-remote origin 'refs/tags/v<version>'` — must return **empty** (do not compare SHAs: an
+   annotated tag returns the tag object's SHA rather than the commit SHA).
+2. `gh api repos/mateusz-klatt/proxenos/releases/<draft-id>` — must show `"draft": true`,
+   `"tag_name": "v<version>"`, and `"target_commitish": "<dispatched-sha>"`.
+
+Publication is then one owner-authorised API request that sets every field explicitly:
+
+```sh
+gh api -X PATCH repos/mateusz-klatt/proxenos/releases/<draft-id> -F draft=false -f tag_name=v<version> -f target_commitish=<dispatched-sha>
+```
 
 Consumer verification: verify `checksums.txt` with:
 
@@ -441,6 +458,10 @@ What this cannot do:
   from creating `refs/tags/v*`, but its repository-admin bypass also covers the owner's token, which
   the fleet's agents hold. Against sessions holding the owner's token, tag creation is therefore an
   agreement rather than enforcement.
+- Between the owner's pre-publication checks (`git ls-remote` and `gh api .../<draft-id>`) and the
+  `PATCH` publication request there is no lock. Because the `PATCH` request sets `tag_name` and
+  `target_commitish` explicitly, a target edit made to the draft in between is overwritten rather
+  than inherited (and `release tag creation` blocks non-admin creation of the tag ref in between).
 - If `main` advances while a release is waiting on signing or approval and a newer commit modifies
   workflow files, creating the draft release targeting the earlier dispatched commit SHA with the
   Actions `GITHUB_TOKEN` can fail (operational limit). Recovery is to dispatch `release.yml` on
@@ -463,25 +484,25 @@ What this cannot do:
 
 Measured on 2026-11-25:
 
-- CI snapshot run `45605931105` on commit `f98eed2` and CI on commit `6733350`: both
-  `snapshot-darwin` (`macos-latest`) and `snapshot-linux-windows` (`ubuntu-latest`) succeeded along
-  with Linux, macOS and Windows CI, building all six targets with direct verified `goreleaser` and
-  `syft` downloads, verifying static ELF output, Mach-O and PE architectures, archive contents,
-  target-specific `cargo-auditable` SPDX crate metadata (including `rmcp 3.11.0`), native execution
-  of the Linux x86-64 and macOS arm64 binaries, and a 12-subject `checksums.txt`.
-- Locally on Linux x86-64 after the round-3 fixes: `actionlint` passed on all three release and
+- CI on commit `1defff9` (following `45605931105` on `f98eed2` and CI on `6733350`): all seven CI
+  checks passed — Linux, macOS and Windows CI, Sonar, and both `snapshot-darwin` (`macos-latest`)
+  and `snapshot-linux-windows` (`ubuntu-latest`) — building all six targets with direct verified
+  `goreleaser` and `syft` downloads over `--proto '=https' --tlsv1.2`, verifying static ELF output,
+  Mach-O and PE architectures, archive contents, target-specific `cargo-auditable` SPDX crate
+  metadata (including `rmcp 3.11.0`), native execution of the Linux x86-64 and macOS arm64 binaries,
+  and a 12-subject `checksums.txt`.
+- Locally on Linux x86-64 after the round-4 fixes: `actionlint` passed on all three release and
   signing-proof workflows; `goreleaser check` validated `.goreleaser.yaml` across all build-group
-  settings; all nine redirecting `curl` calls include `--proto '=https' --tlsv1.2`; tagless
-  `GORELEASER_CURRENT_TAG=v0.0.0 goreleaser build --clean --single-target --skip=validate`
-  succeeded; and a 4-target `PROXENOS_BUILD_GROUP=linux-windows` GoReleaser snapshot with
-  `release: disable: true`, `cargo-auditable` 0.7.7, `cargo-zigbuild` 0.24.1, Zig 0.17.1 and Syft
-  1.54.0 produced verified static ELF and PE binaries, per-target embedded executable digest checks,
-  target-specific SPDX SBOMs listing `rmcp 3.11.0` (58 packages for Linux musl without
-  `windows-sys`; 59 packages for Windows including `windows-sys`), and an 8-subject `checksums.txt`.
+  settings; tagless `GORELEASER_CURRENT_TAG=v0.0.0 goreleaser build --clean --single-target
+  --skip=validate` succeeded; a 4-target `PROXENOS_BUILD_GROUP=linux-windows` GoReleaser snapshot
+  passed with verified static ELF/PE outputs, SPDX SBOMs listing `rmcp 3.11.0` and an 8-subject
+  `checksums.txt`; and the packager's tar (`0755`/`0644`, `root:root`, uid/gid `0`, no special bits)
+  and ZIP (`external_attr` `0755`/`0644`, no special/symlink bits) metadata checks were exercised
+  positively and negatively against real archives.
 
-Not measured: the Sonar gate after adding `--proto '=https' --tlsv1.2`, both signing-proof workflows
-(`signing-proof.yml` and `macos-signing-proof.yml`), a real `workflow_dispatch` release on `main`
-through `release.yml`, quarantined macOS Gatekeeper startup, and Windows SmartScreen.
+Not measured: both signing-proof workflows (`signing-proof.yml` and `macos-signing-proof.yml`), a
+real `workflow_dispatch` release on `main` through `release.yml`, quarantined macOS Gatekeeper
+startup, and Windows SmartScreen.
 
 ### D12. Every line is tested, through the binary
 
