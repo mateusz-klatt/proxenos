@@ -612,8 +612,9 @@ startup, and Windows SmartScreen.
 - During the migration, the same scenarios are replayed against claude-delegator 3.5.0 and the
   results compared, apart from a short list of intended differences.
 - No test starts a real agent CLI or spends a model call.
-- On an Intel Mac, local runs of the provider tests can fail because macOS AppleSystemPolicy
-  kills the stub under a provider name with SIGKILL during exec. It was measured on 2026-11-25 at
+- On an Intel Mac, local runs of the provider tests can fail because the stub under a provider
+  name is killed with SIGKILL during exec while macOS AppleSystemPolicy is evaluating it. Which
+  component sends the signal was not determined. It was measured on 2026-11-25 at
   14 to 21 failing runs in 30 to 50, with the stub unsigned or signed ad hoc, and was not
   reproduced outside `cargo test`. Proxenos does not send that signal: its own stops end as
   `timed_out` or `cancelled`. Adding the terminal to System Settings → Privacy & Security →
