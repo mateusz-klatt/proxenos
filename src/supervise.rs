@@ -136,7 +136,8 @@ pub async fn run(
     // or acquiring the Unix spawn lock. A successful spawn transfers its files to the reaper.
     let queued = cancel.child_token();
     let _cancel_abandoned_launch = queued.clone().drop_guard();
-    let child = tokio::task::spawn_blocking(move || {
+    let (publish, launched) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
         let child = platform::spawn(
             command,
             &mut launch.temporary_files,
@@ -151,13 +152,12 @@ pub async fn run(
                 Ok(())
             },
         );
-        if child.is_err() {
-            cleanup::remove_files_blocking(&launch.temporary_files);
-        }
-        child
-    })
-    .await?;
-    let mut child = match child {
+        let _ = publish.send(child);
+        // Only failed or skipped launches have files left here. This worker holds its
+        // shutdown handle while removing them, even if a diagnostic blocks on stderr.
+        cleanup::remove_files_blocking(&launch.temporary_files);
+    });
+    let mut child = match launched.await.map_err(io::Error::other)? {
         Ok(child) => child,
         Err(reason) => {
             return match reason {

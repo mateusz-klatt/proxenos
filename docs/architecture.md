@@ -208,9 +208,12 @@ Antigravity's reply must name a model; Cursor's must not. A shared test could as
   blocking workers. Their pipe setup and native spawn are serialized, with cancellation and
   the deadline checked under the lock immediately before spawn. If the OS stalls inside spawn,
   that launch and the launches queued behind it can return late. Other calls keep their timers.
+  After the fork, Rust's `Command::spawn` waits for the exec handshake before returning a child
+  handle. If the handshake is still stalled when D4's ten-second shutdown limit expires,
+  Proxenos exits without that handle. The orphan can run the CLI if exec later succeeds.
 - **Windows**: Proxenos creates a job with kill-on-close and starts the CLI suspended with
   `CREATE_NO_WINDOW`. The child has a hidden console. Proxenos assigns the process to the job
-  and only then resumes its primary thread.
+  and checks cancellation and the deadline again immediately before resuming its primary thread.
   A stop terminates the job. The job handle belongs to Proxenos alone, so its members also die
   when Proxenos dies. The Windows behavioural test proves containment by making the stub request
   breakaway as it spawns a grandchild. It checks that Windows denies the request and that the
@@ -224,10 +227,14 @@ Antigravity's reply must name a model; Cursor's must not. A shared test could as
   the time of the last read from either stream, including bytes beyond the capture limit.
   After the final group signal or job close, the caller waits up to two seconds for the leader's
   status and file cleanup together. Once reaped, the status can be returned while a worker
-  finishes cleanup. A temporary input's pathname stays reserved until cleanup ends, even if
-  the CLI unlinks the input. A sibling directory reserves the name for cooperating launches
-  that use a stable parent directory. Both names must fit the filesystem's name limit.
-  D4 counts these workers toward its shutdown deadline.
+  finishes cleanup. Failed and skipped launches also report their outcome before cleanup.
+  D4 counts these workers toward its shutdown deadline. A temporary input's pathname stays
+  reserved until cleanup ends, even if the CLI unlinks it. A sibling directory reserves the
+  name for cooperating launches that use a stable parent directory. Both names must fit the
+  filesystem's name limit.
+  On Windows volumes that generate 8.3 aliases, this reserves only the requested name. If a
+  CLI unlinks an input with a short name and Windows assigns that name as another file's
+  short alias, cleanup can delete the other file.
 
 What this cannot do: on Unix, if Proxenos itself is killed outright, its children survive, and a
 descendant that leaves the process group is not reached. If the OS denies a group signal,

@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,11 +36,13 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
             "remove" => fs::remove_file(value)?,
             "mkdir" => fs::create_dir(value)?,
             "hold" => {
+                // Statics outlive exit handlers. The OS releases these locks after the coverage
+                // writer finishes, so each unlocked file witnesses the end of the process.
+                static HELD_LOCKS: Mutex<Vec<File>> = Mutex::new(Vec::new());
                 let lock = File::create(value)?;
                 lock.lock()?;
                 fs::write(format!("{value}.ready"), [])?;
-                // The OS releases this after exit handlers, including the coverage profile writer.
-                std::mem::forget(lock);
+                HELD_LOCKS.lock().expect("stub lock list").push(lock);
             }
             "grandchild" => spawn_and_wait_ready(&mut grandchild(value)?, value)?,
             "until-released" => wait_for_file(&format!("{value}.release"))?,

@@ -56,7 +56,8 @@ pub(super) mod platform {
 
     #[test]
     fn a_stalled_exec_allows_other_timers_and_a_queued_call_can_be_dropped() {
-        let directory = Directory::new();
+        // TMPDIR may be mounted noexec. The built stub is on an executable filesystem.
+        let directory = Directory::under(Path::new(STUB).parent().unwrap());
         let executable = directory.0.join("leased-stub");
         fs::copy(STUB, &executable).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_proxenos"));

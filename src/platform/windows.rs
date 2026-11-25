@@ -97,12 +97,12 @@ pub fn spawn(
     mut command: Command,
     files: &mut Vec<TemporaryFile>,
     activity: Activity,
-    before_spawn: impl FnOnce() -> Result<(), StartError>,
+    check_start: impl Fn() -> Result<(), StartError>,
 ) -> Result<Child, StartError> {
     let job = Group::new()?;
     // Rust exposes the primary thread handle on std's Child. Keep it through job assignment.
     command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
-    before_spawn()?;
+    check_start()?;
     let mut process = Process(command.spawn()?);
     // SAFETY: the job and suspended process handles are open with assignment rights.
     let rc = unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), process.0.as_raw_handle()) };
@@ -121,6 +121,9 @@ pub fn spawn(
         .take()
         .map(ChildStderr::from_std)
         .transpose()?;
+    // Creation and pipe setup can outlast the deadline or overlap cancellation. A failed
+    // check leaves the process guard to kill and reap the child while it is still suspended.
+    check_start()?;
     // SAFETY: this is the primary thread of our suspended child, borrowed from its owner.
     let count = unsafe { ResumeThread(process.0.main_thread_handle().as_raw_handle()) };
     (count != u32::MAX)

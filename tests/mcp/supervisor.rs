@@ -27,10 +27,13 @@ struct Directory(PathBuf);
 
 impl Directory {
     fn new() -> Self {
+        Self::under(&std::env::temp_dir())
+    }
+
+    fn under(parent: &Path) -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("proxenos-test-{}-{serial}", std::process::id()));
+        let path = parent.join(format!("proxenos-test-{}-{serial}", std::process::id()));
         fs::create_dir(&path).expect("a fresh directory for this call");
         Self(path)
     }
@@ -234,7 +237,9 @@ fn launch_failure_removes_only_the_file_created_for_this_call() {
     let failed = server.call(1, "test_run", args.clone());
     assert_eq!(failed["result"]["isError"], true);
     assert!(text(&failed).contains("supervision failed"), "{failed}");
-    assert!(!temp.exists());
+    wait_for("failed launch kept its input or reservation", || {
+        fs::read_dir(&directory.0).unwrap().next().is_none()
+    });
 
     fs::write(&temp, "another call").unwrap();
     args["program"] = json!(STUB);

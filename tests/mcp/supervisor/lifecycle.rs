@@ -12,6 +12,7 @@ fn an_expired_launch_skips_the_cli_and_removes_its_input_file() {
     let result = finished(&server.call(1, "test_run", args));
     assert_eq!(result["ending"], "timed_out");
     assert!(result["code"].is_null() && result["signal"].is_null());
+    assert!(server.finish().0.success());
     assert!(!marker.exists());
     assert!(!input.exists());
 }
@@ -31,6 +32,7 @@ fn a_call_cancelled_before_spawn_cleans_up_without_running_the_cli() {
     let result = finished(&server.response(1));
     assert_eq!(result["ending"], "cancelled");
     assert!(result["code"].is_null() && result["signal"].is_null());
+    assert!(server.finish().0.success());
     assert!(!marker.exists());
     assert!(!input.exists());
 }
