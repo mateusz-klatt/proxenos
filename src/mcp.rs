@@ -1,14 +1,13 @@
 //! The MCP server, and the only module that knows `rmcp` (D4).
 //!
 //! No `rmcp` type leaves this file. The rest of Proxenos implements [`Service`], and this module
-//! adds what the library does not do itself: it stops waiting the moment standard input ends,
-//! hands every call a cancellation token, and answers a call whose handler panicked.
+//! adds what the library does not do itself: it stops running calls the moment standard input
+//! ends, reports a failure to read or write as a failure, hands every call a cancellation token,
+//! and answers a call whose handler panicked.
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use rmcp::model::{
@@ -16,15 +15,19 @@ use rmcp::model::{
     ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
     Tool,
 };
-use rmcp::service::{RequestContext, ServerInitializeError};
+use rmcp::service::{QuitReason, RequestContext, ServerInitializeError};
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Map, Value};
-use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::mpsc;
+use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
-/// How long [`serve`] waits, once the connection has ended, for running calls to finish.
-const CALLS_STOP_WITHIN: Duration = Duration::from_secs(10);
+/// How long the server may take, from the end of its input, to finish every running call and
+/// write what is left of its output. Past it, serving has failed.
+const STOP_WITHIN: Duration = Duration::from_secs(10);
+
+/// The size of the in-memory pipes between rmcp and the real standard input and output.
+const PIPE_BYTES: usize = 64 * 1024;
 
 /// A tool as the server lists it.
 pub struct ToolSpec {
@@ -67,45 +70,90 @@ pub enum Served {
 
 /// Serves `service` over standard input and output until the client closes the connection.
 ///
-/// It returns only once every call it started has finished, so that what a call owns, such as a
-/// child process, is cleaned up before the runtime goes away.
+/// rmcp reads and writes two in-memory pipes, which this module copies from standard input and to
+/// standard output, so that every failure to read or write is seen here, ends serving, and is
+/// reported. Serving returns once every call it started has finished, so that what a call owns,
+/// such as a child process, is cleaned up first; all of that is bounded by [`STOP_WITHIN`] from
+/// the end of the input.
 pub async fn serve<S: Service>(service: S) -> Served {
     let shutdown = CancellationToken::new();
+    let fault = Arc::new(Mutex::new(None));
     let (active, mut finished) = mpsc::channel::<()>(1);
     let handler = Handler {
         service: Arc::new(service),
         shutdown: shutdown.clone(),
         active,
     };
-    let (stdin, stdout) = rmcp::transport::stdio();
-    let reader = EndSignal {
-        inner: stdin,
-        ended: shutdown.clone(),
+    let (server_input, mut input) = tokio::io::duplex(PIPE_BYTES);
+    let (server_output, mut output) = tokio::io::duplex(PIPE_BYTES);
+
+    let (ended, input_fault) = (shutdown.clone(), Arc::clone(&fault));
+    tokio::spawn(async move {
+        let copied = tokio::io::copy(&mut tokio::io::stdin(), &mut input).await;
+        record(&input_fault, failed("reading the input", copied));
+        // Dropping `input` here is the end of input for rmcp.
+        ended.cancel();
+    });
+    let (stopped, output_fault) = (shutdown.clone(), Arc::clone(&fault));
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        let copied = tokio::io::copy(&mut output, &mut stdout).await;
+        record(&output_fault, failed("writing the output", copied));
+        stopped.cancel();
+    });
+
+    let serving = async {
+        let failure = match handler.serve((server_input, server_output)).await {
+            Ok(running) => quit_failure(running.waiting().await),
+            // The input ended before a lifecycle was chosen: nothing was asked.
+            Err(ServerInitializeError::ConnectionClosed(_)) => None,
+            Err(error) => Some(error.to_string()),
+        };
+        // rmcp stops draining after five seconds or at the first failed write. Whatever is still
+        // running is told to stop and waited for: each call holds a sender until it finishes, and
+        // the handler that owned the last one is gone by now. So is rmcp's end of the output
+        // pipe, so the writer finishes once it has written what is left.
+        shutdown.cancel();
+        let _ = finished.recv().await;
+        let _ = writer.await;
+        failure
     };
-    let outcome = match handler.serve((reader, stdout)).await {
-        Ok(running) => served(
-            running
-                .waiting()
-                .await
-                .err()
-                .as_ref()
-                .map(ToString::to_string),
-        ),
-        // Standard input ended before a lifecycle was chosen: nothing was asked.
-        Err(ServerInitializeError::ConnectionClosed(_)) => Served::Ended,
-        Err(error) => Served::Failed(error.to_string()),
+    let deadline = async {
+        shutdown.cancelled().await;
+        tokio::time::sleep(STOP_WITHIN).await;
     };
-    // rmcp stops draining after five seconds or at the first failed write. Whatever is still
-    // running is told to stop, and waited for: each call holds a sender until it finishes, and
-    // the handler that owned the last one is gone by now. The wait is bounded, so that a call
-    // that ignores its token cannot keep the process alive.
-    shutdown.cancel();
-    let _ = tokio::time::timeout(CALLS_STOP_WITHIN, finished.recv()).await;
-    outcome
+    let failure = tokio::select! {
+        failure = serving => failure,
+        () = deadline => Some(format!(
+            "running calls and pending output did not finish within {} s of the end of the input",
+            STOP_WITHIN.as_secs()
+        )),
+    };
+    let fault = lock(&fault).take();
+    fault.or(failure).map_or(Served::Ended, Served::Failed)
 }
 
-fn served(failure: Option<String>) -> Served {
-    failure.map_or(Served::Ended, Served::Failed)
+/// Says what failed, if anything did.
+fn failed(what: &str, copied: std::io::Result<u64>) -> Option<String> {
+    let error = copied.err()?;
+    Some(format!("{what} failed: {error}"))
+}
+
+/// Keeps the first failure recorded.
+fn record(fault: &Mutex<Option<String>>, failure: Option<String>) {
+    let mut slot = lock(fault);
+    *slot = slot.take().or(failure);
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// rmcp's service loop ended; anything but a closed or cancelled connection is a failure.
+fn quit_failure(quit: Result<QuitReason, JoinError>) -> Option<String> {
+    let clean = matches!(quit, Ok(QuitReason::Closed | QuitReason::Cancelled));
+    let description = format!("the MCP service stopped unexpectedly: {quit:?}");
+    (!clean).then_some(description)
 }
 
 struct Handler<S> {
@@ -193,32 +241,5 @@ impl<S: Service> ServerHandler for Handler<S> {
                 None,
             )),
         }
-    }
-}
-
-/// Passes reads through and cancels `ended` when standard input ends or fails.
-///
-/// `rmcp` itself waits five seconds after its input closes before it cancels running calls.
-struct EndSignal<R> {
-    inner: R,
-    ended: CancellationToken,
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for EndSignal<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        let ended = matches!(poll, Poll::Ready(Err(_)))
-            || (matches!(poll, Poll::Ready(Ok(())))
-                && buf.filled().len() == before
-                && buf.remaining() > 0);
-        if ended {
-            self.ended.cancel();
-        }
-        poll
     }
 }

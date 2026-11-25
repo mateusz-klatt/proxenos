@@ -143,7 +143,11 @@ Measured on 2026-11-24 with a throwaway server on Linux, `rmcp` 3.11.0, features
 What the `mcp` module has to do itself, because the library does not:
 
 - **End of input.** The library waits a fixed five seconds after standard input closes before it
-  cancels running calls. Proxenos watches its input and stops its children at once.
+  cancels running calls. Proxenos copies standard input into the library itself, and stops
+  running calls the moment it ends.
+- **Read and write failures.** The library ends quietly when it cannot read or write. Proxenos
+  copies standard output from the library too, so that a failure in either direction ends serving
+  with exit status 1 and says why; exit status 0 means the client closed the connection.
 - **Cancellation.** The library signals a token and does not stop the handler. Every handler
   waits on that token.
 - **Panics.** A handler that panics is never answered. Proxenos catches the panic and answers
@@ -153,8 +157,9 @@ What the `mcp` module has to do itself, because the library does not:
   library refuses them. Proxenos does not offer that revision: a client that asks for it is
   offered 2025-11-25, which it may accept or not.
 - **Calls still running when the connection ends.** The library stops waiting for them after five
-  seconds, or at the first answer it cannot write. Proxenos tells them to stop and waits up to ten
-  seconds for them to finish before it exits.
+  seconds, or at the first answer it cannot write. Proxenos tells them to stop and waits for them.
+  Ten seconds after the end of the input, whatever is still running or still unwritten, for a
+  client that no longer reads, is abandoned and serving has failed.
 
 Known differences from claude-delegator, accepted: a line that is not JSON is ignored instead of
 answered with a parse error, and a `tools/call` without a name is "method not found" instead of

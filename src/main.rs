@@ -7,10 +7,14 @@ mod tools;
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use client::Client;
 
 const USAGE: &str = "usage: proxenos --version\n       proxenos mcp --client <claude|codex|antigravity|kimi|grok|cursor|copilot>";
+
+/// How long the runtime may take to stop once serving has ended.
+const RUNTIME_STOPS_WITHIN: Duration = Duration::from_millis(500);
 
 enum Command {
     Version,
@@ -50,16 +54,15 @@ fn version() -> ExitCode {
 
 fn serve(client: Client) -> ExitCode {
     eprintln!("proxenos: serving MCP for {}", client.name());
-    match run_server() {
+    let runtime = tokio::runtime::Runtime::new().expect("the async runtime starts");
+    let served = runtime.block_on(mcp::serve(tools::Registry));
+    // A write to an output that nobody reads blocks a thread that a plain drop would wait for.
+    runtime.shutdown_timeout(RUNTIME_STOPS_WITHIN);
+    match served {
         mcp::Served::Ended => ExitCode::SUCCESS,
         mcp::Served::Failed(reason) => {
             eprintln!("proxenos: {reason}");
             ExitCode::FAILURE
         }
     }
-}
-
-#[tokio::main]
-async fn run_server() -> mcp::Served {
-    mcp::serve(tools::Registry).await
 }

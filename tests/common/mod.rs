@@ -110,6 +110,12 @@ impl Server {
             .expect("a frame arrives in time")
     }
 
+    /// Every frame left on standard output, once the server has closed it.
+    pub fn frames_until_end(&mut self) -> Vec<Value> {
+        let deadline = Instant::now() + WAIT;
+        std::iter::from_fn(|| self.next_frame(deadline)).collect()
+    }
+
     /// Sends a call without waiting for its answer.
     pub fn start_call(&mut self, id: i64, name: &str, arguments: Value) {
         self.send(&json!({

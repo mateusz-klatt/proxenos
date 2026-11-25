@@ -83,10 +83,13 @@ mod test_tools {
             spec("test_panic", "Panics.", open),
             spec(
                 "test_wait",
-                "Waits for `ms` milliseconds or until cancelled.",
+                "Waits for `ms` milliseconds or until cancelled, then for `linger_ms` more.",
                 json!({
                     "type": "object",
-                    "properties": { "ms": { "type": "integer", "minimum": 0 } },
+                    "properties": {
+                        "ms": { "type": "integer", "minimum": 0 },
+                        "linger_ms": { "type": "integer", "minimum": 0 }
+                    },
                     "required": ["ms"],
                     "additionalProperties": false
                 }),
@@ -118,6 +121,13 @@ mod test_tools {
                     () = cancel.cancelled() => "cancelled",
                 };
                 eprintln!("proxenos test_wait: {text}");
+                // A cleanup that takes time, as stopping a child does.
+                let linger = arguments
+                    .get("linger_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                tokio::time::sleep(Duration::from_millis(linger)).await;
+                eprintln!("proxenos test_wait: done");
                 ToolOutcome {
                     text: text.to_owned(),
                     is_error: false,
