@@ -4,8 +4,6 @@
 mod common;
 
 use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{NEW_VERSION, Server, meta, text};
@@ -266,34 +264,35 @@ fn a_failed_write_stops_calls_and_makes_serving_fail() {
     // is starting at this moment holds a copy until it executes the binary (measured on Linux), so
     // answers are asked for until one fails to be written. They are asked for on their own thread,
     // so that a server that stops reading cannot hold this one past its deadline.
+    // Writes that block on a server that stops reading never hold up this thread's deadlines.
     let mut stdin = server.take_input();
-    let probing = Arc::new(AtomicBool::new(true));
-    let probes = {
-        let probing = Arc::clone(&probing);
-        std::thread::spawn(move || {
-            for id in 3_u32.. {
-                let echo = json!({
-                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                    "params": { "name": "test_echo", "arguments": {} }
-                });
-                if !probing.load(Ordering::SeqCst) || writeln!(stdin, "{echo}").is_err() {
-                    return stdin;
-                }
-                std::thread::sleep(Duration::from_millis(50));
+    let (halted, told) = std::sync::mpsc::channel::<()>();
+    let probes = std::thread::spawn(move || {
+        for id in 3_u32.. {
+            let echo = json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "test_echo", "arguments": {} }
+            });
+            if writeln!(stdin, "{echo}").is_err() {
+                break;
             }
-            stdin
-        })
-    };
+            if told.recv_timeout(Duration::from_millis(50)).is_ok() {
+                // A call after the failure, which must never start.
+                let late = json!({
+                    "jsonrpc": "2.0", "id": "after-the-failure", "method": "tools/call",
+                    "params": { "name": "test_wait", "arguments": { "ms": 0 } }
+                });
+                let _ = writeln!(stdin, "{late}");
+                break;
+            }
+        }
+        stdin // Input stays open until the child exits.
+    });
     // Input is still open: cancellation shows that the failed write halted serving.
     server.wait_for_stderr("test_wait: cancelled");
-    probing.store(false, Ordering::SeqCst);
-    let mut stdin = probes.join().expect("the probes finish");
-    let late = json!({
-        "jsonrpc": "2.0", "id": "after-the-failure", "method": "tools/call",
-        "params": { "name": "test_wait", "arguments": { "ms": 0 } }
-    });
-    let _ = writeln!(stdin, "{late}");
+    let _ = halted.send(());
     let (status, _) = server.wait_for_exit(Duration::from_secs(7));
+    drop(probes.join().expect("the probes finish"));
     assert_eq!(status.code(), Some(1));
     let stderr = server.stderr();
     assert!(stderr.contains("writing the output failed"), "{stderr}");
@@ -388,7 +387,12 @@ fn input_that_cannot_be_read_makes_serving_fail() {
         .expect("the child can be waited on")
         .is_none()
     {
-        assert!(Instant::now() < deadline, "the server did not exit");
+        if Instant::now() >= deadline {
+            // Not left running after the test.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the server did not exit");
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     let output = child.wait_with_output().expect("the binary runs");
