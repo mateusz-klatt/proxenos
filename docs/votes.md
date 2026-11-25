@@ -144,16 +144,17 @@ the first milestone should contain. Asked because vote 1 had run on weaker model
 
 | Point | GPT (Astra) | Gemini (Neon) | Taken for now |
 |---|---|---|---|
-| MCP layer | Keep `rmcp`, with both lifecycles covered through the compiled binary. | Replace it with an owned module of about 300 lines, or hold the first milestone until real clients have been tested. If it stays: behind one internal boundary, with tests on raw frames. | `rmcp`, by the owner: "rmcp narazie" (for now). |
-| Where a session's settings are remembered | In the server's memory, until 24 hours idle or the server exits. | In a file per session, for 7 days. | A file, chosen by Claude (Fable 5.2, max): a reply often comes after the client has restarted. |
-| Providers in the first milestone | Codex only. | Codex and Antigravity. | Both, chosen by Claude (Fable 5.2, max): GPT also asked for two unlike reply contracts before the provider interface is fixed. |
-| A long answer | A bounded preview, the rest read in pages. | A bounded excerpt, the rest in a file. | A file, chosen by Claude (Fable 5.2, max). |
-| How the result may change | A schema version from the first release. | Additive changes only, without a version field. | A version field, chosen by Claude (Fable 5.2, max). |
-| A warning before starting on a provider at its quota | First version, from a fresh reading. | Later. | Later, chosen by Claude (Fable 5.2, max). |
-| The strongest model as each provider's default | Not Proxenos's business to choose everyone's default. | First version. | The strongest, chosen by Claude (Fable 5.2, max), as one user also asked. |
-| Named file inputs | Later. | Not Proxenos's job. | Later, chosen by Claude (Fable 5.2, max). |
+| MCP layer | Keep `rmcp`, with both lifecycles covered through the compiled binary. | Replace it with an owned module of about 300 lines, or hold the first milestone until real clients have been tested. If it stays: behind one internal boundary, with tests on raw frames. | `rmcp`, by the owner: "rmcp narazie" (for now). Vote 6: seven of nine keep it for the first milestone. |
+| Where a session's settings are remembered | In the server's memory, until 24 hours idle or the server exits. | In a file per session, for 7 days. | A file, chosen by Claude (Fable 5.2, max): a reply often comes after the client has restarted. Vote 6: eight of nine for a file. |
+| Providers in the first milestone | Codex only. | Codex and Antigravity. | Both, chosen by Claude (Fable 5.2, max): GPT also asked for two unlike reply contracts before the provider interface is fixed. Vote 6: eight of nine for both. |
+| A long answer | A bounded preview, the rest read in pages. | A bounded excerpt, the rest in a file. | A file, chosen by Claude (Fable 5.2, max). Vote 6: six of nine for it. Still provisional. |
+| How the result may change | A schema version from the first release. | Additive changes only, without a version field. | A version field, chosen by Claude (Fable 5.2, max). Vote 6: eight of nine for it. |
+| A warning before starting on a provider at its quota | First version, from a fresh reading. | Later. | Later, chosen by Claude (Fable 5.2, max). Vote 6: eight of nine for later. |
+| The strongest model as each provider's default | Not Proxenos's business to choose everyone's default. | First version. | The strongest, chosen by Claude (Fable 5.2, max), as one user also asked. Vote 6: seven of nine against it. D8 now has Proxenos choose no model. |
+| Named file inputs | Later. | Not Proxenos's job. | Later, chosen by Claude (Fable 5.2, max). Vote 6: four of nine for later, five for not Proxenos's job. Still provisional. |
 
-Every "chosen by Claude" above is provisional and goes to the next vote.
+Every "chosen by Claude" above was provisional and went to the next vote, which was vote 6. The
+last column now says what that vote made of it.
 
 **Owner.** "idziemy z tym co mamy teraz, pozniej robimy konsensus" (we go with what we have now
 and reach consensus later).
@@ -446,8 +447,39 @@ failed request, and held neither. The cause is not known. The attempt is recorde
 nowhere: there is no position to count, and a route that failed says nothing about what the model
 would have answered.
 
+**Taken for now, by Claude (Fable 5.2, max).** Where the count is clear, the architecture now
+follows it. Where it is not, the choice stays provisional and the architecture says so. The owner
+has ruled on none of this.
+
+- D8: Proxenos chooses no model, and passes one only when the call or the user's overlay names
+  it. Seven of nine.
+- D17 and D2: a fourth delegation is refused at once, with a failure of the new kind busy. Eight
+  of nine.
+- D17: one `await` lasts at most 20 seconds. Provisional. It is the largest group of answers and
+  the choice of four of seven families, it leaves the most room under the shortest client limit
+  on record, and raising it later breaks no caller.
+- No longer marked as a choice of Claude's: the file for a session's settings (D19), both
+  providers in the first milestone (D5), the schema version (D2), and the quota warning later.
+- Still provisional: the file for a long answer (D2), and named file inputs (section 3).
+- Limits that voters showed and the architecture did not state. The file of a long answer must
+  outlive the child's temporary files, and a client in a sandbox may be unable to read it (D2). A
+  call that waits can be ended by the client's own limit and leave no handle (D17, section 4).
+  `usage` has no windows to report for a CLI that gives none (D9).
+- Opened by the revision of D8, and put to no voter: what a reply does when its start passed no
+  model, on a provider whose reply must name one. D19 records it as not decided.
+- For the users of vote 5: the one who asked for the strongest model as the default gets it by
+  naming it, in the call or in the overlay. The warning before dispatch stays later. Handing one
+  delegate's result to the next as a file stays provisional, with file inputs.
+- Not changed, because one voter or a few raised it and the count does not carry it: the
+  parent-death signal (D6), known shim layouts only (D7), tests inside the process (D12), the six
+  targets in the first milestone (D13), one file for each session (D19), a configurable limit of
+  delegations (D17), stated defaults for `mode` and `access` (D2), and an exit written down for
+  `rmcp` (D4), which is the owner's to decide. D15 still describes the roster as vote 2 left it.
+
 **Owner.** No ruling on this vote yet. `rmcp` stays, as he decided in vote 4. The roster is still
 not decided.
+
+**Recorded as** the revisions of D2, D5, D8, D9, D17 and D19, and of sections 3, 4 and 5.
 
 ## Waiting for another vote
 
