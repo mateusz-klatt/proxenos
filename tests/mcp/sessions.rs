@@ -610,7 +610,7 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
         "antigravity",
         json!({"prompt": "seed", "model": "seed-model"}),
     );
-    assert_eq!(start["observed"]["state"], "finished");
+    assert_eq!(start["observed"]["state"], "finished", "{start}");
     assert!(server1.finish().0.success());
 
     let provider_dir = sessions_root(&fleet.root).join("antigravity");
@@ -860,7 +860,7 @@ fn save_refuses_to_overwrite_corrupt_session_file() {
         "antigravity",
         json!({"prompt": "seed", "model": "m1"}),
     );
-    assert_eq!(seeded["observed"]["state"], "finished");
+    assert_eq!(seeded["observed"]["state"], "finished", "{seeded}");
 
     let provider_dir = sessions_root(&fleet.root).join("antigravity");
     let session_file = single_session_file(&provider_dir);
@@ -933,14 +933,12 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
         json!([{"stdout": CODEX_FINISHED}, {"stdout": CODEX_FINISHED}]),
     );
     let mut seed_a = fleet_a.server("claude");
-    assert_eq!(
-        call(
-            &mut seed_a,
-            "codex",
-            json!({"prompt": "seed", "access": "full"})
-        )["observed"]["state"],
-        "finished"
+    let seeded_a = call(
+        &mut seed_a,
+        "codex",
+        json!({"prompt": "seed", "access": "full"}),
     );
+    assert_eq!(seeded_a["observed"]["state"], "finished", "{seeded_a}");
     assert!(seed_a.finish().0.success());
 
     let session_a = single_session_file(&sessions_root(&fleet_a.root).join("codex"));
@@ -1006,14 +1004,12 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
         ]),
     );
     let mut seed_b = fleet_b.server("claude");
-    assert_eq!(
-        call(
-            &mut seed_b,
-            "codex",
-            json!({"prompt": "seed", "access": "full"})
-        )["observed"]["state"],
-        "finished"
+    let seeded_b = call(
+        &mut seed_b,
+        "codex",
+        json!({"prompt": "seed", "access": "full"}),
     );
+    assert_eq!(seeded_b["observed"]["state"], "finished", "{seeded_b}");
     assert!(seed_b.finish().0.success());
 
     let session_b = single_session_file(&sessions_root(&fleet_b.root).join("codex"));
@@ -1097,10 +1093,8 @@ fn session_load_respects_call_deadline_and_cancellation() {
     let fleet = Fleet::new(&["codex"]);
     fleet.script("codex", json!([{"stdout": CODEX_FINISHED}]));
     let mut server1 = fleet.server("claude");
-    assert_eq!(
-        call(&mut server1, "codex", json!({"prompt": "seed"}))["observed"]["state"],
-        "finished"
-    );
+    let seeded = call(&mut server1, "codex", json!({"prompt": "seed"}));
+    assert_eq!(seeded["observed"]["state"], "finished", "{seeded}");
     assert!(server1.finish().0.success());
 
     let session_file = single_session_file(&sessions_root(&fleet.root).join("codex"));
@@ -1338,5 +1332,128 @@ fn save_error_never_caches_unverified_settings_or_clears_ambiguity() {
         "{refused_mem}"
     );
     assert_eq!(fleet2.records().len(), before_reply2);
+    assert!(server2.finish().0.success());
+}
+
+#[test]
+fn session_save_respects_call_deadline_and_cancellation() {
+    use std::time::{Duration, Instant};
+
+    let fleet = Fleet::new(&["codex"]);
+    fleet.script(
+        "codex",
+        json!([
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED, "final_message": "saved-timeout-answer"},
+            {"stdout": CODEX_FINISHED, "final_message": "saved-cancel-answer"}
+        ]),
+    );
+    let mut server1 = fleet.server("claude");
+    let seeded = call(
+        &mut server1,
+        "codex",
+        json!({"prompt": "seed", "access": "full"}),
+    );
+    assert_eq!(seeded["observed"]["state"], "finished", "{seeded}");
+    assert!(server1.finish().0.success());
+
+    let session_file = single_session_file(&sessions_root(&fleet.root).join("codex"));
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(session_file.with_extension("lock"))
+        .unwrap();
+    lock.lock().unwrap();
+
+    // Part A: a blocked save respects call_deadline, still returns the finished provider answer
+    // with observed.session_save_failure = timeout, and does NOT cache the unverified start.
+    let mut server2 = fleet.server("claude");
+    server2.request(1, "tools/list", json!({}));
+    let began = Instant::now();
+    let timed = call(
+        &mut server2,
+        "codex",
+        json!({
+            "prompt": "save times out",
+            "model": "uncached-model",
+            "timeout_ms": 400
+        }),
+    );
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "blocked save ignored call deadline ({elapsed:?}): {timed}"
+    );
+    assert_eq!(timed["observed"]["state"], "finished", "{timed}");
+    assert_eq!(
+        timed["reported"]["content"], "saved-timeout-answer",
+        "{timed}"
+    );
+    assert_eq!(
+        timed["observed"]["session_save_failure"]["kind"], "timeout",
+        "{timed}"
+    );
+    assert!(
+        server2.stderr().contains("could not save session settings"),
+        "{}",
+        server2.stderr()
+    );
+
+    // Because the start was not cached, a reply still hits the session lock instead of using cache.
+    let reply_blocked = call(
+        &mut server2,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "must not read from cache",
+            "timeout_ms": 150
+        }),
+    );
+    assert_eq!(
+        reply_blocked["observed"]["failure"]["kind"], "timeout",
+        "{reply_blocked}"
+    );
+    assert!(
+        reply_blocked["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Loading session settings"),
+        "{reply_blocked}"
+    );
+
+    // Part B: cancellation (connection EOF) during a blocked save still returns the finished
+    // answer promptly with observed.session_save_failure = cancellation while lock is still held.
+    let before = fleet.records().len();
+    server2.start_call(
+        40,
+        "codex",
+        json!({"prompt": "save cancelled", "model": "cancelled-save-model"}),
+    );
+    let until = Instant::now() + crate::common::WAIT;
+    while fleet.records().len() <= before {
+        assert!(Instant::now() < until, "start stub did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let cancel_began = Instant::now();
+    server2.close_input();
+    let cancelled: Value =
+        serde_json::from_str(crate::common::text(&server2.response(40))).unwrap();
+    let cancel_elapsed = cancel_began.elapsed();
+    assert!(
+        cancel_elapsed < Duration::from_secs(2),
+        "blocked save ignored cancellation ({cancel_elapsed:?}): {cancelled}"
+    );
+    assert_eq!(cancelled["observed"]["state"], "finished", "{cancelled}");
+    assert_eq!(
+        cancelled["reported"]["content"], "saved-cancel-answer",
+        "{cancelled}"
+    );
+    assert_eq!(
+        cancelled["observed"]["session_save_failure"]["kind"], "cancellation",
+        "{cancelled}"
+    );
+
+    drop(lock);
     assert!(server2.finish().0.success());
 }

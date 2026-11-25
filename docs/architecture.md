@@ -248,11 +248,13 @@ out) as well as live turn output—is the next step.
 - **Unix**: the child calls `setsid` before it executes the CLI. It leads its own session and
   process group and starts without a controlling terminal. On a stop, Proxenos sends SIGTERM to
   the group and gives it up to three seconds before SIGKILL, ending the grace early only when
-  `waitid` confirms the leader has exited and process-group enumeration positively confirms that
-  no non-zombie member remains in the group (falling back to the full three seconds if enumeration
-  fails or fills its buffer), and still sending the final SIGKILL while the leader PID stays
-  reserved. Even when the leader exits first, live descendants keep the remainder of the grace;
-  a descendant that left the group (`setsid`) is still outside this mechanism.
+  `waitid` confirms the leader has exited and two consecutive process-group scans separated by one
+  poll interval positively confirm that the unreaped zombie leader is present and no non-zombie
+  member remains in the group (falling back to the full three seconds on any enumeration error,
+  non-`NotFound` read error, or full 4096-entry buffer), and still sending the final SIGKILL while
+  the leader PID stays reserved. Even when the leader exits first, live descendants keep the
+  remainder of the grace; a descendant that left the group (`setsid`) is still outside this
+  mechanism.
   Proxenos observes the leader's exit with `waitid` and keeps its PID reserved until the last
   group signal, so a reused PID cannot take that signal to another group. Launches run on
   blocking workers. Their pipe setup and native spawn are serialized, with cancellation and
@@ -287,7 +289,11 @@ out) as well as live turn output—is the next step.
   short alias, cleanup can delete the other file.
 
 What this cannot do: on Unix, if Proxenos itself is killed outright, its children survive, and a
-descendant that leaves the process group is not reached. If the OS denies a group signal,
+descendant that leaves the process group is not reached. Process-group enumeration is not atomic;
+requiring two consecutive confirmed-empty scans makes a miss unlikely but cannot rule out a
+descendant that forks and exits between them, in which case that descendant is killed early by
+SIGKILL instead of receiving the full grace (the same outcome as a descendant that outlives the
+grace; the grace is a courtesy, not a guarantee). If the OS denies a group signal,
 Proxenos reports the error. On macOS a group containing only its zombie leader also returns
 `EPERM`. Once `waitid` confirms the leader has exited, Proxenos accepts that result. A live
 descendant that Proxenos lacks permission to signal can go undetected in that case.
@@ -814,9 +820,15 @@ an `ambiguous` flag, and for non-ambiguous entries validated start settings (`cw
 the prompt, the instructions text, the environment, `timeout_ms`, or the provider's answer.
 Confirmed-start saves and reply lookups serialize per `(provider, thread_id)` inside the process
 and coordinate across server processes through an advisory lock file (`<key>.lock`) alongside the
-session file. `StartStore` is updated only after the disk outcome is known, and a reply waits
-(bounded by its call deadline and cancellation) while a save for the same ID is in flight. An
-ambiguity tombstone (`ambiguous: true`) is sticky and is never downgraded to `false`.
+session file. Both reply loads and confirmed-start saves are bounded by the call deadline and
+cancellation. `StartStore` is updated only after the disk outcome is known, and a reply waits
+(bounded by its call deadline and cancellation) while a save for the same ID is in flight. If a
+confirmed-start save fails, times out, or is cancelled after the provider finished, Proxenos still
+returns the finished provider answer (`observed.state == "finished"`), records the save failure in
+`observed.session_save_failure` (using existing `FailureKind::Timeout`, `Cancellation`, or
+`Unknown`) and on standard error, never caches an unverified start in `StartStore`, and preserves
+any in-memory ambiguity marker (`None`). An ambiguity tombstone (`ambiguous: true`) is sticky and
+is never downgraded to `false`.
 
 Files are written atomically with mode `0600` in `0700` directories on Unix, after checking that
 each component under the state base (`proxenos`, `sessions`, `<provider>`) is a real directory
@@ -837,7 +849,9 @@ expired start. Parent-directory checks cover the directories Proxenos creates un
 ancestor directories outside that base (such as `$HOME`, `$XDG_STATE_HOME`, or `%LOCALAPPDATA%`),
 nor close a path-swap race on those parent directories by another process running as the same user
 without descriptor-relative traversal. The per-session lock file is an advisory lock and relies on
-cooperating Proxenos processes.
+cooperating Proxenos processes. When a load or save times out or is cancelled while blocked on an
+external lock holder, the underlying blocking worker remains detached until the OS lock is
+released (bounded on server exit by D4's ten-second shutdown limit).
 
 The file was a provisional choice of vote 4, where one reviewer would keep the settings only in
 the server's memory, and vote 6 backed it: eight of nine positions are for a file. How long it is

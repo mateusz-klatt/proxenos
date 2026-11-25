@@ -510,10 +510,8 @@ fn cancelled_or_expired_wait_false_request_does_not_spawn_background_delegation(
     let fleet = Fleet::new(&["codex"]);
     fleet.script("codex", json!([{"stdout": CODEX_FINISHED}]));
     let mut seed = fleet.server("claude");
-    assert_eq!(
-        call(&mut seed, "codex", json!({"prompt": "seed"}))["observed"]["state"],
-        "finished"
-    );
+    let seeded = call(&mut seed, "codex", json!({"prompt": "seed"}));
+    assert_eq!(seeded["observed"]["state"], "finished", "{seeded}");
     assert!(seed.finish().0.success());
 
     #[cfg(all(unix, not(target_os = "macos")))]

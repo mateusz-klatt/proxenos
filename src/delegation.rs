@@ -21,7 +21,7 @@ use crate::providers::{DEFAULT_TIMEOUT_MS, Provider, RememberedStart, Report, Tu
 use crate::sessions::{self, SaveOutcome, SessionLookup};
 use crate::supervise::cleanup::DirectoryLease;
 use crate::supervise::{self, Ending, Finished, Launch};
-use crate::tools::Registry;
+use crate::tools::{Registry, StartStore};
 
 const DEPTH: &[&str] = &[
     "PROXENOS_DEPTH",
@@ -366,42 +366,64 @@ impl Registry {
                     reported_model: result.report.model.clone(),
                 };
                 let key_lock = self.session_locks.for_key(p.name, id);
-                let _key_guard = key_lock.lock().await;
-                let desired = match self.starts.lock().unwrap().get(p.name, id) {
-                    Some(None) => None,
-                    Some(Some(existing)) if existing != &remembered => None,
-                    _ => Some(remembered),
-                };
-                let saved_id = id.clone();
-                let save_activity = activity.clone();
-                let (desired, saved) = tokio::task::spawn_blocking(move || {
-                    let outcome = sessions::save(p, &saved_id, desired.clone());
-                    drop(save_activity);
-                    (desired, outcome)
-                })
-                .await
-                .expect("session saver finished");
-                match saved {
-                    Ok(SaveOutcome::Ambiguous) => {
-                        self.starts.lock().unwrap().cache(p.name, id.clone(), None);
-                    }
-                    Ok(SaveOutcome::Saved | SaveOutcome::Unconfigured) => {
-                        self.starts
-                            .lock()
-                            .unwrap()
-                            .cache(p.name, id.clone(), desired);
-                    }
-                    Err(error) => {
-                        {
-                            let mut starts = self.starts.lock().unwrap();
-                            if desired.is_none() {
-                                starts.cache(p.name, id.clone(), None);
-                            } else {
-                                starts.remove(p.name, id);
+                let saved = await_bounded(
+                    async {
+                        let _key_guard = key_lock.lock().await;
+                        let desired = match self.starts.lock().unwrap().get(p.name, id) {
+                            Some(None) => None,
+                            Some(Some(existing)) if existing != &remembered => None,
+                            _ => Some(remembered.clone()),
+                        };
+                        let saved_id = id.clone();
+                        let save_activity = activity.clone();
+                        let (desired, outcome) = tokio::task::spawn_blocking(move || {
+                            let outcome = sessions::save(p, &saved_id, desired.clone());
+                            drop(save_activity);
+                            (desired, outcome)
+                        })
+                        .await
+                        .expect("session saver finished");
+                        match outcome {
+                            Ok(SaveOutcome::Ambiguous) => {
+                                self.starts.lock().unwrap().cache(p.name, id.clone(), None);
+                                Ok(())
+                            }
+                            Ok(SaveOutcome::Saved | SaveOutcome::Unconfigured) => {
+                                self.starts
+                                    .lock()
+                                    .unwrap()
+                                    .cache(p.name, id.clone(), desired);
+                                Ok(())
+                            }
+                            Err(error) => {
+                                fail_closed_start_cache(
+                                    &mut self.starts.lock().unwrap(),
+                                    p.name,
+                                    id,
+                                    &remembered,
+                                );
+                                Err(Failure::new(FailureKind::Unknown, error.to_string()))
                             }
                         }
-                        write_diagnostic(format!("could not save session settings: {error}")).await;
-                    }
+                    },
+                    call_deadline,
+                    cancel,
+                    "Saving session settings",
+                )
+                .await;
+                if let Err(failure) = saved {
+                    fail_closed_start_cache(
+                        &mut self.starts.lock().unwrap(),
+                        p.name,
+                        id,
+                        &remembered,
+                    );
+                    result.session_save_failure(&failure);
+                    write_diagnostic(format!(
+                        "could not save session settings: {}",
+                        failure.message
+                    ))
+                    .await;
                 }
             }
             break Ok(());
@@ -414,6 +436,21 @@ impl Registry {
         result.excerpt(&self.answers).await;
         drop(activity);
         outcome
+    }
+}
+
+fn fail_closed_start_cache(
+    starts: &mut StartStore,
+    provider: &'static str,
+    id: &str,
+    remembered: &RememberedStart,
+) {
+    let conflicting = matches!(starts.get(provider, id), Some(None))
+        || matches!(starts.get(provider, id), Some(Some(existing)) if existing != remembered);
+    if conflicting {
+        starts.cache(provider, id.to_owned(), None);
+    } else {
+        starts.remove(provider, id);
     }
 }
 

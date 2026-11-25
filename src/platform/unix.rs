@@ -289,18 +289,22 @@ impl Child {
         self.signal(libc::SIGTERM)?;
         // A descendant may need up to GRACE even after the leader exits, while a group whose
         // members have already exited should not pay the full 3 s wait. Because the zombie leader
-        // keeps its PID reserved until the final signal, enumerate the group, filter all zombies,
-        // and end grace early only on positive proof that no live member remains.
+        // keeps its PID reserved until the final signal and enumeration is not atomic, require two
+        // consecutive confirmed-empty scans separated by a poll interval before ending early.
         let deadline = tokio::time::Instant::now() + GRACE;
+        let mut empty_scans = 0_u8;
         loop {
-            if self.exited()? {
+            let empty = if self.exited()? {
                 let pid = self.pid;
-                let empty = tokio::task::spawn_blocking(move || group_confirmed_empty(pid))
+                tokio::task::spawn_blocking(move || group_confirmed_empty(pid))
                     .await
-                    .expect("group check finished");
-                if empty {
-                    break;
-                }
+                    .expect("group check finished")
+            } else {
+                false
+            };
+            empty_scans = if empty { empty_scans + 1 } else { 0 };
+            if empty_scans >= 2 {
+                break;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -365,56 +369,104 @@ async fn sample_once(
 }
 
 #[cfg(target_os = "linux")]
-fn enumerate_pgrp(pgrp: libc::pid_t) -> Option<Vec<(libc::pid_t, bool, u64, u64)>> {
-    // SAFETY: sysconf takes only a POSIX constant and has no memory safety requirements.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
-    // SAFETY: sysconf takes only a POSIX constant and has no memory safety requirements.
-    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-    let rows = std::fs::read_dir("/proc")
-        .ok()?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let pid = entry.file_name().to_str()?.parse::<libc::pid_t>().ok()?;
-            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
-            let (alive, rss_pages, ticks) = parse_linux_stat(&stat, pgrp)?;
-            Some((
-                pid,
-                alive,
-                rss_pages.saturating_mul(page_size),
-                ticks.saturating_mul(1000) / ticks_per_sec,
-            ))
-        })
-        .collect();
-    Some(rows)
+struct LinuxStat<'a> {
+    is_zombie: bool,
+    pgrp: libc::pid_t,
+    rest: std::str::SplitAsciiWhitespace<'a>,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_header(stat: &str) -> Option<LinuxStat<'_>> {
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    let mut fields = after_comm.split_ascii_whitespace();
+    let is_zombie = matches!(fields.next()?, "Z" | "X" | "x");
+    let pgrp: libc::pid_t = fields.nth(1)?.parse().ok()?;
+    Some(LinuxStat {
+        is_zombie,
+        pgrp,
+        rest: fields,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_accounting(mut header: LinuxStat<'_>) -> Option<(u64, u64)> {
+    let utime: u64 = header.rest.nth(8)?.parse().ok()?;
+    let stime: u64 = header.rest.next()?.parse().ok()?;
+    let rss_pages: u64 = header.rest.nth(8)?.parse().ok()?;
+    Some((rss_pages, utime.saturating_add(stime)))
 }
 
 #[cfg(target_os = "linux")]
 fn sample_pgrp(pgrp: libc::pid_t) -> Vec<(libc::pid_t, u64, u64)> {
-    enumerate_pgrp(pgrp)
-        .unwrap_or_default()
+    // SAFETY: sysconf takes only a POSIX constant and has no memory safety requirements.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+    // SAFETY: sysconf takes only a POSIX constant and has no memory safety requirements.
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    std::fs::read_dir("/proc")
         .into_iter()
-        .map(|(pid, _, mem, cpu)| (pid, mem, cpu))
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let pid = entry.file_name().to_str()?.parse::<libc::pid_t>().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let header = parse_linux_header(&stat)?;
+            (header.pgrp == pgrp)
+                .then(|| parse_linux_accounting(header))
+                .flatten()
+                .map(|(rss_pages, ticks)| {
+                    (
+                        pid,
+                        rss_pages.saturating_mul(page_size),
+                        ticks.saturating_mul(1000) / ticks_per_sec,
+                    )
+                })
+        })
         .collect()
 }
 
 #[cfg(target_os = "linux")]
-fn group_confirmed_empty(pgrp: libc::pid_t) -> bool {
-    enumerate_pgrp(pgrp).is_some_and(|rows| !rows.iter().any(|&(_, alive, _, _)| alive))
+fn scan_linux_proc_entry(
+    entry: io::Result<std::fs::DirEntry>,
+    pgrp: libc::pid_t,
+) -> Result<bool, ()> {
+    let entry = entry.ok().ok_or(())?;
+    let Some(pid) = entry
+        .file_name()
+        .to_str()
+        .and_then(|name| name.parse::<libc::pid_t>().ok())
+    else {
+        return Ok(false);
+    };
+    let read = std::fs::read_to_string(entry.path().join("stat"));
+    // Fail safe on any stat read error other than NotFound (a process that vanished).
+    let vanished = read.as_ref().err().map(io::Error::kind) == Some(io::ErrorKind::NotFound);
+    let stat = read.ok();
+    (stat.is_some() || vanished).then_some(()).ok_or(())?;
+    // Fail safe if an existing stat file cannot be parsed for state and pgrp.
+    let parsed = stat
+        .as_deref()
+        .map(|text| parse_linux_header(text).ok_or(()));
+    let header = parsed.transpose()?;
+    let member = header.filter(|h| h.pgrp == pgrp);
+    let is_live = member.as_ref().is_some_and(|h| !h.is_zombie);
+    (!is_live).then_some(()).ok_or(())?;
+    Ok(member.is_some() && pid == pgrp)
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_stat(stat: &str, pgrp: libc::pid_t) -> Option<(bool, u64, u64)> {
-    let (_, rest) = stat.rsplit_once(')')?;
-    let mut fields = rest.split_ascii_whitespace();
-    let alive = !matches!(fields.next()?, "Z" | "X" | "x");
-    let group: libc::pid_t = fields.nth(1)?.parse().ok()?;
-    if group != pgrp {
-        return None;
-    }
-    let utime: u64 = fields.nth(8)?.parse().ok()?;
-    let stime: u64 = fields.next()?.parse().ok()?;
-    let rss_pages: u64 = fields.nth(8)?.parse().ok()?;
-    Some((alive, rss_pages, utime.saturating_add(stime)))
+fn group_confirmed_empty(pgrp: libc::pid_t) -> bool {
+    // Positive proof only: /proc scan completed without errors, no non-zombie member matched
+    // pgrp, and the unreaped zombie leader itself was observed in this scan.
+    std::fs::read_dir("/proc")
+        .ok()
+        .and_then(|mut entries| {
+            entries
+                .try_fold(false, |seen_leader, entry| {
+                    scan_linux_proc_entry(entry, pgrp).map(|is_leader| seen_leader || is_leader)
+                })
+                .ok()
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -434,50 +486,48 @@ unsafe extern "C" {
 const PGRP_SAMPLE_PIDS: usize = 4096;
 
 #[cfg(target_os = "macos")]
-fn pgrp_pids_raw(pgrp: libc::pid_t) -> (libc::c_int, Vec<libc::pid_t>) {
+fn pgrp_pids(pgrp: libc::pid_t) -> (Vec<libc::pid_t>, bool) {
     // A fixed buffer: libproc's size query with a null buffer does not report the size of this
     // group. A group of more than PGRP_SAMPLE_PIDS processes is sampled only in part.
     let mut pids = vec![0 as libc::pid_t; PGRP_SAMPLE_PIDS];
     let buf_bytes = (pids.len() * size_of::<libc::pid_t>()) as libc::c_int;
     // SAFETY: pids is writable storage of exactly buf_bytes bytes.
     let filled = unsafe { libc::proc_listpgrppids(pgrp, pids.as_mut_ptr().cast(), buf_bytes) };
-    // proc_listpgrppids returns a count of PIDs, not of bytes (measured on macOS 26).
-    (filled, pids)
+    // libproc converts syscall failure into 0 with errno set, and returns a count of PIDs (measured
+    // on macOS 26). A full buffer may be truncated; a 0 return fails the leader-presence check.
+    let count = (filled as usize).min(pids.len());
+    let complete = count < pids.len();
+    pids.truncate(count);
+    (pids, complete)
 }
 
 #[cfg(target_os = "macos")]
-fn macos_pid_is_not_live(pid: libc::pid_t) -> bool {
+fn macos_pid_is_zombie(pid: libc::pid_t) -> bool {
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // Pass arg=1 so XNU looks up zombies via proc_find_zombref(). Never treat ESRCH (or any other
+    // lookup failure) as proof a member is gone: a member may have forked before exiting.
     // SAFETY: info points to valid writable storage of `size` bytes for PROC_PIDTBSDINFO.
     let got = unsafe {
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            1,
             info.as_mut_ptr().cast(),
             size,
         )
     };
-    let err = io::Error::last_os_error().raw_os_error();
-    // Positive proof only: confirmed zombie (SZOMB) or already reaped (ESRCH). Any other error
-    // (such as EPERM) fails safe by treating the member as still live.
     // SAFETY: when got == size, proc_pidinfo wrote a complete proc_bsdinfo struct.
-    (got == size && unsafe { info.assume_init() }.pbi_status == libc::SZOMB)
-        || (got <= 0 && err == Some(libc::ESRCH))
+    got == size && unsafe { info.assume_init() }.pbi_status == libc::SZOMB
 }
 
 #[cfg(target_os = "macos")]
 fn group_confirmed_empty(pgrp: libc::pid_t) -> bool {
-    let (filled, mut pids) = pgrp_pids_raw(pgrp);
-    // Fail-safe: a negative return or a full 4096-entry buffer cannot prove the group is empty.
-    usize::try_from(filled)
-        .ok()
-        .filter(|&count| count < pids.len())
-        .is_some_and(|count| {
-            pids.truncate(count);
-            pids.into_iter().all(macos_pid_is_not_live)
-        })
+    let (pids, complete) = pgrp_pids(pgrp);
+    // Positive proof only: the buffer was not full (no truncation), the unreaped zombie leader
+    // itself is present (ruling out a 0-return failure), and every listed member is confirmed to
+    // be a zombie.
+    complete && pids.contains(&pgrp) && pids.into_iter().all(macos_pid_is_zombie)
 }
 
 #[cfg(target_os = "macos")]
@@ -487,8 +537,7 @@ fn sample_pgrp(pgrp: libc::pid_t) -> Vec<(libc::pid_t, u64, u64)> {
     let _ = unsafe { mach_timebase_info(&raw mut timebase) };
     let numer = u128::from(timebase.numer.max(1));
     let denom = u128::from(timebase.denom.max(1));
-    let (filled, mut pids) = pgrp_pids_raw(pgrp);
-    pids.truncate((filled.max(0) as usize).min(pids.len()));
+    let (pids, _) = pgrp_pids(pgrp);
     pids.into_iter()
         .filter_map(|pid| {
             let mut info = MaybeUninit::<libc::proc_taskinfo>::zeroed();

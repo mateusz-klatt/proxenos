@@ -142,6 +142,10 @@ impl Envelope {
         self.observed["git"][when] = value;
     }
 
+    pub fn session_save_failure(&mut self, failure: &Failure) {
+        self.observed["session_save_failure"] = json!(failure);
+    }
+
     pub fn fail(&mut self, failure: Failure) {
         self.state = if failure.kind == FailureKind::Cancellation {
             "cancelled"
