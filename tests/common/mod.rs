@@ -52,7 +52,14 @@ impl Server {
         let mut command = Command::new(env!("CARGO_BIN_EXE_proxenos"));
         // Even a version probe would execute a real CLI on a developer's machine.
         let absent = std::env::temp_dir().join(format!("proxenos-absent-{}", uuid::Uuid::new_v4()));
-        for key in ["PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+        for key in [
+            "PATH",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_STATE_HOME",
+        ] {
             command.env(key, &absent);
         }
         for (key, _) in std::env::vars_os() {

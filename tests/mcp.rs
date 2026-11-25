@@ -55,7 +55,9 @@ fn an_earlier_revision_is_served_after_initialize() {
                 "test_fail",
                 "test_panic",
                 "test_run",
-                "test_wait"
+                "test_wait",
+                "await",
+                "cancel"
             ]
         );
         // The schema goes out as it was written.

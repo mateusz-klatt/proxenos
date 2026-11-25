@@ -1,8 +1,12 @@
 //! Provider behaviour over MCP with isolated CLI installations.
 #![cfg(feature = "test-tools")]
 
+#[path = "mcp/accounting.rs"]
+mod accounting;
 #[path = "mcp/antigravity.rs"]
 mod antigravity;
+#[path = "mcp/background.rs"]
+mod background;
 #[path = "mcp/codex.rs"]
 mod codex;
 #[allow(dead_code)]
@@ -12,6 +16,8 @@ mod content;
 #[path = "mcp/discovery.rs"]
 mod discovery;
 mod provider_support;
+#[path = "mcp/sessions.rs"]
+mod sessions;
 
 #[path = "mcp/git.rs"]
 mod git;
@@ -21,7 +27,7 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 #[test]
-fn both_pairs_are_listed_with_their_own_capabilities() {
+fn both_pairs_and_shared_tools_are_listed_with_their_own_capabilities() {
     let fleet = Fleet::new(&["codex", "agy"]);
     let mut server = fleet.server("claude");
     let response = server.request(5, "tools/list", json!({}));
@@ -31,10 +37,17 @@ fn both_pairs_are_listed_with_their_own_capabilities() {
         .iter()
         .filter(|s| !s["name"].as_str().unwrap().starts_with("test_"))
         .collect();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 6);
+    let mut provider_count = 0;
+    let mut shared = Vec::new();
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
         let fields = &tool["inputSchema"]["properties"];
+        if matches!(name, "await" | "cancel") {
+            shared.push(name);
+            continue;
+        }
+        provider_count += 1;
         assert_eq!(fields["thread_id"].is_object(), name.ends_with("-reply"));
         assert_eq!(fields["effort"].is_object(), name.starts_with("codex"));
         assert!(fields["access"]["description"].as_str().unwrap().contains(
@@ -44,8 +57,14 @@ fn both_pairs_are_listed_with_their_own_capabilities() {
                 "shell"
             }
         ));
-        assert!(fields["wait"].is_null() && fields["expert"].is_null());
+        assert_eq!(fields["wait"]["type"], "boolean");
+        assert_eq!(fields["wait"]["default"], true);
+        assert_eq!(fields["memory_limit_bytes"]["type"], "integer");
+        assert_eq!(fields["memory_limit_bytes"]["minimum"], 1);
+        assert!(fields["expert"].is_null());
     }
+    assert_eq!(provider_count, 4);
+    assert_eq!(shared, ["await", "cancel"]);
 }
 
 #[test]
@@ -628,8 +647,23 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
     });
     fleet.script(
         "agy",
-        json!([ok("s1"), err_step, ok("s2"), ok("s3"), ok("s2"), ok("s1")]),
+        json!([
+            ok("s1"),
+            err_step,
+            ok("s2"),
+            ok("s3"),
+            ok("s2"),
+            ok("s1"),
+            ok("s1"),
+            ok("s2"),
+            ok("s3"),
+            ok("s2"),
+            ok("s1")
+        ]),
     );
+
+    // Part A: with durable session files enabled, failed starts are ignored everywhere, while
+    // evicting s1 from StartStore drops its in-memory-only instructions and falls back to disk.
     let mut command = fleet.command("claude");
     command.env("PROXENOS_TEST_START_LIMIT", "2");
     let mut server = common::Server::start_command(command);
@@ -638,7 +672,7 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
     let s1 = call(
         &mut server,
         "antigravity",
-        json!({"prompt": "1", "model": "m1"}),
+        json!({"prompt": "1", "model": "m1", "instructions": "cache-only-note"}),
     );
     assert_eq!(s1["observed"]["state"], "finished", "{s1}");
     let failed = call(
@@ -654,13 +688,13 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
     );
     assert_eq!(
         unremembered_failed["observed"]["failure"]["kind"], "invalid_request",
-        "failed start must not be recorded in starts: {unremembered_failed}"
+        "failed start must not be recorded in StartStore or on disk: {unremembered_failed}"
     );
 
     let s2 = call(
         &mut server,
         "antigravity",
-        json!({"prompt": "2", "model": "m2"}),
+        json!({"prompt": "2", "model": "m2", "instructions": "still-cached-note"}),
     );
     assert_eq!(s2["observed"]["state"], "finished", "{s2}");
     let s3 = call(
@@ -670,9 +704,62 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
     );
     assert_eq!(s3["observed"]["state"], "finished", "{s3}");
 
-    // Limit is 2, so s1 was evicted while s2 and s3 remain remembered.
-    let evicted = call(
+    // Limit is 2, so s2 remained in StartStore (retaining its non-persisted instructions) while
+    // s1 was evicted from StartStore and served from the durable session file (retaining model
+    // "m1" without its non-persisted instructions).
+    let kept = call(
         &mut server,
+        "antigravity-reply",
+        json!({"thread_id": "s2", "prompt": "still-cached"}),
+    );
+    assert_eq!(kept["observed"]["state"], "finished", "{kept}");
+    assert_eq!(kept["observed"]["passed"]["model"], "m2", "{kept}");
+    let from_file = call(
+        &mut server,
+        "antigravity-reply",
+        json!({"thread_id": "s1", "prompt": "from-file"}),
+    );
+    assert_eq!(from_file["observed"]["state"], "finished", "{from_file}");
+    assert_eq!(
+        from_file["observed"]["passed"]["model"], "m1",
+        "{from_file}"
+    );
+    let prints: Vec<String> = fleet
+        .records()
+        .into_iter()
+        .filter_map(|record| {
+            record["args"]
+                .as_array()?
+                .windows(2)
+                .find(|pair| pair[0] == "--print")
+                .and_then(|pair| pair[1].as_str().map(str::to_owned))
+        })
+        .collect();
+    assert!(prints[4].contains("still-cached-note"), "{}", prints[4]);
+    assert!(!prints[5].contains("cache-only-note"), "{}", prints[5]);
+    assert!(server.finish().0.success());
+
+    // Part B: without a usable durable state directory, eviction from StartStore drops s1.
+    let mut mem_only = fleet.command("claude");
+    mem_only
+        .env("PROXENOS_TEST_START_LIMIT", "2")
+        .env("PROXENOS_AGY_CONVERSATIONS_DIR", &store)
+        .env("HOME", "relative-home")
+        .env("LOCALAPPDATA", "relative-localappdata")
+        .env("XDG_STATE_HOME", "relative-xdg");
+    let mut server2 = common::Server::start_command(mem_only);
+    server2.initialize("2025-11-25");
+
+    for (prompt, model) in [("1", "m1"), ("2", "m2"), ("3", "m3")] {
+        let done = call(
+            &mut server2,
+            "antigravity",
+            json!({"prompt": prompt, "model": model}),
+        );
+        assert_eq!(done["observed"]["state"], "finished", "{done}");
+    }
+    let evicted = call(
+        &mut server2,
         "antigravity-reply",
         json!({"thread_id": "s1", "prompt": "evicted"}),
     );
@@ -687,17 +774,15 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
             .contains("no settings"),
         "{evicted}"
     );
-
-    let kept = call(
-        &mut server,
+    let kept2 = call(
+        &mut server2,
         "antigravity-reply",
         json!({"thread_id": "s2", "prompt": "still remembered"}),
     );
-    assert_eq!(kept["observed"]["state"], "finished", "{kept}");
-    assert_eq!(kept["observed"]["passed"]["model"], "m2", "{kept}");
-
+    assert_eq!(kept2["observed"]["state"], "finished", "{kept2}");
+    assert_eq!(kept2["observed"]["passed"]["model"], "m2", "{kept2}");
     let explicit = call(
-        &mut server,
+        &mut server2,
         "antigravity-reply",
         json!({
             "thread_id": "s1", "prompt": "explicit",

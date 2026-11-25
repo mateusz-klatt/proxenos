@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::delegation::Attempt;
 use crate::mcp::ToolOutcome;
 use crate::providers::{Provider, Report, Turn};
+use crate::supervise::Accounting;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,8 +21,10 @@ pub enum FailureKind {
     #[cfg(windows)]
     UnsupportedLauncher,
     Launch,
+    Busy,
     Timeout,
     Cancellation,
+    MemoryLimit,
     AbnormalExit,
     InvalidRequest,
     DepthLimit,
@@ -52,9 +55,11 @@ impl Failure {
 
 pub struct Envelope {
     started: Instant,
+    state: &'static str,
     observed: Value,
     pub report: Report,
     attempts: Vec<Value>,
+    accounting: Option<Accounting>,
 }
 
 impl Envelope {
@@ -66,9 +71,19 @@ impl Envelope {
             .collect();
         Self {
             started: Instant::now(),
+            state: "finished",
             report: Report::default(),
             attempts: Vec::new(),
-            observed: json!({"provider":provider.name,"requested":requested,"state":"finished","failure":null,"passed":null,"access_mechanism":null}),
+            accounting: None,
+            observed: json!({
+                "provider": provider.name,
+                "requested": requested,
+                "state": "finished",
+                "failure": null,
+                "passed": null,
+                "access_mechanism": null,
+                "accounting": null
+            }),
         }
     }
 
@@ -104,14 +119,22 @@ impl Envelope {
                 .map(|(_, text)| text);
             self.observed["access_mechanism"] = json!(mechanism);
         }
+        self.accounting = Some(merge_accounting(self.accounting.take(), &result.accounting));
         self.attempts.push(json!({
-            "exit_code":result.code, "signal":result.signal,"elapsed_ms":result.elapsed.as_millis(),
-            "stdout_bytes":result.stdout.total,"stderr_bytes":result.stderr.total,
-            "operation": if reply {"reply"} else {"start"}, "deadline_ms":attempt.deadline.as_millis(),
-            "cli_timeout_ms":attempt.cli_timeout_ms, "provider_file_bytes":attempt.file_bytes,
-            "provider_file_captured":attempt.file_captured,
-            "stdout_captured":result.stdout.bytes.len(),"stderr_captured":result.stderr.bytes.len(),
-            "last_output_ms":result.last_output.map(|at|at.as_millis())
+            "exit_code": result.code,
+            "signal": result.signal,
+            "elapsed_ms": result.elapsed.as_millis(),
+            "stdout_bytes": result.stdout.total,
+            "stderr_bytes": result.stderr.total,
+            "operation": if reply { "reply" } else { "start" },
+            "deadline_ms": attempt.deadline.as_millis(),
+            "cli_timeout_ms": attempt.cli_timeout_ms,
+            "provider_file_bytes": attempt.file_bytes,
+            "provider_file_captured": attempt.file_captured,
+            "stdout_captured": result.stdout.bytes.len(),
+            "stderr_captured": result.stderr.bytes.len(),
+            "last_output_ms": result.last_output.map(|at| at.as_millis()),
+            "accounting": result.accounting,
         }));
     }
 
@@ -120,24 +143,57 @@ impl Envelope {
     }
 
     pub fn fail(&mut self, failure: Failure) {
-        self.observed["state"] = json!(if failure.kind == FailureKind::Cancellation {
+        self.state = if failure.kind == FailureKind::Cancellation {
             "cancelled"
         } else {
             "failed"
-        });
+        };
+        self.observed["state"] = json!(self.state);
         self.observed["failure"] = json!(failure);
     }
 
-    pub fn outcome(mut self) -> ToolOutcome {
-        if self.report.failure.is_some() && self.observed["state"] == "finished" {
-            self.observed["state"] = json!("failed");
+    pub fn finalize(mut self) -> (&'static str, Value) {
+        if self.report.failure.is_some() && self.state == "finished" {
+            self.state = "failed";
+            self.observed["state"] = json!(self.state);
         }
         self.observed["duration_ms"] = json!(self.elapsed().as_millis());
         self.observed["attempts"] = json!(self.attempts);
+        self.observed["accounting"] = json!(self.accounting);
+        let value = json!({
+            "schema_version": 1,
+            "observed": self.observed,
+            "reported": self.report,
+            "not_claimed": [
+                "The provider followed its requested mode.",
+                "The CLI loaded particular instruction files.",
+                "A review established a verdict.",
+                "A git snapshot identifies the author of a change or captures every edit."
+            ]
+        });
+        (self.state, value)
+    }
+
+    pub fn outcome(self) -> ToolOutcome {
+        let (state, value) = self.finalize();
         ToolOutcome {
-            is_error:self.observed["state"]!="finished",
-            text:json!({"schema_version":1,"observed": self.observed,"reported":self.report,
-                "not_claimed":["The provider followed its requested mode.","The CLI loaded particular instruction files.","A review established a verdict.","A git snapshot identifies the author of a change or captures every edit."]}).to_string(),
+            is_error: state != "finished",
+            text: value.to_string(),
         }
     }
+}
+
+fn combine_opt(left: Option<u64>, right: Option<u64>, join: fn(u64, u64) -> u64) -> Option<u64> {
+    left.zip(right).map(|(a, b)| join(a, b)).or(left).or(right)
+}
+
+fn merge_accounting(existing: Option<Accounting>, next: &Accounting) -> Accounting {
+    let Some(mut acc) = existing else {
+        return next.clone();
+    };
+    acc.peak_memory_bytes = combine_opt(acc.peak_memory_bytes, next.peak_memory_bytes, u64::max);
+    acc.cpu_time_ms = combine_opt(acc.cpu_time_ms, next.cpu_time_ms, u64::saturating_add);
+    acc.samples = combine_opt(acc.samples, next.samples, u64::saturating_add);
+    acc.memory_limit_exceeded |= next.memory_limit_exceeded;
+    acc
 }

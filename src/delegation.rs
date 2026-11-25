@@ -1,4 +1,4 @@
-//! One foreground call, from preflight through reaping, interpretation and D19 continuity.
+//! Foreground and background delegations, from preflight through reaping, accounting and D19 continuity.
 
 mod git;
 
@@ -6,16 +6,19 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::background::MAX_CONCURRENT;
 use crate::discovery::{Executable, exit_description};
 use crate::envelope::{CAPTURE_LIMIT, Envelope, Failure, FailureKind};
 use crate::mcp::{Activity, ToolOutcome};
-use crate::providers::{Provider, Report, Turn};
+use crate::providers::{Provider, RememberedStart, Report, Turn};
+use crate::sessions::{self, SessionLookup};
 use crate::supervise::cleanup::DirectoryLease;
 use crate::supervise::{self, Ending, Finished, Launch};
 use crate::tools::Registry;
@@ -33,7 +36,7 @@ const DEPTH: &[&str] = &[
 
 impl Registry {
     pub async fn delegate(
-        &self,
+        self: Arc<Self>,
         p: &'static Provider,
         reply: bool,
         args: Map<String, Value>,
@@ -41,8 +44,72 @@ impl Registry {
         activity: Activity,
     ) -> ToolOutcome {
         let mut result = Envelope::new(p, &args);
+        let (turn, call_deadline) = match self
+            .prepare_turn(p, reply, &args, &cancel, activity.clone(), result.started())
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                result.fail(error);
+                return result.outcome();
+            }
+        };
+        if !turn.wait {
+            let bg_cancel = activity.shutdown_token();
+            let Some((handle, slot)) = self.background.try_start(p.name, bg_cancel.clone()) else {
+                result.fail(busy_failure());
+                return result.outcome();
+            };
+            let task_handle = handle.clone();
+            let registry = Arc::clone(&self);
+            tokio::spawn(async move {
+                let outcome = registry
+                    .execute(
+                        p,
+                        reply,
+                        turn,
+                        call_deadline,
+                        &bg_cancel,
+                        activity,
+                        &mut result,
+                    )
+                    .await;
+                if let Err(error) = outcome {
+                    result.fail(error);
+                }
+                let (state, value) = result.finalize();
+                // Free the concurrency slot before waking `await`, so a follow-up start
+                // issued right after `await` returns never races with the finished slot.
+                drop(slot);
+                registry
+                    .background
+                    .complete(&task_handle, p.name, state, value);
+            });
+            return ToolOutcome {
+                is_error: false,
+                text: json!({
+                    "schema_version": 1,
+                    "handle": handle,
+                    "state": "running",
+                    "provider": p.name,
+                })
+                .to_string(),
+            };
+        }
+        let Some(_slot) = self.background.try_acquire_slot() else {
+            result.fail(busy_failure());
+            return result.outcome();
+        };
         let outcome = self
-            .run(p, reply, &args, &cancel, activity, &mut result)
+            .execute(
+                p,
+                reply,
+                turn,
+                call_deadline,
+                &cancel,
+                activity,
+                &mut result,
+            )
             .await;
         if let Err(error) = outcome {
             result.fail(error);
@@ -50,15 +117,15 @@ impl Registry {
         result.outcome()
     }
 
-    async fn run(
+    async fn prepare_turn(
         &self,
         p: &'static Provider,
         reply: bool,
         args: &Map<String, Value>,
         cancel: &CancellationToken,
         activity: Activity,
-        result: &mut Envelope,
-    ) -> Result<(), Failure> {
+        started: Instant,
+    ) -> Result<(Turn, Instant), Failure> {
         if DEPTH.iter().any(|key| {
             std::env::var(key).is_ok_and(|s| s.trim().parse::<u64>().is_ok_and(|n| n > 0))
         }) {
@@ -67,29 +134,74 @@ impl Registry {
                 "A delegated CLI cannot start another Proxenos delegation.",
             ));
         }
-        let start = if reply {
-            match args
+        let start = if reply
+            && let Some(id) = args
                 .get("thread_id")
                 .and_then(Value::as_str)
-                .and_then(|id| self.starts.lock().unwrap().get(p.name, id).cloned())
-            {
-                Some(None) => {
-                    return Err(Failure::new(
-                        FailureKind::InvalidRequest,
-                        "Multiple starts reported this thread_id with conflicting settings. Start a new session instead.",
-                    ));
+                .filter(|s| !s.trim().is_empty() && !s.contains('\0'))
+        {
+            let cached = self.starts.lock().unwrap().get(p.name, id).cloned();
+            match cached {
+                Some(None) => return Err(ambiguous_thread_failure()),
+                Some(Some(remembered)) => Some(remembered),
+                None => {
+                    let id_owned = id.to_owned();
+                    let load_activity = activity.clone();
+                    let lookup = tokio::task::spawn_blocking(move || {
+                        let found = sessions::load(p, &id_owned);
+                        drop(load_activity);
+                        found
+                    })
+                    .await
+                    .expect("session loader finished");
+                    match lookup {
+                        SessionLookup::Missing => None,
+                        SessionLookup::Found(remembered) => {
+                            self.starts.lock().unwrap().cache(
+                                p.name,
+                                id.to_owned(),
+                                Some(remembered.clone()),
+                            );
+                            Some(remembered)
+                        }
+                        SessionLookup::Ambiguous => {
+                            self.starts
+                                .lock()
+                                .unwrap()
+                                .cache(p.name, id.to_owned(), None);
+                            return Err(ambiguous_thread_failure());
+                        }
+                        SessionLookup::Corrupt(reason) => {
+                            return Err(Failure::new(
+                                FailureKind::InvalidRequest,
+                                format!("Cannot use session settings file: {reason}"),
+                            ));
+                        }
+                    }
                 }
-                Some(Some(settings)) => Some(settings),
-                None => None,
             }
         } else {
             None
         };
-        let mut turn = p
+        let turn = p
             .turn(args, reply, start)
             .map_err(|message| Failure::new(FailureKind::InvalidRequest, message))?;
-        let call_deadline = result.started() + Duration::from_millis(turn.timeout_ms);
-        prepare(p, &turn, call_deadline, cancel, activity.clone()).await?;
+        let call_deadline = started + Duration::from_millis(turn.timeout_ms);
+        prepare(p, &turn, call_deadline, cancel, activity).await?;
+        Ok((turn, call_deadline))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute(
+        &self,
+        p: &'static Provider,
+        reply: bool,
+        mut turn: Turn,
+        call_deadline: Instant,
+        cancel: &CancellationToken,
+        activity: Activity,
+        result: &mut Envelope,
+    ) -> Result<(), Failure> {
         let exe = match self
             .discovery
             .resolve(p.name, cancel, call_deadline, activity.clone())
@@ -164,6 +276,15 @@ impl Registry {
                         "The provider call was cancelled.",
                     ));
                 }
+                Ending::Exited
+                    if finished.accounting.memory_limit_exceeded
+                        && (cfg!(unix) || finished.code != Some(0)) =>
+                {
+                    break Err(Failure::new(
+                        FailureKind::MemoryLimit,
+                        "The provider exceeded the delegation's memory limit.",
+                    ));
+                }
                 Ending::Exited => (),
             }
             if !retry
@@ -206,10 +327,29 @@ impl Registry {
                 && result.report.failure.is_none()
                 && let Some(id) = &result.report.thread_id
             {
-                self.starts
+                let remembered = RememberedStart {
+                    settings: turn.settings.clone(),
+                    reported_model: result.report.model.clone(),
+                };
+                let entry = self
+                    .starts
                     .lock()
                     .unwrap()
-                    .record(p.name, id.clone(), turn.settings.clone());
+                    .record(p.name, id.clone(), remembered);
+                let saved_id = id.clone();
+                let save_activity = activity.clone();
+                let saved = tokio::task::spawn_blocking(move || {
+                    let outcome = sessions::save(p, &saved_id, entry);
+                    drop(save_activity);
+                    outcome
+                })
+                .await
+                .expect("session saver finished");
+                match saved {
+                    Ok(true) => self.starts.lock().unwrap().cache(p.name, id.clone(), None),
+                    Ok(false) => (),
+                    Err(error) => eprintln!("proxenos: could not save session settings: {error}"),
+                }
             }
             break Ok(());
         };
@@ -219,6 +359,20 @@ impl Registry {
         result.excerpt(&self.answers).await;
         outcome
     }
+}
+
+fn ambiguous_thread_failure() -> Failure {
+    Failure::new(
+        FailureKind::InvalidRequest,
+        "Multiple starts reported this thread_id with conflicting settings. Start a new session instead.",
+    )
+}
+
+fn busy_failure() -> Failure {
+    Failure::new(
+        FailureKind::Busy,
+        format!("At most {MAX_CONCURRENT} delegations may run at once."),
+    )
 }
 
 async fn await_bounded<T>(
@@ -372,6 +526,7 @@ async fn launch(
         env_set: env_set(),
         env_remove: env_remove(),
         deadline,
+        memory_limit_bytes: turn.memory_limit_bytes,
         capture_limit: CAPTURE_LIMIT,
         temporary_files: vec![scratch.for_child()],
     };

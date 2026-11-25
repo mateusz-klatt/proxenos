@@ -8,10 +8,16 @@ use common::Server;
 use serde_json::json;
 
 #[test]
-fn a_release_build_lists_no_tools_and_refuses_the_test_ones() {
+fn a_release_build_lists_only_shared_tools_and_refuses_the_test_ones() {
     let (mut server, _) = Server::initialized("2025-11-25");
     let listed = server.request(1, "tools/list", json!({}));
-    assert_eq!(listed["result"]["tools"], json!([]));
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(names, ["await", "cancel"]);
     for (id, name) in [
         (2, "test_echo"),
         (3, "test_panic"),
