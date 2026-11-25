@@ -1,9 +1,10 @@
 name: macOS signing proof
 
 # Manual proof for Apple Developer ID signing and notarization on throwaway
-# macOS Rust builds. Runs only on workflow_dispatch on main, builds and
-# notarizes on macos-latest via GoReleaser snapshot mode, uploads the signed
-# binaries as a 1-day artifact for verification, and never publishes a release.
+# macOS Rust builds. Runs only on workflow_dispatch on main. Compilation runs
+# without credentials; signing and notarization run on macos-latest in the
+# `release` environment without Cargo; native verification runs separately
+# without credentials. Uploads 1-day artifacts and never publishes a release.
 on:
   workflow_dispatch:
 
@@ -14,17 +15,28 @@ concurrency:
   group: macos-signing-proof
   cancel-in-progress: false
 
+env:
+  GORELEASER_VERSION: v2.20.0
+  GORELEASER_SHA256_DARWIN_ARM64: 9988202381824b763c95422cbcff82b86060dfde891436242f5184974c8cfd04
+
 jobs:
-  sign:
-    name: Build, sign and notarize throwaway macOS binaries
+  build:
+    name: Build throwaway unsigned macOS binaries
     if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     permissions:
       contents: read
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
+      - name: Verify exact repository and main ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
+          test "$GITHUB_REF" = "refs/heads/main"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -38,26 +50,67 @@ jobs:
 
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
-          tool: cargo-zigbuild@0.24.1
+          tool: cargo-zigbuild@0.24.1,cargo-auditable@0.7.7
 
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
-          version: v2.20.0
+          version: ${{ env.GORELEASER_VERSION }}
           install-only: true
 
-      - name: Show toolchain versions
+      - name: Verify pinned goreleaser digest and show versions
         shell: bash
         run: |
           set -euo pipefail
+          test "$(uname -m)" = arm64
+          printf '%s  %s\n' "$GORELEASER_SHA256_DARWIN_ARM64" "$(command -v goreleaser)" | shasum -a 256 -c -
           cargo --version --verbose
           zig version
           cargo-zigbuild --version
           goreleaser --version
 
-      - name: Build, sign and notarize the macOS snapshot
+      - name: Build unsigned macOS snapshot binaries without credentials
         shell: bash
         env:
           PROXENOS_BUILD_GROUP: darwin
+        run: goreleaser build --snapshot --clean --parallelism=1
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: unsigned-macos-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/proxenos-darwin_x86_64-apple-darwin/proxenos
+            dist/proxenos-darwin_aarch64-apple-darwin/proxenos
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign and notarize throwaway macOS binaries
+    if: github.repository == 'mateusz-klatt/proxenos' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: macos-latest
+    environment: release
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Verify exact repository and main ref before signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/macos-unsigned
+
+      - name: Sign with Developer ID and notarize via Apple notarytool
+        shell: bash
+        env:
           MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
           MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
@@ -71,37 +124,76 @@ jobs:
               exit 1
             fi
           done
-          # Snapshot never publishes. --skip=sign skips cosign while leaving
-          # notarize.macos enabled.
-          goreleaser release --snapshot --clean --parallelism=1 --skip=sbom,sign,publish 2>&1 | tee "$RUNNER_TEMP/macos-signing-proof.log"
 
-      - name: Require Apple acceptance for both binaries
-        shell: bash
-        run: |
-          set -euo pipefail
+          cd "$RUNNER_TEMP/macos-unsigned"
+          test "$(find . -type f | LC_ALL=C sort)" = "$(printf '%s\n' ./proxenos-darwin_aarch64-apple-darwin/proxenos ./proxenos-darwin_x86_64-apple-darwin/proxenos)"
+
+          IDENTITY="Developer ID Application: Mateusz Klatt (26MP7QQP95)"
+          KEYCHAIN="$RUNNER_TEMP/proxenos-signing.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -hex 24)"
+          trap 'security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true' EXIT
+
           python3 - <<'PY'
+          import base64
           import os
           from pathlib import Path
-          import re
 
-          log = Path(os.environ["RUNNER_TEMP"], "macos-signing-proof.log").read_text()
-          log = re.sub(r"\x1b\[[0-9;]*m", "", log)
-          for target in ("proxenos-darwin_x86_64-apple-darwin", "proxenos-darwin_aarch64-apple-darwin"):
-              rel = Path("dist", target, "proxenos")
-              candidates = {str(rel), str(Path.cwd() / rel), str((Path.cwd() / rel).resolve())}
-              if not any(re.search(r"\bnotarized\s+binary=" + re.escape(c) + r"(?:\s|$)", log) for c in candidates):
-                  raise SystemExit(f"Missing Apple notarization acceptance for {rel}")
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-                  summary.write(f"Apple accepted notarization: `{rel}`\n\n")
+          p12 = Path(os.environ["RUNNER_TEMP"], "developer-id.p12")
+          p12.write_bytes(base64.b64decode(os.environ["MACOS_SIGN_P12"]))
+          os.chmod(p12, 0o600)
+
+          key = Path(os.environ["RUNNER_TEMP"], "AuthKey.p8")
+          key.write_bytes(base64.b64decode(os.environ["MACOS_NOTARY_KEY"]))
+          os.chmod(key, 0o600)
           PY
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/developer-id.p12" -P "$MACOS_SIGN_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN" | grep -F "$IDENTITY"
+
+          for target in proxenos-darwin_x86_64-apple-darwin proxenos-darwin_aarch64-apple-darwin; do
+            binary="$RUNNER_TEMP/macos-unsigned/$target/proxenos"
+            zip_path="$RUNNER_TEMP/notarize-${target}.zip"
+            notary_json="$RUNNER_TEMP/notary-${target}.json"
+            chmod +x "$binary"
+            codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" --sign "$IDENTITY" "$binary"
+            codesign --verify --strict --verbose=2 "$binary"
+            ditto -c -k --keepParent "$binary" "$zip_path"
+            xcrun notarytool submit "$zip_path" \
+              --key "$RUNNER_TEMP/AuthKey.p8" \
+              --key-id "$MACOS_NOTARY_KEY_ID" \
+              --issuer "$MACOS_NOTARY_ISSUER_ID" \
+              --wait \
+              --timeout 20m \
+              --output-format json > "$notary_json"
+            python3 - "$target" "$notary_json" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          target, json_path = sys.argv[1], Path(sys.argv[2])
+          data = json.loads(json_path.read_text())
+          status = data.get("status")
+          sub_id = data.get("id", "<unknown>")
+          if status != "Accepted":
+              raise SystemExit(f"Apple notarization did not accept {target}: status={status!r}, id={sub_id!r}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"Apple accepted notarization for `{target}` (submission `{sub_id}`)\n\n")
+          PY
+          done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload
         with:
           name: macos-signing-proof-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            dist/proxenos-darwin_x86_64-apple-darwin/proxenos
-            dist/proxenos-darwin_aarch64-apple-darwin/proxenos
+            ${{ runner.temp }}/macos-unsigned/proxenos-darwin_x86_64-apple-darwin/proxenos
+            ${{ runner.temp }}/macos-unsigned/proxenos-darwin_aarch64-apple-darwin/proxenos
           if-no-files-found: error
           retention-days: 1
 

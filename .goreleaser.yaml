@@ -1,10 +1,10 @@
 version: 2
 project_name: proxenos
 
-# D11: a version tag produces a draft GitHub release for the owner to publish.
-# Snapshots never publish. The release workflow splits macOS and Linux/Windows
-# across runners using PROXENOS_BUILD_GROUP and hands the macOS archives and
-# SBOMs into checksums and release upload through PROXENOS_MACOS_DIST.
+# D11: GoReleaser builds Proxenos with its Rust builder (cargo auditable zigbuild)
+# in credential-free jobs. Signing, notarization and release publication run in
+# separate jobs that never invoke Cargo. Snapshots use this config directly to
+# exercise all six targets, archives, Syft SBOMs and checksums with no secrets.
 release:
   draft: true
   prerelease: auto
@@ -15,6 +15,7 @@ builds:
   - id: proxenos-darwin
     builder: rust
     binary: proxenos
+    command: auditablezigbuild
     skip: '{{ eq (envOrDefault "PROXENOS_BUILD_GROUP" "all") "linux-windows" }}'
     targets:
       - x86_64-apple-darwin
@@ -22,10 +23,15 @@ builds:
     flags:
       - --release
       - --locked
+    env:
+      # Cargo expands this single-word alias to `cargo auditable zigbuild`,
+      # embedding target-specific crate metadata for Syft in every binary.
+      - CARGO_ALIAS_AUDITABLEZIGBUILD=auditable zigbuild
 
   - id: proxenos
     builder: rust
     binary: proxenos
+    command: auditablezigbuild
     skip: '{{ eq (envOrDefault "PROXENOS_BUILD_GROUP" "all") "darwin" }}'
     targets:
       - x86_64-unknown-linux-musl
@@ -36,39 +42,10 @@ builds:
       - --release
       - --locked
     env:
+      - CARGO_ALIAS_AUDITABLEZIGBUILD=auditable zigbuild
       # Zig's Windows ARM64 GNU wrapper does not add libunwind automatically from
       # rustc's --unwindlib=libunwind; link it explicitly for panic unwinding (D4).
       - CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS=-C link-arg=-lunwind
-    hooks:
-      post:
-        # On a real tag release, sign each Windows executable before archiving,
-        # checksumming and cosign. Snapshots stay unsigned. No secret value is
-        # templated into argv; the child receives only the five allowlisted
-        # environment variables and no standard I/O.
-        - cmd: |-
-            {{ if and (eq .Os "windows") (not .IsSnapshot) -}}
-            python3 -c '
-            import os, stat, subprocess, sys
-            path = sys.argv[1]
-            signer = os.environ.get("PROXENOS_WINDOWS_SIGNER", "")
-            runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
-            if not (os.path.isabs(signer) and os.path.isabs(runtime_dir) and os.environ.get("CERTUM_EMAIL") and os.environ.get("CERTUM_OTP")):
-                sys.exit("Windows signing configuration is incomplete")
-            if not (not os.path.islink(signer) and not os.path.islink(path) and stat.S_ISREG(os.stat(signer).st_mode) and stat.S_ISREG(os.stat(path).st_mode)):
-                sys.exit("Windows signing input is unavailable")
-            os.chmod(signer, 0o700)
-            cache_dir = os.path.join(runtime_dir, "ssign")
-            os.makedirs(cache_dir, mode=0o700, exist_ok=True)
-            os.chmod(cache_dir, 0o700)
-            env = {k: os.environ.get(k, "") for k in ("CERTUM_EMAIL", "CERTUM_OTP", "XDG_RUNTIME_DIR", "HOME", "PATH")}
-            try:
-                res = subprocess.run([signer, path], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
-            except subprocess.TimeoutExpired:
-                sys.exit("Windows signing deadline exceeded")
-            if res.returncode != 0:
-                sys.exit("Windows signing failed")
-            ' "{{ .Path }}"
-            {{- end }}
 
 archives:
   - id: proxenos
@@ -97,23 +74,6 @@ archives:
           mtime: '{{ .CommitDate }}'
       - src: NOTICE
         info: *fixed
-
-# Developer ID signing and Apple notarization. Disabled when MACOS_SIGN_P12 is
-# unset or empty, so local and PR snapshots run without credentials.
-notarize:
-  macos:
-    - ids:
-        - proxenos-darwin
-      enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
-      sign:
-        certificate: '{{ .Env.MACOS_SIGN_P12 }}'
-        password: '{{ envOrDefault "MACOS_SIGN_PASSWORD" "" }}'
-      notarize:
-        issuer_id: '{{ envOrDefault "MACOS_NOTARY_ISSUER_ID" "" }}'
-        key_id: '{{ envOrDefault "MACOS_NOTARY_KEY_ID" "" }}'
-        key: '{{ envOrDefault "MACOS_NOTARY_KEY" "" }}'
-        wait: true
-        timeout: 20m
 
 checksum:
   name_template: checksums.txt
