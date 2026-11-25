@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 
 pub const WAIT: Duration = Duration::from_secs(10);
 
+/// Longer than the server's own ten-second limit after the end of its input.
+pub const EXIT_WAIT: Duration = Duration::from_secs(30);
+
 pub const NEW_VERSION: &str = "2026-07-28";
 
 /// The per-request `_meta` of the 2026-07-28 revision.
@@ -179,7 +182,7 @@ impl Server {
     pub fn finish(&mut self) -> (ExitStatus, Duration) {
         self.close_input();
         let started = Instant::now();
-        let deadline = started + WAIT;
+        let deadline = started + EXIT_WAIT;
         loop {
             if let Some(status) = self.child.try_wait().expect("the child can be waited on") {
                 let took = started.elapsed();
@@ -200,7 +203,7 @@ impl Drop for Server {
     /// itself and writes its coverage data. It is killed only if it does not exit in time.
     fn drop(&mut self) {
         self.close_input();
-        let deadline = Instant::now() + WAIT;
+        let deadline = Instant::now() + EXIT_WAIT;
         while Instant::now() < deadline {
             if let Ok(Some(_)) = self.child.try_wait() {
                 return;
