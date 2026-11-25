@@ -616,11 +616,12 @@ startup, and Windows SmartScreen.
   name is killed with SIGKILL during exec while macOS AppleSystemPolicy is evaluating it. Which
   component sends the signal was not determined. It was measured on 2026-11-25 at
   14 to 21 failing runs in 30 to 50, with the stub unsigned or signed ad hoc, and was not
-  reproduced outside `cargo test`. Proxenos does send SIGKILL, but only when it stops a child after
-  a deadline or a cancellation, which ends as `timed_out` or `cancelled`, and when it clears a
-  group whose leader has already exited. Neither applies to these failures: the stub died 3 to
-  561 ms after spawn, as `exited` with signal 9, well before any deadline. Adding the terminal to System Settings → Privacy & Security →
-  Developer Tools is expected to stop the evaluation, but that is not yet measured. CI on arm64
+  reproduced outside `cargo test`. Proxenos does send SIGKILL in three cases: when it stops a child
+  after a deadline or a cancellation, which ends as `timed_out` or `cancelled`; when it clears a
+  group whose leader has already exited; and when a supervision is abandoned, which returns no
+  result at all. None of these applies to the failures: the stub died 3 to 561 ms after spawn, as
+  `exited` with signal 9, well before any deadline. Adding the terminal to System Settings →
+  Privacy & Security → Developer Tools is expected to stop the evaluation, but that is not yet measured. CI on arm64
   macOS is unaffected. Tests that expect a failure assert its kind, so an unexpected kill cannot
   pass as an expected failure.
 
