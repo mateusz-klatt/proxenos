@@ -6,7 +6,9 @@ changes it. [ADR 001](adr/001-decisions-by-the-families-that-can-answer.md) says
 taken, and [votes.md](votes.md) records who proposed and who supported each one.
 
 **Status: milestone 1 in progress.** `proxenos mcp --client <client>` serves the MCP layer of D4.
-Codex and Antigravity run through the D6 supervisor. Behavioural tests install the crate’s stub
+Codex and Antigravity run through the D6 supervisor with D17 background delegations (`wait: false`,
+`await`, `cancel`, at most 3 concurrent delegations), D18 resource accounting and optional memory
+limits, and D19 persisted session settings files. Behavioural tests install the crate’s stub
 in a private search path.
 The remaining decisions describe the design.
 
@@ -61,7 +63,7 @@ snake_case:
 | `mode` | `advisory` or `implementation`. It adds a sentence of instruction. It is advice to the provider, never a permission. |
 | `instructions` | Free text from the caller, added after the role. |
 | `access` | `full` or `read-only`. What `read-only` enforces differs by provider and is stated in each tool's schema. |
-| `cwd`, `model`, `effort`, `timeout_ms` | As named. Which of them a provider accepts differs. |
+| `cwd`, `model`, `effort`, `timeout_ms`, `memory_limit_bytes` | As named. Which of `cwd`, `model` and `effort` a provider accepts differs. `memory_limit_bytes` is optional, with no limit by default (D18). |
 | `thread_id` | On a reply: the session to continue. The reply inherits the settings of its start (D19). |
 | `wait` | `true` by default. With `false` a call that is admitted returns a handle at once (D17). |
 | `coordination` | Optional progress reporting through Iris (D16). |
@@ -661,12 +663,15 @@ except in the platform modules of D6.
 Role texts are written for Proxenos, model-neutral, one per role. A call may also name no role and
 carry only `instructions`.
 
-The first three to ship are the code reviewer, the debugger and the claim verifier, as the owner
-accepted on 2026-11-25. The rest of the roster is not decided. Three families, in four answers,
-agreed in vote 2 on code review, debugging, verification of claims, architecture, security and plan
-review, and on a redesigned cross-discipline role. The strongest model of each family would ship the
-code reviewer, the debugger and the claim verifier first. They did not agree on a scope analyst, a
-challenger or a separate test role.
+Owner decision (2026-11-25): roles move to v0.2. In v0.1 the caller supplies the instructions, so
+Proxenos ships no role texts and exposes no `expert` parameter yet.
+
+When roles ship in v0.2, the first three are the code reviewer, the debugger and the claim
+verifier, as the owner accepted on 2026-11-25. The rest of the roster is not decided. Three
+families, in four answers, agreed in vote 2 on code review, debugging, verification of claims,
+architecture, security and plan review, and on a redesigned cross-discipline role. The strongest
+model of each family would ship the code reviewer, the debugger and the claim verifier first. They
+did not agree on a scope analyst, a challenger or a separate test role.
 
 A role's text says what `implementation` allows it, and tells a role whose worth is its
 independence, such as one that verifies a claim, to stay advisory. That is an instruction: under
@@ -712,12 +717,16 @@ opaque, that puts the whole answer into the context, and that dies with the sess
   a queue would add a state that a handle does not have, and a wait that the caller cannot see.
 
 The refusal follows the count over votes 3 and 6: eight of nine positions chose it, and one a
-short queue. The 20 seconds are provisional, taken by Claude (Fable 5.2, max) on the count of vote
-6. Four positions chose 20 seconds. Gemini (Hydrogen) proposed 45 by default and at most 60,
-Gemini (Argon) 55 by default and at most 120, DeepSeek 60, and Gemini (Carbon) and Zhipu up to
-120. The limit starts at the low end because a longer wait can run past the limit that a client
-is configured with for one call. The shortest default that a client's documentation gives is 60
-seconds.
+short queue. Owner decision (2026-11-25): `await` waits up to 20 seconds; this limit is now final.
+Earlier, vote 6 had four positions for 20 seconds alongside longer proposals from 45 to 120 seconds,
+starting at the low end because a longer wait can run past the limit that a client is configured
+with for one call (the shortest default that a client's documentation gives is 60 seconds).
+
+In milestone 1 step 4, finished background results are retained in process memory up to 16 results,
+1 MiB of serialized result JSON (keeping at least the newest terminal result), and 30 minutes.
+Opaque handles are UUIDs valid only in the creating server process. On server shutdown (end of
+stdin or transport failure), running background delegations receive the server's shutdown token and
+drain inside D4's ten-second shutdown limit.
 
 What this cannot do: when the server exits, its handles and the results it held are gone. Nothing
 reliably wakes a client that does not call `await`: an Iris message that a provider has finished
@@ -740,14 +749,21 @@ time of each delegation and returns them with the result, saying how they were m
 the job on Windows, samples of the supervised process group on Linux and macOS.
 
 - **Windows**: the job object of D6 reports the peak of committed memory and the CPU time of the
-  job. With a limit set, the system refuses an allocation that would exceed it. The CLI may fail
-  on that refusal or carry on.
-- **Linux and macOS**: the processes of the supervised process group are sampled. Samples can
-  miss a peak, a short-lived child, and a descendant that has left the group. With a limit set, a
-  sample above it starts the stop that D6 describes. That is a threshold checked between samples,
-  not a ceiling.
+  job (`windows_job_totals`, read via `QueryInformationJobObject`). With `memory_limit_bytes` set,
+  Proxenos sets `JOB_OBJECT_LIMIT_JOB_MEMORY` on the job and observes
+  `JOB_OBJECT_MSG_JOB_MEMORY_LIMIT` via an associated completion port. The system refuses an
+  allocation that would exceed the limit; the CLI may fail on that refusal (reported as
+  `memory_limit`) or carry on.
+- **Linux and macOS**: the processes of the supervised process group are sampled every 50 ms
+  (`linux_proc_group_sample` from `/proc/<pid>/stat` RSS pages and CPU ticks on Linux;
+  `macos_proc_group_sample` from `proc_listpgrppids` and `proc_pidinfo(PROC_PIDTASKINFO)` scaled
+  with `mach_timebase_info` on macOS). Samples can miss a brief peak, a short-lived child, and a
+  descendant that has left the group. On macOS only the first 4096 members of the group are
+  sampled. With `memory_limit_bytes` set, a sample above it starts the
+  stop that D6 describes and reports `memory_limit`. That is a threshold checked between samples,
+  not a hard allocation ceiling.
 
-No memory limit applies unless the user sets one.
+No memory limit applies unless the caller sets `memory_limit_bytes`.
 
 ### D19. A session remembers how it was started
 
@@ -757,30 +773,47 @@ reapplies what it passed at the start. Which model actually ran is what the prov
 With claude-delegator each provider needed different settings repeated, and a forgotten one
 silently changed the model.
 
-Where the start passed no model (D8), there is none to reapply. Not decided: what a reply does
-when it must name a model (D5) and its start passed none. It could repeat the model that the
-provider reported for the start, where the provider reported one, or ask the caller for one.
-ADR 002 opened this question, and neither a voter nor the owner has answered it.
+Where the start passed no model (D8), there is none to reapply. Owner decision (2026-11-25): if
+the start named no model and the reply must name one (D5), the reply repeats the model the provider
+reported at the start. If the provider reported none, the reply is refused with a request for a
+model. Proxenos never guesses a model.
 
 The settings of a session are kept in a file in the user's state directory, without secrets, for a
-limited time. When a session is not found there, Proxenos asks for the settings and supplies no
-defaults of its own. It cannot check that the settings a caller then gives match the forgotten
-start. A reply may change the mode where the CLI accepts it. Codex keeps the start's developer
-instructions, including its mode, for the session. Proxenos refuses a change before dispatch.
+limited time (7 days in milestone 1 step 4). When a session is not found there or has expired,
+Proxenos asks for the settings and supplies no defaults of its own. It cannot check that the
+settings a caller then gives match the forgotten start. A reply may change the mode where the CLI
+accepts it. Codex keeps the start's developer instructions, including its mode, for the session.
+Proxenos refuses a change before dispatch.
 
-At milestone 1 step 3 the server remembers confirmed, successful starts only in a bounded
-in-memory store (at most 1024 entries, evicting the oldest entry first). Restarting the server
-loses that continuity, and a reply to an evicted session must supply its directory, access, mode
-and any optional settings used at the start, just like after a restart. `timeout_ms` is
-initialized per request and is never inherited by a reply. If two confirmed starts report the
-same `thread_id` with conflicting settings, the server marks that ID ambiguous and refuses to
-dispatch a reply from it. Proxenos cannot verify explicit reply settings against a forgotten or
-evicted start. Pending the owner decision above, an Antigravity reply with no remembered start
-model must supply a model explicitly. Proxenos never infers one from provider output.
+In milestone 1 step 4, the server pairs its bounded in-memory `StartStore` cache (at most 1024
+entries, evicting the oldest entry first) with durable session files on disk. Both record only
+confirmed, successful starts; failed or unconfirmed starts are ignored. `timeout_ms` is initialized
+per request on the turn and is never stored or inherited by a reply. A reply looks up `(provider,
+thread_id)` in `StartStore` first and falls back to the durable session file on a cache miss (such
+as after a server restart or cache eviction), populating the cache on a hit. If two confirmed starts
+report the same `thread_id` with conflicting settings—either in the same server process or across a
+restart—Proxenos marks that ID ambiguous in both `StartStore` and the session file and refuses
+replies for it, even after a restart.
+
+Session files hold versioned, typed JSON (`schema_version: 1`, unknown fields rejected) keyed by
+provider and a SHA-256-encoded thread ID under `$XDG_STATE_HOME/proxenos/sessions` (or
+`~/.local/state/proxenos/sessions`) on Linux, `~/Library/Application Support/proxenos/sessions` on
+macOS, and `%LOCALAPPDATA%\proxenos\sessions` on Windows. Each file stores only the save timestamp,
+an `ambiguous` flag, and for non-ambiguous entries validated start settings (`cwd`, `mode`,
+`access`, `model`, `effort`) and any validated start model the provider reported. It never stores
+the prompt, the instructions text, the environment, `timeout_ms`, or the provider's answer. Files
+are written atomically with mode `0600` in `0700` directories on Unix, and loaded with bounded
+reads without following symlinks. A corrupt, oversized, non-regular, or unreadable session file
+fails closed before discovery or launch and executes nothing from the file. Because `instructions`
+text is never persisted to disk, a reply served from the file after a server restart or cache
+eviction does not reapply start `instructions` text; within the same server process while cached in
+`StartStore`, start instructions remain available in memory only. Proxenos cannot verify explicit
+reply settings supplied for a forgotten or expired start.
 
 The file was a provisional choice of vote 4, where one reviewer would keep the settings only in
 the server's memory, and vote 6 backed it: eight of nine positions are for a file. How long it is
-kept is not fixed: three positions named seven days, and one 24 hours without use.
+kept is not fixed long-term: three positions named seven days, and one 24 hours without use; step 4
+uses seven days.
 
 ## 3. Later, and not at all
 

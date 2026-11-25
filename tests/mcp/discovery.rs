@@ -28,7 +28,7 @@ fn listed(server: &mut Server) -> Vec<String> {
         .unwrap()
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
-        .filter(|name| !name.starts_with("test_"))
+        .filter(|name| !name.starts_with("test_") && !matches!(*name, "await" | "cancel"))
         .map(str::to_owned)
         .collect()
 }
@@ -296,7 +296,7 @@ fn discovery_waits_are_bounded_by_each_callers_deadline_and_cancellation() {
         .unwrap()
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
-        .filter(|name| !name.starts_with("test_"))
+        .filter(|name| !name.starts_with("test_") && !matches!(*name, "await" | "cancel"))
         .collect();
     assert_eq!(tools, ["antigravity", "antigravity-reply"]);
 

@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::background::{self, Background};
 use crate::client::Client;
 use crate::discovery::Discovery;
 use crate::mcp::{Activity, Service, ToolOutcome, ToolSpec, UnknownTool};
-use crate::providers::{self, Settings};
+use crate::providers::{self, RememberedStart};
 
 const MAX_STARTS: usize = 1024;
 
@@ -25,10 +26,11 @@ fn start_limit() -> usize {
     MAX_STARTS
 }
 
-/// Bounded in-memory D19 session map. `Some(settings)` remembers a unique confirmed start;
-/// `None` marks a conflicting duplicate ID. Oldest entries are evicted past `limit`.
+/// Bounded in-memory D19 cache in front of the durable session files. `Some(start)` caches a
+/// unique confirmed start (including non-persisted in-memory instructions); `None` marks a
+/// conflicting duplicate ID. Oldest entries are evicted past `limit`.
 pub struct StartStore {
-    entries: HashMap<(&'static str, String), Option<Settings>>,
+    entries: HashMap<(&'static str, String), Option<RememberedStart>>,
     order: VecDeque<(&'static str, String)>,
     limit: usize,
 }
@@ -42,24 +44,43 @@ impl StartStore {
         }
     }
 
-    pub fn get(&self, provider: &'static str, id: &str) -> Option<&Option<Settings>> {
+    pub fn get(&self, provider: &'static str, id: &str) -> Option<&Option<RememberedStart>> {
         self.entries.get(&(provider, id.into()))
     }
 
-    pub fn record(&mut self, provider: &'static str, id: String, settings: Settings) {
-        let key = (provider, id);
-        if let Some(slot) = self.entries.get_mut(&key) {
-            if slot.as_ref() != Some(&settings) {
-                *slot = None;
-            }
-            return;
-        }
+    fn insert(&mut self, key: (&'static str, String), value: Option<RememberedStart>) {
         if self.entries.len() == self.limit {
             let oldest = self.order.pop_front().expect("bounded store is non-empty");
             self.entries.remove(&oldest);
         }
         self.order.push_back(key.clone());
-        self.entries.insert(key, Some(settings));
+        self.entries.insert(key, value);
+    }
+
+    pub fn cache(&mut self, provider: &'static str, id: String, value: Option<RememberedStart>) {
+        let key = (provider, id);
+        if let Some(slot) = self.entries.get_mut(&key) {
+            *slot = value;
+            return;
+        }
+        self.insert(key, value);
+    }
+
+    pub fn record(
+        &mut self,
+        provider: &'static str,
+        id: String,
+        remembered: RememberedStart,
+    ) -> Option<RememberedStart> {
+        let key = (provider, id);
+        if let Some(slot) = self.entries.get_mut(&key) {
+            if slot.as_ref() != Some(&remembered) {
+                *slot = None;
+            }
+            return slot.clone();
+        }
+        self.insert(key, Some(remembered.clone()));
+        Some(remembered)
     }
 }
 
@@ -68,6 +89,7 @@ pub struct Registry {
     pub discovery: Discovery,
     pub answers: crate::envelope::AnswerArchive,
     pub starts: Mutex<StartStore>,
+    pub background: Arc<Background>,
 }
 
 impl Registry {
@@ -75,8 +97,9 @@ impl Registry {
         Self {
             client,
             discovery: Discovery::new(client),
-            starts: Mutex::new(StartStore::new()),
             answers: Default::default(),
+            starts: Mutex::new(StartStore::new()),
+            background: Background::new(),
         }
     }
 }
@@ -91,6 +114,7 @@ impl Service for Registry {
         {
             tools.extend([provider.tool(false), provider.tool(true)]);
         }
+        tools.extend(background::tool_specs());
         tools
     }
 
@@ -101,6 +125,12 @@ impl Service for Registry {
         cancel: CancellationToken,
         activity: Activity,
     ) -> Result<ToolOutcome, UnknownTool> {
+        if name == "await" {
+            return Ok(self.background.call_await(&arguments, &cancel).await);
+        }
+        if name == "cancel" {
+            return Ok(self.background.call_cancel(&arguments));
+        }
         let bare = name.strip_suffix("-reply").unwrap_or(&name);
         if let Some(provider) = providers::ALL
             .iter()
@@ -264,6 +294,7 @@ mod test_tools {
                 .collect(),
             deadline: started
                 + Duration::from_millis(millis(arguments, "deadline_ms").unwrap_or(0)),
+            memory_limit_bytes: None,
             capture_limit: usize::try_from(millis(arguments, "capture_limit").unwrap_or(0))
                 .unwrap_or(usize::MAX),
             temporary_files,

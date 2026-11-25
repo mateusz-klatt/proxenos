@@ -255,6 +255,7 @@ async fn probe(
         env_set: crate::delegation::env_set(),
         env_remove: crate::delegation::env_remove(),
         deadline: deadline.map_or(limit, |call| call.min(limit)),
+        memory_limit_bytes: None,
         capture_limit: 2048,
         temporary_files: Vec::new(),
     };

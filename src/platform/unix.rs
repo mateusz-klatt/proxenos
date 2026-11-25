@@ -1,12 +1,15 @@
-//! A session per child, with its leader's PID reserved until the final group signal.
+//! A session per child, with its leader's PID reserved until the final group signal,
+//! and periodic process-group sampling for D18 accounting and optional memory thresholds.
 #![allow(unsafe_code)]
 
+use std::collections::HashMap;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::pin::pin;
 use std::process::{Child as NativeChild, Command, ExitStatus};
-use std::sync::{Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -17,10 +20,85 @@ use tokio::sync::oneshot;
 use super::session;
 use crate::mcp::Activity;
 use crate::supervise::cleanup::{TemporaryFile, remove_files_blocking};
-use crate::supervise::{StartError, finish_reap};
+use crate::supervise::{Accounting, StartError, finish_reap};
 
 const GRACE: Duration = Duration::from_secs(3);
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 static SPAWNING: Mutex<()> = Mutex::new(());
+
+#[cfg(target_os = "linux")]
+const METHOD: &str = "linux_proc_group_sample";
+#[cfg(target_os = "macos")]
+const METHOD: &str = "macos_proc_group_sample";
+
+const CAVEATS: &[&str] = &[
+    "Values come from periodic samples of the supervised process group; sampling can miss brief peaks, short-lived children, and descendants that leave the process group.",
+    "A memory limit is a sampled threshold that triggers a D6 stop, not a hard allocation ceiling.",
+];
+
+pub fn empty_accounting(memory_limit_bytes: Option<u64>) -> Accounting {
+    Accounting {
+        method: METHOD,
+        caveats: CAVEATS,
+        memory_limit_bytes,
+        peak_memory_bytes: None,
+        cpu_time_ms: None,
+        samples: Some(0),
+        memory_limit_exceeded: false,
+    }
+}
+
+struct UnixAccounting {
+    memory_limit_bytes: Option<u64>,
+    samples: u64,
+    peak_memory_bytes: Option<u64>,
+    cpu_ms_by_pid: HashMap<libc::pid_t, u64>,
+    memory_limit_exceeded: bool,
+}
+
+impl UnixAccounting {
+    fn new(memory_limit_bytes: Option<u64>) -> Self {
+        Self {
+            memory_limit_bytes,
+            samples: 0,
+            peak_memory_bytes: None,
+            cpu_ms_by_pid: HashMap::new(),
+            memory_limit_exceeded: false,
+        }
+    }
+
+    fn record(&mut self, rows: Vec<(libc::pid_t, u64, u64)>, check_limit: bool) -> bool {
+        self.samples += 1;
+        let mut rss = 0_u64;
+        for &(pid, mem, cpu_ms) in &rows {
+            rss = rss.saturating_add(mem);
+            self.cpu_ms_by_pid.insert(pid, cpu_ms);
+        }
+        self.peak_memory_bytes = (!rows.is_empty())
+            .then(|| self.peak_memory_bytes.unwrap_or(0).max(rss))
+            .or(self.peak_memory_bytes);
+        self.memory_limit_exceeded |=
+            check_limit && self.memory_limit_bytes.is_some_and(|limit| rss > limit);
+        self.memory_limit_exceeded
+    }
+
+    fn snapshot(&self) -> Accounting {
+        let cpu_time_ms = (!self.cpu_ms_by_pid.is_empty()).then(|| {
+            self.cpu_ms_by_pid
+                .values()
+                .fold(0_u64, |acc, &ms| acc.saturating_add(ms))
+        });
+        Accounting {
+            method: METHOD,
+            caveats: CAVEATS,
+            memory_limit_bytes: self.memory_limit_bytes,
+            peak_memory_bytes: self.peak_memory_bytes,
+            cpu_time_ms,
+            samples: Some(self.samples),
+            memory_limit_exceeded: self.memory_limit_exceeded,
+        }
+    }
+}
 
 struct Leader {
     process: NativeChild,
@@ -34,6 +112,7 @@ pub struct Child {
     reap: mpsc::Sender<Leader>,
     status: oneshot::Receiver<io::Result<ExitStatus>>,
     cleaned: oneshot::Receiver<()>,
+    accounting: Arc<Mutex<UnixAccounting>>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
 }
@@ -41,6 +120,7 @@ pub struct Child {
 pub fn spawn(
     mut command: Command,
     files: &mut Vec<TemporaryFile>,
+    memory_limit_bytes: Option<u64>,
     activity: Activity,
     before_spawn: impl FnOnce() -> Result<(), StartError>,
 ) -> Result<Child, StartError> {
@@ -105,18 +185,40 @@ pub fn spawn(
         reap,
         status,
         cleaned,
+        accounting: Arc::new(Mutex::new(UnixAccounting::new(memory_limit_bytes))),
         stdout: Some(stdout),
         stderr: Some(stderr),
     })
 }
 
 impl Child {
-    /// Observe exit without reaping so that the final group signal still targets our group.
+    /// Observe exit without reaping so that the final group signal still targets our group,
+    /// while periodically sampling the supervised process group for D18.
     pub async fn wait_for_exit(&mut self) -> io::Result<()> {
-        while !self.exited()? {
-            self.changes.recv().await;
+        {
+            let pid = self.pid;
+            let accounting = Arc::clone(&self.accounting);
+            let mut exit = pin!(async {
+                while !self.exited()? {
+                    self.changes.recv().await;
+                }
+                Ok::<(), io::Error>(())
+            });
+            let mut monitor = pin!(async move {
+                loop {
+                    if sample_once(pid, &accounting, true).await {
+                        return;
+                    }
+                    tokio::time::sleep(SAMPLE_INTERVAL).await;
+                }
+            });
+            tokio::select! {
+                biased;
+                result = &mut exit => return result,
+                () = &mut monitor => (),
+            }
         }
-        Ok(())
+        self.stop().await
     }
 
     fn exited(&self) -> io::Result<bool> {
@@ -168,10 +270,17 @@ impl Child {
             .expect("reaper waits for this leader");
     }
 
-    pub async fn finish(mut self) -> io::Result<ExitStatus> {
+    pub async fn finish(mut self) -> io::Result<(ExitStatus, Accounting)> {
+        let _ = sample_once(self.pid, &self.accounting, false).await;
         self.signal(libc::SIGKILL)?;
         self.release();
-        finish_reap(&mut self.status, &mut self.cleaned).await
+        let status = finish_reap(&mut self.status, &mut self.cleaned).await?;
+        let accounting = self
+            .accounting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot();
+        Ok((status, accounting))
     }
 }
 
@@ -186,4 +295,111 @@ impl Drop for Child {
 
 pub fn exit_signal(status: &ExitStatus) -> Option<i32> {
     status.signal()
+}
+
+async fn sample_once(
+    pid: libc::pid_t,
+    state: &Arc<Mutex<UnixAccounting>>,
+    check_limit: bool,
+) -> bool {
+    let rows = tokio::task::spawn_blocking(move || sample_pgrp(pid))
+        .await
+        .expect("accounting sampler finished");
+    state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .record(rows, check_limit)
+}
+
+#[cfg(target_os = "linux")]
+fn sample_pgrp(pgrp: libc::pid_t) -> Vec<(libc::pid_t, u64, u64)> {
+    // SAFETY: sysconf takes only a POSIX constant and has no memory safety requirements.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+    // SAFETY: sysconf takes only a POSIX constant and has no memory safety requirements.
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let pid = entry.file_name().to_str()?.parse::<libc::pid_t>().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let (rss_pages, ticks) = parse_linux_stat(&stat, pgrp)?;
+            Some((
+                pid,
+                rss_pages.saturating_mul(page_size),
+                ticks.saturating_mul(1000) / ticks_per_sec,
+            ))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_stat(stat: &str, pgrp: libc::pid_t) -> Option<(u64, u64)> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_ascii_whitespace();
+    let group: libc::pid_t = fields.nth(2)?.parse().ok()?;
+    if group != pgrp {
+        return None;
+    }
+    let utime: u64 = fields.nth(8)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    let rss_pages: u64 = fields.nth(8)?.parse().ok()?;
+    Some((rss_pages, utime.saturating_add(stime)))
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+}
+
+/// How many members of a process group are sampled on macOS.
+#[cfg(target_os = "macos")]
+const PGRP_SAMPLE_PIDS: usize = 4096;
+
+#[cfg(target_os = "macos")]
+fn sample_pgrp(pgrp: libc::pid_t) -> Vec<(libc::pid_t, u64, u64)> {
+    let mut timebase = MachTimebaseInfo { numer: 1, denom: 1 };
+    // SAFETY: timebase points to valid writable storage matching mach_timebase_info_data_t.
+    let _ = unsafe { mach_timebase_info(&raw mut timebase) };
+    let numer = u128::from(timebase.numer.max(1));
+    let denom = u128::from(timebase.denom.max(1));
+    // A fixed buffer: libproc's size query with a null buffer does not report the size of this
+    // group. A group of more than PGRP_SAMPLE_PIDS processes is sampled only in part.
+    let mut pids = vec![0 as libc::pid_t; PGRP_SAMPLE_PIDS];
+    let buf_bytes = (pids.len() * size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: pids is writable storage of exactly buf_bytes bytes.
+    let filled = unsafe { libc::proc_listpgrppids(pgrp, pids.as_mut_ptr().cast(), buf_bytes) };
+    // proc_listpgrppids returns a count of PIDs, not of bytes (measured on macOS 26).
+    pids.truncate((filled.max(0) as usize).min(pids.len()));
+    pids.into_iter()
+        .filter_map(|pid| {
+            let mut info = MaybeUninit::<libc::proc_taskinfo>::zeroed();
+            let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
+            // SAFETY: info points to valid writable storage of `size` bytes for PROC_PIDTASKINFO.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTASKINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            (got == size).then(|| {
+                // SAFETY: proc_pidinfo wrote a complete proc_taskinfo struct.
+                let info = unsafe { info.assume_init() };
+                let cpu_ticks = u128::from(info.pti_total_user) + u128::from(info.pti_total_system);
+                let cpu_ms = ((cpu_ticks * numer / denom) / 1_000_000) as u64;
+                (pid, info.pti_resident_size, cpu_ms)
+            })
+        })
+        .collect()
 }
