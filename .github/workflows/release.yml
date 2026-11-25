@@ -991,7 +991,7 @@ jobs:
               bin_bytes = bin_path.read_bytes()
               with archive_path.open("wb") as raw:
                   with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=commit_ts) as gz:
-                      with tarfile.open(fileobj=gz, mode="w") as tf:
+                      with tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tf:
                           for name, data, mode in (
                               ("LICENSE", license_bytes, 0o644),
                               ("NOTICE", notice_bytes, 0o644),
@@ -1137,6 +1137,8 @@ jobs:
               if hashes.get(name) != archive_sha:
                   raise SystemExit(f"{name}: checksum mismatch against checksums.txt")
               with tarfile.open(archive_path, "r:gz") as tf:
+                  if tf.pax_headers:
+                      raise SystemExit(f"{name}: unexpected archive PAX headers {tf.pax_headers!r}")
                   members = tf.getmembers()
                   names = [m.name for m in members]
                   if sorted(names) != ["LICENSE", "NOTICE", "proxenos"] or len(names) != 3:
@@ -1144,6 +1146,7 @@ jobs:
                   for m in members:
                       if (
                           not m.isfile()
+                          or m.pax_headers
                           or m.size > max_member_bytes
                           or (m.mode & 0o7000) != 0
                           or m.mode != expected_tar_modes[m.name]
@@ -1154,7 +1157,7 @@ jobs:
                       ):
                           raise SystemExit(
                               f"{name}: invalid member metadata or size for {m.name} "
-                              f"(mode={oct(m.mode)}, uid={m.uid}, gid={m.gid}, uname={m.uname!r}, gname={m.gname!r})"
+                              f"(mode={oct(m.mode)}, uid={m.uid}, gid={m.gid}, uname={m.uname!r}, gname={m.gname!r}, pax={m.pax_headers!r})"
                           )
                   f = tf.extractfile(tf.getmember("proxenos"))
                   assert f is not None
@@ -1504,6 +1507,8 @@ jobs:
           }
           for archive_name, expected_bin_sha in tar_expectations.items():
               with tarfile.open(bundle / archive_name, "r:gz") as tf:
+                  if tf.pax_headers:
+                      raise SystemExit(f"{archive_name}: unexpected archive PAX headers {tf.pax_headers!r}")
                   members = tf.getmembers()
                   names = [m.name for m in members]
                   if len(names) != 3 or sorted(names) != ["LICENSE", "NOTICE", "proxenos"]:
@@ -1511,6 +1516,7 @@ jobs:
                   for m in members:
                       if (
                           not m.isfile()
+                          or m.pax_headers
                           or m.size > max_member_bytes
                           or (m.mode & 0o7000) != 0
                           or m.mode != expected_tar_modes[m.name]
@@ -1521,7 +1527,7 @@ jobs:
                       ):
                           raise SystemExit(
                               f"{archive_name}: invalid member metadata or size for {m.name} "
-                              f"(mode={oct(m.mode)}, uid={m.uid}, gid={m.gid}, uname={m.uname!r}, gname={m.gname!r})"
+                              f"(mode={oct(m.mode)}, uid={m.uid}, gid={m.gid}, uname={m.uname!r}, gname={m.gname!r}, pax={m.pax_headers!r})"
                           )
                   f = tf.extractfile(tf.getmember("proxenos"))
                   if f is None:
@@ -1655,6 +1661,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I - "$RUNNER_TEMP/release-bundle" <<'PY'
+          import hashlib
           import json
           import os
           from pathlib import Path
@@ -1746,14 +1753,27 @@ jobs:
               raise SystemExit(f"Release {release_id} failed pre-upload draft verification")
 
           # 4. Upload all 14 verified files directly to the numeric draft release ID.
+          expected_digests = {}
           for name in expected_names:
+              data = (bundle / name).read_bytes()
+              expected_digests[name] = f"sha256:{hashlib.sha256(data).hexdigest()}"
               upload_url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={urllib.parse.quote(name)}"
-              api_request("POST", upload_url, data=(bundle / name).read_bytes(), content_type="application/octet-stream")
+              api_request("POST", upload_url, data=data, content_type="application/octet-stream")
 
-          # 5. Confirm the release is still a draft with all 14 assets attached.
+          # 5. Confirm the release is still a draft with all 14 expected assets and digests attached.
           final = api_request("GET", f"{api_base}/repos/{repo}/releases/{release_id}")
-          if final.get("draft") is not True or len(final.get("assets", [])) != 14:
+          final_assets = final.get("assets", [])
+          actual_digests = {a.get("name"): a.get("digest") for a in final_assets}
+          if (
+              final.get("draft") is not True
+              or final.get("prerelease") is not is_prerelease
+              or len(final_assets) != 14
+              or actual_digests != expected_digests
+          ):
               raise SystemExit(f"Release {release_id} failed post-upload draft verification")
+
+          prerelease_flag = "true" if is_prerelease else "false"
+          expected_asset_lines = "\n".join(f"{name}  {expected_digests[name]}" for name in expected_names)
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
               summary.write(
@@ -1761,18 +1781,24 @@ jobs:
                   f"- Release ID: `{release_id}`\n"
                   f"- Tag: `{tag}`\n"
                   f"- Dispatched commit SHA: `{commit}`\n"
-                  f"- Prerelease: `{final.get('prerelease')}`\n"
+                  f"- Prerelease: `{prerelease_flag}`\n"
                   f"- Verified assets uploaded: `14`\n\n"
-                  f"Do **not** click **Publish** in the GitHub UI. First verify that the tag does not exist and that the draft still points at `{commit}`:\n\n"
+                  f"Expected remote assets (`name  sha256:<digest>`):\n\n"
+                  f"```text\n{expected_asset_lines}\n```\n\n"
+                  f"Do **not** click **Publish** in the GitHub UI. First verify that the tag does not exist, that the draft metadata matches, and that all 14 remote asset digests match:\n\n"
                   f"```sh\n"
                   f"# 1. Must return empty (do not compare SHAs; annotated tags return the tag object SHA):\n"
                   f"git ls-remote origin 'refs/tags/{tag}'\n\n"
-                  f"# 2. Must show draft=true, tag_name={tag}, target_commitish={commit}:\n"
-                  f"gh api repos/{repo}/releases/{release_id} --jq '{{draft, tag_name, target_commitish, assets: (.assets | length)}}'\n"
+                  f"# 2. Must show draft=true, prerelease={prerelease_flag}, tag_name={tag}, target_commitish={commit}, assets=14:\n"
+                  f"gh api repos/{repo}/releases/{release_id} --jq '{{draft, prerelease, tag_name, target_commitish, assets: (.assets | length)}}'\n\n"
+                  f"# 3. Must exit 0 with empty output (compares all 14 remote name + SHA-256 digests):\n"
+                  f"diff -u - <(gh api --paginate repos/{repo}/releases/{release_id}/assets --jq '.[] | \"\\(.name)  \\(.digest)\"' | LC_ALL=C sort) <<'EOF'\n"
+                  f"{expected_asset_lines}\n"
+                  f"EOF\n"
                   f"```\n\n"
                   f"Then publish with one owner-authorised API request that sets every field explicitly:\n\n"
                   f"```sh\n"
-                  f"gh api -X PATCH repos/{repo}/releases/{release_id} -F draft=false -f tag_name={tag} -f target_commitish={commit}\n"
+                  f"gh api -X PATCH repos/{repo}/releases/{release_id} -F draft=false -F prerelease={prerelease_flag} -f tag_name={tag} -f target_commitish={commit}\n"
                   f"```\n"
               )
           PY
