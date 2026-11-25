@@ -1,8 +1,8 @@
 //! A raw-frame MCP client for driving the compiled binary.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +35,24 @@ pub struct Server {
 
 impl Server {
     pub fn start(args: &[&str]) -> Self {
+        let (server, stdout, sender) = Self::spawn(args);
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        server
+    }
+
+    /// Gives the test the read end of stdout so it can withhold reads or close the pipe.
+    pub fn mcp_with_unread_output() -> (Self, ChildStdout) {
+        let (server, stdout, _) = Self::spawn(&["mcp", "--client", "claude"]);
+        (server, stdout)
+    }
+
+    fn spawn(args: &[&str]) -> (Self, ChildStdout, Sender<String>) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_proxenos"))
             .args(args)
             .stdin(Stdio::piped())
@@ -45,14 +63,6 @@ impl Server {
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
-        let (sender, lines) = channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if sender.send(line).is_err() {
-                    break;
-                }
-            }
-        });
         let captured = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&captured);
         let stderr_reader = thread::spawn(move || {
@@ -62,13 +72,15 @@ impl Server {
                 text.push('\n');
             }
         });
-        Self {
+        let (sender, lines) = channel();
+        let server = Self {
             child,
             stdin,
             lines,
             stderr: captured,
             stderr_reader: Some(stderr_reader),
-        }
+        };
+        (server, stdout, sender)
     }
 
     pub fn mcp() -> Self {
@@ -167,7 +179,11 @@ impl Server {
 
     /// Waits until standard error holds `needle`.
     pub fn wait_for_stderr(&self, needle: &str) {
-        let deadline = Instant::now() + WAIT;
+        self.wait_for_stderr_within(needle, WAIT);
+    }
+
+    pub fn wait_for_stderr_within(&self, needle: &str, limit: Duration) {
+        let deadline = Instant::now() + limit;
         while !self.stderr().contains(needle) {
             assert!(
                 Instant::now() < deadline,
@@ -186,11 +202,19 @@ impl Server {
         self.stdin = None;
     }
 
+    pub fn take_input(&mut self) -> ChildStdin {
+        self.stdin.take().expect("stdin is open")
+    }
+
     /// Closes standard input and waits for the process to exit.
     pub fn finish(&mut self) -> (ExitStatus, Duration) {
         self.close_input();
+        self.wait_for_exit(EXIT_WAIT)
+    }
+
+    pub fn wait_for_exit(&mut self, limit: Duration) -> (ExitStatus, Duration) {
         let started = Instant::now();
-        let deadline = started + EXIT_WAIT;
+        let deadline = started + limit;
         loop {
             if let Some(status) = self.child.try_wait().expect("the child can be waited on") {
                 let took = started.elapsed();

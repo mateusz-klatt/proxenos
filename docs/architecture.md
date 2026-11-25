@@ -142,17 +142,21 @@ Measured on 2026-11-24 with a throwaway server on Linux, `rmcp` 3.11.0, features
 
 What the `mcp` module has to do itself, because the library does not:
 
-- **End of input.** The library waits a fixed five seconds after standard input closes before it
-  cancels running calls. Proxenos reads standard input itself, as soon as bytes arrive, and passes
-  them on; it stops running calls the moment the input ends, whatever the library is doing.
+- **End of input.** Proxenos reads ahead on standard input and signals running calls as soon as
+  it sees the input end. Up to 16 chunks of at most 64 KiB each can wait in the input queue.
+  When rmcp falls further behind, the reader waits for space before reading again. Only that
+  backpressure delays its observation of the end of input.
 - **Read and write failures.** The library ends quietly when it cannot read or write. Proxenos
   takes the library's answers from it frame by frame as they are written, and writes them to
   standard output itself, so that a failure in either direction stops serving and ends it with
-  exit status 1 and the reason; exit status 0 means the client closed the connection. After a
-  failed write nothing more reaches the library.
-- **A client that does not read.** Answers wait in memory, in order, up to 64 MiB, so that the
-  library is never blocked by such a client and does not cut an answer short. Past that, serving
-  has failed.
+  exit status 1 and the first reason recorded. Exit status 0 means the client closed the
+  connection. On failure Proxenos stops forwarding bytes into the library. If the library
+  dispatches a buffered tool call after the halt, the handler returns an internal error without
+  invoking the tool. A failed connection may be unable to deliver that error.
+- **A client that does not read.** Up to 64 MiB of output can wait for the client, including the
+  frame being collected and the frame being written. The collector passes complete frames to the
+  writer in order. Crossing the limit or reaching the end of the library's output partway through
+  a frame fails the connection. After a failure, serving can end even if standard output is blocked.
 - **Cancellation.** The library signals a token and does not stop the handler. Every handler
   waits on that token.
 - **Panics.** A handler that panics is never answered. Proxenos catches the panic and answers
@@ -161,10 +165,11 @@ What the `mcp` module has to do itself, because the library does not:
 - **Batches.** The revision of 2025-03-26 requires a server to accept JSON-RPC batches, and the
   library refuses them. Proxenos does not offer that revision: a client that asks for it is
   offered 2025-11-25, which it may accept or not.
-- **Calls still running when the connection ends.** The library stops waiting for them after five
-  seconds. Proxenos tells them to stop and waits for them. Ten seconds after the end of the input
-  or the first failure, whatever is still running or still unwritten is abandoned and serving has
-  failed.
+- **Calls still running when the connection ends.** When rmcp sees the end of its input it gives
+  handlers five seconds to finish. A call cancelled by the end of input gets a reply if it
+  finishes within that drain. A call that finishes later gets no reply. Proxenos still waits for
+  running calls to clean up. Ten seconds after Proxenos sees the end of input or the first
+  failure, it abandons any remaining calls and output and exits with a failure.
 
 Known differences from claude-delegator, accepted: a line that is not JSON is ignored instead of
 answered with a parse error, and a `tools/call` without a name is "method not found" instead of

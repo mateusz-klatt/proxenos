@@ -181,6 +181,9 @@ fn the_end_of_input_stops_a_running_call_at_once() {
     // rmcp alone would wait five seconds before cancelling the call.
     let took = closed.elapsed();
     assert!(took < Duration::from_secs(3), "cancellation took {took:?}");
+    let reply = server.exact_next_frame();
+    assert_eq!(reply["id"], 5);
+    assert_eq!(text(&reply), "cancelled");
     let (status, _) = server.finish();
     assert!(status.success(), "{status}");
 }
@@ -215,6 +218,7 @@ fn a_call_that_takes_longer_than_rmcp_waits_to_clean_up_still_finishes() {
     let (status, took) = server.finish();
     assert!(status.success(), "{status}");
     assert!(took >= Duration::from_secs(6), "exit took {took:?}");
+    assert!(server.frames_until_end().is_empty());
     assert!(
         server.stderr().contains("test_wait: done"),
         "{}",
@@ -248,89 +252,58 @@ fn initialize_frame() -> serde_json::Value {
     })
 }
 
-fn raw_server(stdout: std::process::Stdio) -> std::process::Child {
-    std::process::Command::new(env!("CARGO_BIN_EXE_proxenos"))
-        .args(["mcp", "--client", "claude"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(stdout)
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("the binary starts")
-}
-
 #[test]
-fn output_that_cannot_be_written_makes_serving_fail() {
-    let mut child = raw_server(std::process::Stdio::piped());
-    // Nobody will ever read the answer.
-    drop(child.stdout.take());
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    writeln!(stdin, "{}", initialize_frame()).expect("the server reads its input");
-    // Standard input stays open: the failed write alone has to end serving, and soon.
-    let started = Instant::now();
-    let output = child.wait_with_output().expect("the server exits");
-    let took = started.elapsed();
-    drop(stdin);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(took < Duration::from_secs(3), "exit took {took:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn a_failed_write_stops_calls_and_makes_serving_fail() {
+    let (mut server, stdout) = Server::mcp_with_unread_output();
+    server.send(&initialize_frame());
+    server.start_call(2, "test_wait", json!({ "ms": 60_000, "linger_ms": 1_000 }));
+    server.wait_for_stderr("test_wait: started");
+
+    drop(stdout);
+    server.start_call(3, "test_echo", json!({}));
+    // Input is still open. Cancellation tells us the failed write halted serving.
+    server.wait_for_stderr("test_wait: cancelled");
+    let mut stdin = server.take_input();
+    let late = json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": { "name": "test_wait", "arguments": { "ms": 0 } }
+    });
+    let _ = writeln!(stdin, "{late}");
+    let (status, _) = server.wait_for_exit(Duration::from_secs(3));
+    assert_eq!(status.code(), Some(1));
+    let stderr = server.stderr();
     assert!(stderr.contains("writing the output failed"), "{stderr}");
+    assert_eq!(stderr.matches("test_wait: started").count(), 1, "{stderr}");
 }
 
 #[test]
 fn output_that_nobody_reads_is_bounded_by_the_stop_limit() {
-    let mut child = raw_server(std::process::Stdio::piped());
-    let unread = child.stdout.take();
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    writeln!(stdin, "{}", initialize_frame()).expect("the server reads its input");
+    let (mut server, _unread) = Server::mcp_with_unread_output();
+    server.send(&initialize_frame());
     // Answers far larger than any pipe holds, which this test does not read.
     let large = "x".repeat(1 << 20);
     for id in 2..6 {
-        let call = json!({
-            "jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": { "name": "test_echo", "arguments": { "large": large } }
-        });
-        writeln!(stdin, "{call}").expect("the server reads its input");
+        server.start_call(id, "test_echo", json!({ "large": large }));
     }
-    let closed = Instant::now();
-    drop(stdin);
-    let deadline = closed + Duration::from_secs(20);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("the child can be waited on") {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "the server did not exit");
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let took = closed.elapsed();
-    drop(unread);
+    server.close_input();
+    let (status, _) = server.wait_for_exit(Duration::from_secs(15));
     assert_eq!(status.code(), Some(1));
-    assert!(took < Duration::from_secs(15), "exit took {took:?}");
-    let mut stderr = String::new();
-    let _ = std::io::Read::read_to_string(
-        &mut child.stderr.take().expect("stderr is piped"),
-        &mut stderr,
-    );
+    let stderr = server.stderr();
     assert!(stderr.contains("did not finish within 10 s"), "{stderr}");
 }
 
 #[test]
 fn a_client_that_reads_late_still_gets_every_answer_whole() {
-    let mut child = raw_server(std::process::Stdio::piped());
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    writeln!(stdin, "{}", initialize_frame()).expect("the server reads its input");
+    let (mut server, mut stdout) = Server::mcp_with_unread_output();
+    server.send(&initialize_frame());
     let large = "y".repeat(1 << 20);
-    let call = json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": { "name": "test_echo", "arguments": { "large": large } }
-    });
-    writeln!(stdin, "{call}").expect("the server reads its input");
-    drop(stdin);
+    server.start_call(2, "test_echo", json!({ "large": large }));
+    server.close_input();
     // Longer than rmcp waits for a pending answer after its input ends.
     std::thread::sleep(Duration::from_secs(6));
     let mut output = String::new();
     std::io::Read::read_to_string(&mut stdout, &mut output).expect("the output is read");
-    let status = child.wait().expect("the server exits");
+    let (status, _) = server.finish();
     assert!(status.success(), "{status}");
     let frames: Vec<serde_json::Value> = output
         .lines()
@@ -344,25 +317,31 @@ fn a_client_that_reads_late_still_gets_every_answer_whole() {
 
 #[test]
 fn output_that_piles_up_unread_past_its_limit_makes_serving_fail() {
-    let mut child = raw_server(std::process::Stdio::piped());
-    let unread = child.stdout.take();
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    writeln!(stdin, "{}", initialize_frame()).expect("the server reads its input");
-    let large = "z".repeat(1 << 20);
-    // More than 64 MiB of answers, none of them read. Writing may fail once serving has stopped.
-    for id in 2..80 {
-        let call = json!({
-            "jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": { "name": "test_echo", "arguments": { "large": large } }
-        });
-        if writeln!(stdin, "{call}").is_err() {
-            break;
+    let (mut server, _unread) = Server::mcp_with_unread_output();
+    server.send(&initialize_frame());
+    server.start_call(2, "test_wait", json!({ "ms": 120_000 }));
+    server.wait_for_stderr("test_wait: started");
+    let mut stdin = server.take_input();
+    let writing = std::thread::spawn(move || {
+        let large = "z".repeat(1 << 20);
+        for id in 3..80 {
+            let call = json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "test_echo", "arguments": { "large": large } }
+            });
+            if writeln!(stdin, "{call}").is_err() {
+                break;
+            }
         }
-    }
-    let output = child.wait_with_output().expect("the server exits");
-    drop((stdin, unread));
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+        stdin // Keep input open until the child exits.
+    });
+    // Allow for slow input under instrumentation. Once overflow cancels the call, a blocked
+    // stdout must not keep the process alive for its ten-second shutdown deadline.
+    server.wait_for_stderr_within("test_wait: cancelled", Duration::from_secs(120));
+    let (status, _) = server.wait_for_exit(Duration::from_secs(7));
+    drop(writing.join().expect("the input writer finishes"));
+    assert_eq!(status.code(), Some(1));
+    let stderr = server.stderr();
     assert!(stderr.contains("more than 64 MiB of output"), "{stderr}");
 }
 
