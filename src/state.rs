@@ -8,8 +8,15 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 const HOME_ENV: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+const STATE_DIR_ERROR: &str = if cfg!(windows) {
+    "LOCALAPPDATA is not set to an absolute path."
+} else if cfg!(target_os = "macos") {
+    "HOME is not set to an absolute path."
+} else {
+    "Neither XDG_STATE_HOME nor HOME is set to an absolute path."
+};
 
-pub fn absolute_env(key: &str) -> Option<PathBuf> {
+fn absolute_env(key: &str) -> Option<PathBuf> {
     env::var_os(key).map(PathBuf::from).filter(|path| {
         path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
     })
@@ -19,20 +26,22 @@ pub fn home_dir() -> Result<PathBuf, String> {
     absolute_env(HOME_ENV).ok_or_else(|| format!("{HOME_ENV} is not set to an absolute path."))
 }
 
-#[cfg(unix)]
-pub fn state_dir() -> Result<PathBuf, String> {
-    let base = match absolute_env("XDG_STATE_HOME") {
-        Some(dir) => dir,
-        None => home_dir()?.join(".local").join("state"),
-    };
-    Ok(base.join("proxenos"))
+/// Returns Proxenos's user state directory (`.../proxenos`) when the platform's state
+/// environment variable is set to an absolute path without `..` components, or `None` when no
+/// durable state directory is configured (D19).
+pub fn state_dir() -> Option<PathBuf> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let base = absolute_env("XDG_STATE_HOME")
+        .or_else(|| absolute_env("HOME").map(|home| home.join(".local/state")));
+    #[cfg(target_os = "macos")]
+    let base = absolute_env("HOME").map(|home| home.join("Library/Application Support"));
+    #[cfg(windows)]
+    let base = absolute_env("LOCALAPPDATA");
+    base.map(|dir| dir.join("proxenos"))
 }
 
-#[cfg(windows)]
-pub fn state_dir() -> Result<PathBuf, String> {
-    absolute_env("LOCALAPPDATA")
-        .map(|dir| dir.join("proxenos"))
-        .ok_or_else(|| "LOCALAPPDATA is not set to an absolute path.".to_owned())
+pub fn require_state_dir() -> Result<PathBuf, String> {
+    state_dir().ok_or_else(|| STATE_DIR_ERROR.to_owned())
 }
 
 pub fn claude_settings_path() -> Result<PathBuf, String> {

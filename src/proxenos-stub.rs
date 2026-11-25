@@ -44,7 +44,8 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
             "remove" => fs::remove_file(value)?,
             "mkdir" => fs::create_dir(value)?,
             "hold" => hold_lock(value)?,
-            "grandchild" => spawn_and_wait_ready(&mut grandchild(value)?, value)?,
+            "grandchild" => spawn_and_wait_ready(&mut grandchild(value, true)?, value)?,
+            "quiet-grandchild" => spawn_and_wait_ready(&mut grandchild(value, false)?, value)?,
             "until-released" => wait_for_file(&format!("{value}.release"))?,
             #[cfg(unix)]
             "ignore-term" => platform::ignore_term(),
@@ -234,13 +235,14 @@ fn hold_lock(path: &str) -> io::Result<()> {
 
 /// Leave a live descendant holding the output pipes. The ready file ties the test observation
 /// to this instance: its lock survives until this process exits, including death by signal.
-fn grandchild(path: &str) -> io::Result<Command> {
+fn grandchild(path: &str, announce: bool) -> io::Result<Command> {
     let mut copy = Command::new(std::env::current_exe()?);
     #[cfg(unix)]
     copy.arg("ignore-term");
-    copy.arg("out:grandchild ready")
-        .arg(format!("hold:{path}"))
-        .arg("sleep:60000");
+    if announce {
+        copy.arg("out:grandchild ready");
+    }
+    copy.arg(format!("hold:{path}")).arg("sleep:60000");
     Ok(copy)
 }
 
@@ -362,7 +364,7 @@ mod platform {
     /// Ask Windows to create this grandchild outside the job. Report the OS reason for the
     /// refusal and retry the same grandchild in the job, where the test can witness its death.
     pub(super) fn breakaway(path: &str) -> io::Result<i32> {
-        let mut copy = super::grandchild(path)?;
+        let mut copy = super::grandchild(path, true)?;
         let refusal = copy
             .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
             .spawn()

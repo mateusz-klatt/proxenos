@@ -47,9 +47,16 @@ impl Sandbox {
     }
 
     fn state_dir(&self) -> PathBuf {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             self.home.join(".local").join("state").join("proxenos")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.home
+                .join("Library")
+                .join("Application Support")
+                .join("proxenos")
         }
         #[cfg(windows)]
         {
@@ -881,12 +888,17 @@ fn compact_settings_restores_original_bytes_when_unchanged_and_edits_semanticall
 fn paths_with_spaces_and_non_ascii_work_end_to_end() {
     let sb = Sandbox::with_name(&format!("proxenos space café ąčę {}", Uuid::new_v4()));
     let bin = sb.hard_link_binary("bin dir café ąčę");
+    #[cfg(not(target_os = "macos"))]
     let custom_state = sb.root.join("state dir café ąčę");
+    #[cfg(target_os = "macos")]
+    let custom_home = sb.root.join("home dir café ąčę");
 
     let run_with_env = |args: &[&str]| {
         let mut cmd = sb.command_for(&bin, args);
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "macos")))]
         cmd.env("XDG_STATE_HOME", &custom_state);
+        #[cfg(target_os = "macos")]
+        cmd.env("HOME", &custom_home);
         #[cfg(windows)]
         cmd.env("LOCALAPPDATA", &custom_state);
         cmd.output().expect("proxenos binary runs")
@@ -899,8 +911,21 @@ fn paths_with_spaces_and_non_ascii_work_end_to_end() {
         String::from_utf8_lossy(&int_out.stderr)
     );
 
-    let expected_marketplace = custom_state.join("proxenos").join("claude-marketplace");
-    let settings = read_json(&sb.settings_path());
+    #[cfg(not(target_os = "macos"))]
+    let (expected_marketplace, settings_path) = (
+        custom_state.join("proxenos").join("claude-marketplace"),
+        sb.settings_path(),
+    );
+    #[cfg(target_os = "macos")]
+    let (expected_marketplace, settings_path) = (
+        custom_home
+            .join("Library")
+            .join("Application Support")
+            .join("proxenos")
+            .join("claude-marketplace"),
+        custom_home.join(".claude").join("settings.json"),
+    );
+    let settings = read_json(&settings_path);
     assert_eq!(
         settings["extraKnownMarketplaces"]["proxenos"]["source"]["path"],
         expected_marketplace.to_str().unwrap()
@@ -1701,17 +1726,26 @@ fn doctor_checks_unix_state_directory_permissions() {
     assert_eq!(wide_check["status"], "fail");
     assert_eq!(wide_check["details"]["mode"], "0755");
 
-    // Non-directory parent for XDG_STATE_HOME exercises non-NotFound symlink_metadata error.
+    // Non-directory parent for the platform state-directory env var exercises non-NotFound
+    // symlink_metadata error (ENOTDIR).
     let file_parent = sb.root.join("not-a-dir");
     fs::write(&file_parent, "file").unwrap();
     let mut cmd = sb.command(&["doctor", "--json"]);
+    #[cfg(not(target_os = "macos"))]
     cmd.env("XDG_STATE_HOME", &file_parent);
+    #[cfg(target_os = "macos")]
+    cmd.env("HOME", &file_parent);
     let err_out = cmd.output().unwrap();
     assert_eq!(err_out.status.code(), Some(1));
     let err_report: Value = serde_json::from_slice(&err_out.stdout).unwrap();
-    assert_eq!(
-        find_check(&err_report, "state_dir.permissions")["status"],
-        "fail"
+    let err_check = find_check(&err_report, "state_dir.permissions");
+    assert_eq!(err_check["status"], "fail", "{err_report}");
+    assert!(
+        err_check["message"]
+            .as_str()
+            .unwrap()
+            .contains("Could not inspect state directory"),
+        "{err_report}"
     );
 }
 
@@ -2042,14 +2076,18 @@ mod with_stubs {
         }
 
         // 6c. Handshake spawns under D6 platform isolation so descendants (grandchild ignoring
-        // SIGTERM on Unix / inside Job Object on Windows) are killed too.
+        // SIGTERM on Unix / inside Job Object on Windows) are killed too when the deadline hits.
+        // The parent exits after waiting for `grandchild.lock.ready`, leaving only the silent
+        // grandchild holding stdout open until the deadline fires.
         let gc_lock = sb.root.join("grandchild.lock");
         set_stub_args(json!([
-            format!("grandchild:{}", gc_lock.display()),
-            "sleep:60000"
+            format!("quiet-grandchild:{}", gc_lock.display()),
+            "exit:0"
         ]));
         let gc_started = Instant::now();
-        let gc_out = sb.run(&["doctor", "--json"]);
+        let mut gc_cmd = sb.command(&["doctor", "--json"]);
+        gc_cmd.env("PROXENOS_TEST_HANDSHAKE_TIMEOUT_MS", "1500");
+        let gc_out = gc_cmd.output().unwrap();
         assert!(
             gc_started.elapsed() < Duration::from_secs(10),
             "doctor waited on grandchild: {:?}",
@@ -2057,6 +2095,13 @@ mod with_stubs {
         );
         let gc_report: Value = serde_json::from_slice(&gc_out.stdout).unwrap();
         assert_eq!(gc_out.status.code(), Some(1), "{gc_report}");
+        assert!(
+            find_check(&gc_report, "claude-code.handshake")["message"]
+                .as_str()
+                .unwrap()
+                .contains("deadline"),
+            "{gc_report}"
+        );
         assert!(
             sb.root.join("grandchild.lock.ready").exists(),
             "grandchild never started: {gc_report}"
@@ -2162,6 +2207,190 @@ mod with_stubs {
                 .as_str()
                 .unwrap()
                 .contains("Cannot follow batch launcher")
+        );
+    }
+
+    #[test]
+    fn integrate_sessions_and_doctor_share_one_state_directory() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::Stdio;
+
+        let sb = Sandbox::new();
+        let bin_dir = sb.root.join("stub-bin");
+        install_stub(&bin_dir, "codex");
+        fs::write(
+            sb.root.join("codex.version"),
+            json!({"stdout": "codex 0.50.0\n"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            sb.root.join("codex.steps"),
+            json!([{"stdout": include_str!("fixtures/codex/finished.jsonl")}]).to_string(),
+        )
+        .unwrap();
+        let cwd = sb.root.join("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let (xdg_state, expected_state_dir) = {
+            let xdg = sb.root.join("custom-xdg-state");
+            (xdg.clone(), xdg.join("proxenos"))
+        };
+        #[cfg(target_os = "macos")]
+        let (ignored_xdg, expected_state_dir) = (
+            sb.root.join("ignored-xdg-state"),
+            sb.home
+                .join("Library")
+                .join("Application Support")
+                .join("proxenos"),
+        );
+        #[cfg(windows)]
+        let expected_state_dir = sb.local_app_data.join("proxenos");
+
+        let configure_env = |cmd: &mut Command| {
+            cmd.env("PATH", &bin_dir).env("PROXENOS_STUB_DIR", &sb.root);
+            #[cfg(all(unix, not(target_os = "macos")))]
+            cmd.env("XDG_STATE_HOME", &xdg_state);
+            #[cfg(target_os = "macos")]
+            cmd.env("XDG_STATE_HOME", &ignored_xdg);
+        };
+
+        // 1. Run `proxenos integrate claude-code`.
+        let mut int_cmd = sb.command(&["integrate", "claude-code"]);
+        configure_env(&mut int_cmd);
+        let int_out = int_cmd.output().unwrap();
+        assert!(
+            int_out.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&int_out.stdout),
+            String::from_utf8_lossy(&int_out.stderr)
+        );
+        let manifest_path = expected_state_dir.join("integrate").join("manifest.json");
+        assert!(
+            manifest_path.is_file(),
+            "manifest missing at {}",
+            manifest_path.display()
+        );
+
+        // 2. Run one confirmed delegation start through `proxenos mcp --client claude`.
+        let mut mcp_cmd = sb.command(&["mcp", "--client", "claude"]);
+        configure_env(&mut mcp_cmd);
+        mcp_cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = mcp_cmd.spawn().expect("proxenos mcp spawns");
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        let send = |stdin: &mut std::process::ChildStdin, msg: &Value| {
+            writeln!(stdin, "{msg}").unwrap();
+            stdin.flush().unwrap();
+        };
+        let recv = |stdout: &mut BufReader<std::process::ChildStdout>, id: i64| -> Value {
+            loop {
+                let mut line = String::new();
+                let n = stdout.read_line(&mut line).unwrap();
+                assert!(n > 0, "proxenos mcp closed stdout before answering id {id}");
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                if frame.get("id") == Some(&json!(id)) {
+                    return frame;
+                }
+            }
+        };
+
+        send(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "integrate-test", "version": "0.1"}
+                }
+            }),
+        );
+        let init_resp = recv(&mut stdout, 1);
+        assert!(init_resp.get("result").is_some(), "{init_resp}");
+        send(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        );
+        send(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "codex",
+                    "arguments": {
+                        "prompt": "verify shared state dir",
+                        "model": "test-model",
+                        "cwd": cwd,
+                        "timeout_ms": 5_000
+                    }
+                }
+            }),
+        );
+        let call_resp = recv(&mut stdout, 2);
+        drop(stdin);
+        let mcp_output = child.wait_with_output().unwrap();
+        assert!(
+            mcp_output.status.success(),
+            "mcp stderr: {}",
+            String::from_utf8_lossy(&mcp_output.stderr)
+        );
+        let raw_envelope = call_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("unexpected tools/call response: {call_resp}"));
+        let envelope: Value = serde_json::from_str(raw_envelope).unwrap();
+        assert_eq!(envelope["observed"]["state"], "finished", "{envelope}");
+        assert!(
+            envelope["observed"]["session_save_failure"].is_null(),
+            "{envelope}"
+        );
+
+        let sessions_dir = expected_state_dir.join("sessions").join("codex");
+        let session_files: Vec<PathBuf> = fs::read_dir(&sessions_dir)
+            .unwrap_or_else(|err| panic!("missing sessions dir {}: {err}", sessions_dir.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert_eq!(
+            session_files.len(),
+            1,
+            "expected 1 session file in {}",
+            sessions_dir.display()
+        );
+        assert!(manifest_path.starts_with(&expected_state_dir));
+        assert!(session_files[0].starts_with(&expected_state_dir));
+        #[cfg(target_os = "macos")]
+        assert!(
+            !ignored_xdg.exists(),
+            "macOS must ignore XDG_STATE_HOME: {}",
+            ignored_xdg.display()
+        );
+
+        // 3. Run `proxenos doctor --json` and verify it reports the exact same proxenos directory.
+        let mut doc_cmd = sb.command(&["doctor", "--json"]);
+        configure_env(&mut doc_cmd);
+        let doc_out = doc_cmd.output().unwrap();
+        let report: Value = serde_json::from_slice(&doc_out.stdout).unwrap();
+        assert!(
+            doc_out.status.success(),
+            "report: {report}\nstderr: {}",
+            String::from_utf8_lossy(&doc_out.stderr)
+        );
+        assert_eq!(report["ok"], true, "{report}");
+        let state_check = find_check(&report, "state_dir.permissions");
+        assert_eq!(state_check["status"], "ok", "{report}");
+        assert_eq!(
+            state_check["details"]["path"],
+            expected_state_dir.to_str().unwrap(),
+            "{report}"
         );
     }
 }

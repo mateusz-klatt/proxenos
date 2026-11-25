@@ -269,7 +269,7 @@ fn remove_if_exists(path: &Path) -> Result<(), IntegrateError> {
 }
 
 pub fn integrate_claude_code() -> Result<String, IntegrateError> {
-    let state_dir = state::state_dir().map_err(IntegrateError::Message)?;
+    let state_dir = state::require_state_dir().map_err(IntegrateError::Message)?;
     let settings_path = state::claude_settings_path().map_err(IntegrateError::Message)?;
     let binary_path = state::current_executable().map_err(io_err("current executable"))?;
     let binary_str = state::path_string(&binary_path).map_err(io_err(&binary_path))?;
@@ -567,7 +567,7 @@ fn remove_managed_entry(
 }
 
 pub fn remove_claude_code() -> Result<String, IntegrateError> {
-    let state_dir = state::state_dir().map_err(IntegrateError::Message)?;
+    let state_dir = state::require_state_dir().map_err(IntegrateError::Message)?;
     let manifest_file = manifest_path(&state_dir);
     let mut manifest = load_manifest(&manifest_file)?;
     let Some(record) = manifest.clients.get(CLIENT_CLAUDE_CODE).cloned() else {

@@ -7,13 +7,14 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::providers::{Provider, RememberedStart, Settings, is_valid_model};
+use crate::state;
 
 const SESSION_SCHEMA_VERSION: u32 = 1;
 const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -67,24 +68,8 @@ pub enum SaveOutcome {
     Unconfigured,
 }
 
-fn absolute_env(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key).map(PathBuf::from).filter(|path| {
-        path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
-    })
-}
-
-fn state_base() -> Option<PathBuf> {
-    #[cfg(all(unix, not(target_os = "macos")))]
-    return absolute_env("XDG_STATE_HOME")
-        .or_else(|| absolute_env("HOME").map(|home| home.join(".local/state")));
-    #[cfg(target_os = "macos")]
-    return absolute_env("HOME").map(|home| home.join("Library/Application Support"));
-    #[cfg(windows)]
-    return absolute_env("LOCALAPPDATA");
-}
-
-fn provider_dir_chain(state_root: &Path, provider: &str) -> [PathBuf; 3] {
-    let proxenos = state_root.join("proxenos");
+fn provider_dir_chain(state_dir: &Path, provider: &str) -> [PathBuf; 3] {
+    let proxenos = state_dir.to_path_buf();
     let sessions = proxenos.join("sessions");
     let provider_dir = sessions.join(provider);
     [proxenos, sessions, provider_dir]
@@ -124,13 +109,13 @@ fn lookup_bytes(provider: &Provider, thread_id: &str, read: io::Result<Vec<u8>>)
 }
 
 pub fn load(provider: &Provider, thread_id: &str) -> SessionLookup {
-    let Some(base) = state_base() else {
+    let Some(state_dir) = state::state_dir() else {
         return SessionLookup::Missing;
     };
     lookup_bytes(
         provider,
         thread_id,
-        read_provider_session(&base, provider.name, thread_id),
+        read_provider_session(&state_dir, provider.name, thread_id),
     )
 }
 
@@ -172,11 +157,11 @@ pub fn save(
     thread_id: &str,
     entry: Option<RememberedStart>,
 ) -> io::Result<SaveOutcome> {
-    let Some(base) = state_base() else {
+    let Some(state_dir) = state::state_dir() else {
         return Ok(SaveOutcome::Unconfigured);
     };
     let desired = entry.as_ref().map(stored_from).transpose()?;
-    let provider_dir = ensure_provider_dir(&base, provider.name)?;
+    let provider_dir = ensure_provider_dir(&state_dir, provider.name)?;
     let key = encode_thread_id(thread_id);
     let _lock = open_lock_file(&provider_dir.join(format!("{key}.lock")))?;
     let target = provider_dir.join(format!("{key}.json"));
@@ -276,9 +261,10 @@ fn verify_existing_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn ensure_provider_dir(state_root: &Path, provider: &str) -> io::Result<PathBuf> {
-    fs::create_dir_all(state_root)?;
-    let chain = provider_dir_chain(state_root, provider);
+fn ensure_provider_dir(state_dir: &Path, provider: &str) -> io::Result<PathBuf> {
+    let parent = state_dir.parent().expect("state directory has a parent");
+    fs::create_dir_all(parent)?;
+    let chain = provider_dir_chain(state_dir, provider);
     for dir in &chain {
         ensure_private_dir(dir)?;
     }
@@ -356,8 +342,8 @@ fn open_lock_file(path: &Path) -> io::Result<fs::File> {
     Ok(file)
 }
 
-fn read_provider_session(base: &Path, provider: &str, thread_id: &str) -> io::Result<Vec<u8>> {
-    let chain = provider_dir_chain(base, provider);
+fn read_provider_session(state_dir: &Path, provider: &str, thread_id: &str) -> io::Result<Vec<u8>> {
+    let chain = provider_dir_chain(state_dir, provider);
     for dir in &chain {
         verify_existing_dir(dir)?;
     }

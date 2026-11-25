@@ -260,7 +260,7 @@ fn check_registration() -> (Check, Option<RegisteredCommand>) {
 }
 
 fn check_state_dir() -> Check {
-    let dir = match state::state_dir() {
+    let dir = match state::require_state_dir() {
         Ok(path) => path,
         Err(message) => return Check::new("state_dir.permissions", Status::Fail, message, None),
     };

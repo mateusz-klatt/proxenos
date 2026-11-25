@@ -373,9 +373,8 @@ entries it wrote, refuses to take over one it did not, and keeps a record of wha
 At milestone 1 step 5, `proxenos integrate claude-code [--remove]` and `proxenos doctor [--json]`
 implement the Claude Code registration and health check:
 
-- **State directory.** Proxenos stores its integration state under `$XDG_STATE_HOME/proxenos` (or
-  `$HOME/.local/state/proxenos` when `XDG_STATE_HOME` is unset or non-absolute) on Unix, and
-  `%LOCALAPPDATA%\proxenos` on Windows. Directories created by Proxenos use mode `0700` on Unix and
+- **State directory.** Proxenos stores its integration state in the user state directory defined in
+  D19 (`<state_dir>`). Directories created by Proxenos use mode `0700` on Unix and
   files owned by Proxenos use mode `0600`. All writes go through a unique temporary file in the same
   directory, call `File::sync_all()` before an atomic rename, and on Unix open and `sync_all()` the
   parent directory after the rename, propagating any directory sync error.
@@ -907,10 +906,16 @@ report the same `thread_id` with conflicting settings—either in the same serve
 restart—Proxenos marks that ID ambiguous in both `StartStore` and the session file and refuses
 replies for it, even after a restart.
 
+Proxenos's user state directory (`<state_dir>`, shared by D10 integration state, `doctor`, and D19
+session files) is `$XDG_STATE_HOME/proxenos` when `XDG_STATE_HOME` is an absolute path without `..`
+components, otherwise `$HOME/.local/state/proxenos`, on Linux and other non-macOS Unix;
+`~/Library/Application Support/proxenos` on macOS; and `%LOCALAPPDATA%\proxenos` on Windows. When
+the platform's environment variables are unset, relative, or contain `..`, no durable state
+directory is configured: D19 treats the store as unconfigured (`SaveOutcome::Unconfigured`), while
+`integrate` and `doctor` report an error.
+
 Session files hold versioned, typed JSON (`schema_version: 1`, unknown fields rejected) keyed by
-provider and a SHA-256-encoded thread ID under `$XDG_STATE_HOME/proxenos/sessions` (or
-`~/.local/state/proxenos/sessions`) on Linux, `~/Library/Application Support/proxenos/sessions` on
-macOS, and `%LOCALAPPDATA%\proxenos\sessions` on Windows. Each file stores only the save timestamp,
+provider and a SHA-256-encoded thread ID under `<state_dir>/sessions`. Each file stores only the save timestamp,
 an `ambiguous` flag, and for non-ambiguous entries validated start settings (`cwd`, `mode`,
 `access`, `model`, `effort`) and any validated start model the provider reported. It never stores
 the prompt, the instructions text, the environment, `timeout_ms`, or the provider's answer.
