@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 mod session;
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
+    if let Some(directory) = std::env::var_os("PROXENOS_STUB_DIR") {
+        return replay(Path::new(&directory));
+    }
     for step in std::env::args().skip(1) {
         let (name, value) = step.split_once(':').unwrap_or((&step, ""));
         match name {
@@ -73,6 +76,103 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Record only test inputs. Provider credentials from the surrounding environment never enter
+/// the log. Version checks have their own response and consume no turn.
+fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
+    use serde_json::{Value, json};
+    let invoked = std::env::args_os().next().unwrap();
+    let cli = Path::new(&invoked).file_stem().unwrap().to_string_lossy();
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let env: serde_json::Map<_, _> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.to_str()?;
+            (key.ends_with("_DEPTH")
+                || matches!(
+                    key,
+                    "IRIS_EXECUTION" | "CLAUDECODE" | "PROXENOS_STUB_MARKER"
+                ))
+            .then(|| (key.to_owned(), json!(value.to_string_lossy())))
+        })
+        .collect();
+    let record = json!({"cli":cli, "args":args, "cwd":std::env::current_dir()?, "env":env, "pid":std::process::id()});
+    let mut log = File::options()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(root.join("invocations"))?;
+    log.lock()?;
+    log.write_all(format!("{record}\n").as_bytes())?;
+    drop(log);
+    let step = if args.last().is_some_and(|arg| arg == "--version") {
+        let version = root.join(format!("{cli}.version"));
+        if version.exists() {
+            serde_json::from_slice(&fs::read(version)?)?
+        } else {
+            json!({"stdout": "1.2.3"})
+        }
+    } else {
+        let script = root.join(format!("{cli}.steps"));
+        let mut steps: Vec<Value> = serde_json::from_slice(&fs::read(&script)?)?;
+        let step = steps.remove(0);
+        fs::write(script, serde_json::to_vec(&steps)?)?;
+        step
+    };
+    if let Some(message) = step["final_message"].as_str() {
+        let pos = args
+            .iter()
+            .position(|arg| arg == "-o")
+            .ok_or("missing -o")?;
+        fs::write(&args[pos + 1], message)?;
+    }
+    if let Some(message) = step["replace_final_message"].as_str() {
+        let pos = args
+            .iter()
+            .position(|arg| arg == "-o")
+            .ok_or("missing -o")?;
+        let target = Path::new(&args[pos + 1]);
+        let staging = target.with_extension("tmp");
+        fs::write(&staging, message)?;
+        fs::rename(&staging, target)?;
+    }
+    if step["remove_output"] == true {
+        let pos = args
+            .iter()
+            .position(|arg| arg == "-o" || arg == "--log-file")
+            .ok_or("missing output flag")?;
+        fs::remove_file(&args[pos + 1])?;
+    }
+    if step["replace_output_with_dir"] == true {
+        let pos = args
+            .iter()
+            .position(|arg| arg == "-o" || arg == "--log-file")
+            .ok_or("missing output flag")?;
+        fs::remove_file(&args[pos + 1])?;
+        fs::create_dir(&args[pos + 1])?;
+    }
+    #[cfg(unix)]
+    if step["replace_output_with_fifo"] == true {
+        let pos = args
+            .iter()
+            .position(|arg| arg == "-o" || arg == "--log-file")
+            .ok_or("missing output flag")?;
+        platform::replace_with_fifo(Path::new(&args[pos + 1]))?;
+    }
+    io::stdout().write_all(step["stdout"].as_str().unwrap_or("").as_bytes())?;
+    io::stdout().flush()?;
+    io::stderr().write_all(step["stderr"].as_str().unwrap_or("").as_bytes())?;
+    io::stderr().flush()?;
+    if let Some(ready) = step["ready"].as_str() {
+        fs::write(ready, [])?;
+    }
+    if let Some(wait) = step["wait_for"].as_str() {
+        wait_for_file(wait)?;
+    }
+    thread::sleep(Duration::from_millis(
+        step["sleep_ms"].as_u64().unwrap_or(0),
+    ));
+    Ok(ExitCode::from(step["code"].as_u64().unwrap_or(0) as u8))
 }
 
 /// Leave a live descendant holding the output pipes. The ready file ties the test observation
@@ -149,6 +249,17 @@ mod platform {
     pub(super) fn await_term(ready: &str) -> io::Result<()> {
         fs::write(ready, [])?;
         super::wait_until(|| Ok(RECEIVED_TERM.load(Ordering::Relaxed)))
+    }
+
+    pub(super) fn replace_with_fifo(path: &std::path::Path) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        fs::remove_file(path)?;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        // SAFETY: c_path is a valid NUL-terminated path created by this stub test.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        (rc == 0).then_some(()).ok_or_else(io::Error::last_os_error)
     }
 }
 

@@ -1,10 +1,12 @@
 //! Proxenos: MCP delegation between coding-agent CLIs.
 
 mod client;
+mod delegation;
+mod discovery;
+mod envelope;
 mod mcp;
-#[cfg(feature = "test-tools")]
 mod platform;
-#[cfg(feature = "test-tools")]
+mod providers;
 mod supervise;
 mod tools;
 
@@ -59,7 +61,7 @@ fn version() -> ExitCode {
 fn serve(client: Client) -> ExitCode {
     eprintln!("proxenos: serving MCP for {}", client.name());
     let runtime = tokio::runtime::Runtime::new().expect("the async runtime starts");
-    let served = runtime.block_on(mcp::serve(tools::Registry));
+    let served = runtime.block_on(mcp::serve(tools::Registry::new(client)));
     let stopping = Instant::now();
     let code = match served {
         mcp::Served::Ended => ExitCode::SUCCESS,

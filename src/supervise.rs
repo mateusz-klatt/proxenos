@@ -25,13 +25,15 @@ pub struct Launch {
     pub cwd: Option<PathBuf>,
     pub env_set: Vec<(OsString, OsString)>,
     pub env_remove: Vec<OsString>,
-    pub deadline: Duration,
+    /// Absolute deadline checked immediately before native spawn and enforced while running.
+    pub deadline: Instant,
     /// How many bytes to keep from each stream.
     pub capture_limit: usize,
     /// Files created exclusively for this launch. Their ownership passes to the supervisor.
     pub temporary_files: Vec<cleanup::TemporaryFile>,
 }
 
+#[derive(Clone, Copy)]
 pub enum Ending {
     Exited,
     TimedOut,
@@ -49,6 +51,7 @@ impl From<io::Error> for StartError {
     }
 }
 
+#[cfg(feature = "test-tools")]
 impl Ending {
     pub fn name(&self) -> &'static str {
         match self {
@@ -88,6 +91,7 @@ impl Captured {
 }
 
 pub struct Finished {
+    pub spawned: bool,
     pub ending: Ending,
     pub code: Option<i32>,
     pub signal: Option<i32>,
@@ -96,6 +100,8 @@ pub struct Finished {
     pub elapsed: Duration,
     /// Time of the most recent read on either stream, relative to the start of the launch.
     pub last_output: Option<Duration>,
+    /// Error raised while supervising a child that had already started.
+    pub error: Option<io::Error>,
 }
 
 /// The worker publishes the status as soon as it reaps the leader. Give file cleanup the
@@ -146,7 +152,7 @@ pub async fn run(
                 if queued.is_cancelled() {
                     return Err(StartError::Skipped(Ending::Cancelled));
                 }
-                if started.elapsed() >= launch.deadline {
+                if Instant::now() >= launch.deadline {
                     return Err(StartError::Skipped(Ending::TimedOut));
                 }
                 Ok(())
@@ -155,7 +161,7 @@ pub async fn run(
         let _ = publish.send(child);
         // Only failed or skipped launches have files left here. This worker holds its
         // shutdown handle while removing them, even if a diagnostic blocks on stderr.
-        cleanup::remove_files_blocking(&launch.temporary_files);
+        cleanup::remove_files_blocking(launch.temporary_files);
     });
     let mut child = match launched.await.map_err(io::Error::other)? {
         Ok(child) => child,
@@ -163,6 +169,7 @@ pub async fn run(
             return match reason {
                 StartError::Io(error) => Err(error),
                 StartError::Skipped(ending) => Ok(Finished {
+                    spawned: false,
                     ending,
                     code: None,
                     signal: None,
@@ -170,6 +177,7 @@ pub async fn run(
                     stderr: Captured::default(),
                     elapsed: started.elapsed(),
                     last_output: None,
+                    error: None,
                 }),
             };
         }
@@ -187,7 +195,7 @@ pub async fn run(
             out.and(err)
         };
         let watch = async {
-            let remaining = launch.deadline.saturating_sub(started.elapsed());
+            let remaining = launch.deadline.saturating_duration_since(Instant::now());
             let ending = tokio::select! {
                 biased;
                 result = child.wait_for_exit() => return result.map(|()| Ending::Exited),
@@ -204,18 +212,22 @@ pub async fn run(
             ending = &mut watch => (ending, tokio::time::timeout(DRAIN, read).await.unwrap_or(Ok(()))),
         }
     };
-    // Close the group or job even when a reader or the stop failed. Preserve the first error.
+    // Close the group or job even when a reader or the stop failed. Preserve the first error
+    // alongside the dispatch evidence that was already observed.
     let status = child.finish().await;
-    let ending = ending?;
-    let status = status?;
-    read_result?;
+    let code = status.as_ref().ok().and_then(ExitStatus::code);
+    let signal = status.as_ref().ok().and_then(platform::exit_signal);
+    let ending_kind = ending.as_ref().copied().unwrap_or(Ending::Exited);
+    let error = ending.err().or(status.err()).or(read_result.err());
     Ok(Finished {
-        ending,
-        code: status.code(),
-        signal: platform::exit_signal(&status),
+        spawned: true,
+        ending: ending_kind,
+        code,
+        signal,
         elapsed: started.elapsed(),
         last_output: stdout.last_output.max(stderr.last_output),
         stdout,
         stderr,
+        error,
     })
 }

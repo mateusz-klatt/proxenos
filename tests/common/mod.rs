@@ -48,9 +48,28 @@ impl Server {
         Self::start_command(Self::command(args))
     }
 
-    fn command(args: &[&str]) -> Command {
+    pub fn command(args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_proxenos"));
-        command.args(args).stderr(Stdio::piped());
+        // Even a version probe would execute a real CLI on a developer's machine.
+        let absent = std::env::temp_dir().join(format!("proxenos-absent-{}", uuid::Uuid::new_v4()));
+        for key in ["PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+            command.env(key, &absent);
+        }
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy().to_ascii_uppercase();
+            if name.starts_with("PROXENOS_")
+                || name.starts_with("CLAUDE_DELEGATOR_")
+                || name == "CODEX_DELEGATOR_CODEX_BIN"
+            {
+                command.env_remove(key);
+            }
+        }
+        // Cargo runs many independent servers concurrently. Two workers per server still
+        // exercise concurrent calls without creating a machine-sized pool for every test.
+        command
+            .env("TOKIO_WORKER_THREADS", "2")
+            .args(args)
+            .stderr(Stdio::piped());
         command
     }
 

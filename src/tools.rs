@@ -1,21 +1,97 @@
-//! The tools that `proxenos mcp` serves.
-//!
-//! Providers are added in later steps of milestone 1. Until then the server lists only the
-//! tools of the `test-tools` feature, which exists so that the MCP layer can be tested through
-//! the compiled binary. A release is built without it.
+//! Routes the client's installed providers and the optional protocol test tools.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::client::Client;
+use crate::discovery::Discovery;
 use crate::mcp::{Activity, Service, ToolOutcome, ToolSpec, UnknownTool};
+use crate::providers::{self, Settings};
 
-pub struct Registry;
+const MAX_STARTS: usize = 1024;
+
+fn start_limit() -> usize {
+    #[cfg(feature = "test-tools")]
+    if let Some(limit) = std::env::var("PROXENOS_TEST_START_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return limit;
+    }
+    MAX_STARTS
+}
+
+/// Bounded in-memory D19 session map. `Some(settings)` remembers a unique confirmed start;
+/// `None` marks a conflicting duplicate ID. Oldest entries are evicted past `limit`.
+pub struct StartStore {
+    entries: HashMap<(&'static str, String), Option<Settings>>,
+    order: VecDeque<(&'static str, String)>,
+    limit: usize,
+}
+
+impl StartStore {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            limit: start_limit(),
+        }
+    }
+
+    pub fn get(&self, provider: &'static str, id: &str) -> Option<&Option<Settings>> {
+        self.entries.get(&(provider, id.into()))
+    }
+
+    pub fn record(&mut self, provider: &'static str, id: String, settings: Settings) {
+        let key = (provider, id);
+        if let Some(slot) = self.entries.get_mut(&key) {
+            if slot.as_ref() != Some(&settings) {
+                *slot = None;
+            }
+            return;
+        }
+        if self.entries.len() == self.limit {
+            let oldest = self.order.pop_front().expect("bounded store is non-empty");
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, Some(settings));
+    }
+}
+
+pub struct Registry {
+    client: Client,
+    pub discovery: Discovery,
+    pub answers: crate::envelope::AnswerArchive,
+    pub starts: Mutex<StartStore>,
+}
+
+impl Registry {
+    pub fn new(client: Client) -> Self {
+        Self {
+            client,
+            discovery: Discovery::new(client),
+            starts: Mutex::new(StartStore::new()),
+            answers: Default::default(),
+        }
+    }
+}
 
 impl Service for Registry {
-    fn tools(&self) -> Vec<ToolSpec> {
-        extra_tools()
+    async fn tools(&self, cancel: &CancellationToken, activity: Activity) -> Vec<ToolSpec> {
+        let installed = self.discovery.listed(cancel, activity).await;
+        let mut tools = extra_tools();
+        for provider in providers::ALL
+            .iter()
+            .filter(|p| installed.contains(&p.name))
+        {
+            tools.extend([provider.tool(false), provider.tool(true)]);
+        }
+        tools
     }
 
     async fn call(
@@ -25,6 +101,15 @@ impl Service for Registry {
         cancel: CancellationToken,
         activity: Activity,
     ) -> Result<ToolOutcome, UnknownTool> {
+        let bare = name.strip_suffix("-reply").unwrap_or(&name);
+        if let Some(provider) = providers::ALL
+            .iter()
+            .find(|p| p.name == bare && bare != self.client.name())
+        {
+            return Ok(self
+                .delegate(provider, bare != name, arguments, cancel, activity)
+                .await);
+        }
         extra_call(&name, &arguments, &cancel, activity)
             .await
             .ok_or(UnknownTool)
@@ -150,6 +235,7 @@ mod test_tools {
                 .map(str::to_owned)
         };
         let env = arguments.get("env").and_then(Value::as_object);
+        let started = std::time::Instant::now();
         let mut temporary_files = Vec::new();
         if let Some(path) = text("temp_file") {
             let file = supervise::cleanup::TemporaryFile::create(
@@ -176,7 +262,8 @@ mod test_tools {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
-            deadline: Duration::from_millis(millis(arguments, "deadline_ms").unwrap_or(0)),
+            deadline: started
+                + Duration::from_millis(millis(arguments, "deadline_ms").unwrap_or(0)),
             capture_limit: usize::try_from(millis(arguments, "capture_limit").unwrap_or(0))
                 .unwrap_or(usize::MAX),
             temporary_files,
@@ -191,13 +278,14 @@ mod test_tools {
         } else {
             cancel.clone()
         };
-        tokio::select! {
+        let mut finished = tokio::select! {
             biased;
             result = supervise::run(launch, &supervisor_cancel, activity) => result,
             () = cancel.cancelled(), if on_cancel == Some("drop") => {
                 Err(std::io::Error::other("caller dropped the supervisor"))
             }
-        }
+        }?;
+        finished.error.take().map_or(Ok(finished), Err)
     }
 
     fn run_outcome(result: std::io::Result<Finished>) -> ToolOutcome {
