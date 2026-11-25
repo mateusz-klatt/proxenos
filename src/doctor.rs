@@ -468,7 +468,7 @@ async fn run_handshake(
     // session/process group or Windows kill-on-close job and descendants are stopped too.
     let launched = tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
-        platform::spawn(cmd, &mut files, activity, || {
+        platform::spawn(cmd, &mut files, None, activity, || {
             (Instant::now() < deadline)
                 .then_some(())
                 .ok_or(StartError::Skipped(Ending::TimedOut))
