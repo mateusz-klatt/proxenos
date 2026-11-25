@@ -26,11 +26,21 @@ fn start_limit() -> usize {
     MAX_STARTS
 }
 
-/// Bounded in-memory D19 cache in front of the durable session files. `Some(start)` caches a
-/// unique confirmed start (including non-persisted in-memory instructions); `None` marks a
-/// conflicting duplicate ID. Oldest entries are evicted past `limit`.
+/// State of a cached D19 start entry in [`StartStore`].
+///
+/// Only [`StartEntry::Known`] is dispatchable from memory; it is reached solely after a
+/// confirmed `SaveOutcome::Saved` (or `Unconfigured`) or a matching disk load.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StartEntry {
+    Known(RememberedStart),
+    Unverified(RememberedStart),
+    Ambiguous,
+}
+
+/// Bounded in-memory D19 cache in front of the durable session files. Oldest entries are evicted
+/// past `limit`.
 pub struct StartStore {
-    entries: HashMap<(&'static str, String), Option<RememberedStart>>,
+    entries: HashMap<(&'static str, String), StartEntry>,
     order: VecDeque<(&'static str, String)>,
     limit: usize,
 }
@@ -44,11 +54,11 @@ impl StartStore {
         }
     }
 
-    pub fn get(&self, provider: &'static str, id: &str) -> Option<&Option<RememberedStart>> {
+    pub fn get(&self, provider: &'static str, id: &str) -> Option<&StartEntry> {
         self.entries.get(&(provider, id.into()))
     }
 
-    fn insert(&mut self, key: (&'static str, String), value: Option<RememberedStart>) {
+    fn insert(&mut self, key: (&'static str, String), value: StartEntry) {
         if self.entries.len() == self.limit {
             let oldest = self.order.pop_front().expect("bounded store is non-empty");
             self.entries.remove(&oldest);
@@ -57,7 +67,7 @@ impl StartStore {
         self.entries.insert(key, value);
     }
 
-    pub fn cache(&mut self, provider: &'static str, id: String, value: Option<RememberedStart>) {
+    pub fn set(&mut self, provider: &'static str, id: String, value: StartEntry) {
         let key = (provider, id);
         if let Some(slot) = self.entries.get_mut(&key) {
             *slot = value;
@@ -66,10 +76,40 @@ impl StartStore {
         self.insert(key, value);
     }
 
-    pub fn remove(&mut self, provider: &'static str, id: &str) {
-        let key = (provider, id.to_owned());
-        self.entries.remove(&key);
-        self.order.retain(|item| item != &key);
+    pub fn conflicts_with(
+        &self,
+        provider: &'static str,
+        id: &str,
+        remembered: &RememberedStart,
+    ) -> bool {
+        matches!(self.get(provider, id), Some(StartEntry::Ambiguous))
+            || matches!(
+                self.get(provider, id),
+                Some(StartEntry::Known(existing) | StartEntry::Unverified(existing))
+                    if existing != remembered
+            )
+    }
+
+    pub fn record_unverified(
+        &mut self,
+        provider: &'static str,
+        id: String,
+        remembered: RememberedStart,
+    ) {
+        let next = if self.conflicts_with(provider, &id, &remembered) {
+            StartEntry::Ambiguous
+        } else {
+            StartEntry::Unverified(remembered)
+        };
+        self.set(provider, id, next);
+    }
+
+    pub fn promote(&mut self, provider: &'static str, id: &str, remembered: &RememberedStart) {
+        if let Some(slot) = self.entries.get_mut(&(provider, id.into()))
+            && matches!(slot, StartEntry::Unverified(existing) if existing == remembered)
+        {
+            *slot = StartEntry::Known(remembered.clone());
+        }
     }
 }
 

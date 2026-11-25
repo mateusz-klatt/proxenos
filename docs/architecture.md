@@ -821,16 +821,20 @@ the prompt, the instructions text, the environment, `timeout_ms`, or the provide
 Confirmed-start saves and reply lookups serialize per `(provider, thread_id)` inside the process
 and coordinate across server processes through an advisory lock file (`<key>.lock`) alongside the
 session file. Both reply loads and confirmed-start saves are bounded by the call deadline and
-cancellation. `StartStore` is updated only after the disk outcome is known, and a reply waits
-(bounded by its call deadline and cancellation) while a save for the same ID is in flight. The
-blocking save worker takes ownership of the per-`(provider, thread_id)` lock guard and a shutdown
-`Activity` handle, keeping both until disk persistence and `StartStore` reconciliation complete
-even if the waiting caller times out or is cancelled. If a confirmed-start save fails, times out,
-or is cancelled after the provider finished, Proxenos still returns the finished provider answer
+cancellation. `StartStore` holds three states per key (`Known`, `Unverified`, and `Ambiguous`): a
+confirmed start records `Unverified` (or `Ambiguous` on conflict) synchronously before saving, and
+an entry reaches the dispatchable `Known` state only after a confirmed save (`Saved` or
+`Unconfigured`) under the key lock or a matching disk load on reply; in the rare unverified case
+this costs a disk read and can refuse replies until the save lands or the server restarts. A reply
+waits (bounded by its call deadline and cancellation) while a save for the same ID is in flight.
+The blocking save worker takes ownership of the per-`(provider, thread_id)` lock guard and a
+shutdown `Activity` handle, keeping both until disk persistence and cache promotion complete even
+if the waiting caller times out or is cancelled. If a confirmed-start save fails, times out, or is
+cancelled after the provider finished, Proxenos still returns the finished provider answer
 (`observed.state == "finished"`), records the save failure in `observed.session_save_failure`
-(using existing `FailureKind::Timeout`, `Cancellation`, or `Unknown`) and on standard error, never
-caches an unverified start in `StartStore`, and preserves any in-memory ambiguity marker (`None`).
-An ambiguity tombstone (`ambiguous: true`) is sticky and is never downgraded to `false`.
+(using existing `FailureKind::Timeout`, `Cancellation`, or `Unknown`) and on standard error, leaves
+the entry `Unverified` (or `Ambiguous`) rather than `Known`, and never downgrades `Ambiguous`. An
+ambiguity tombstone (`ambiguous: true`) is sticky and is never downgraded to `false`.
 
 Files are written atomically with mode `0600` in `0700` directories on Unix, after checking that
 each component under the state base (`proxenos`, `sessions`, `<provider>`) is a real directory

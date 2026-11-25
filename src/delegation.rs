@@ -21,7 +21,7 @@ use crate::providers::{DEFAULT_TIMEOUT_MS, Provider, RememberedStart, Report, Tu
 use crate::sessions::{self, SaveOutcome, SessionLookup};
 use crate::supervise::cleanup::DirectoryLease;
 use crate::supervise::{self, Ending, Finished, Launch};
-use crate::tools::{Registry, StartStore};
+use crate::tools::{Registry, StartEntry};
 
 const DEPTH: &[&str] = &[
     "PROXENOS_DEPTH",
@@ -160,12 +160,15 @@ impl Registry {
             let lookup = await_bounded(
                 async {
                     let _key_guard = key_lock.lock().await;
-                    if let Some(cached) = self.starts.lock().unwrap().get(p.name, id).cloned() {
-                        return Ok(match cached {
-                            Some(remembered) => SessionLookup::Found(remembered),
-                            None => SessionLookup::Ambiguous,
-                        });
-                    }
+                    let prior_unverified =
+                        match self.starts.lock().unwrap().get(p.name, id).cloned() {
+                            Some(StartEntry::Known(remembered)) => {
+                                return Ok(SessionLookup::Found(remembered));
+                            }
+                            Some(StartEntry::Ambiguous) => return Ok(SessionLookup::Ambiguous),
+                            Some(StartEntry::Unverified(expected)) => Some(expected),
+                            None => None,
+                        };
                     let id_owned = id.to_owned();
                     let load_activity = activity.clone();
                     let found = tokio::task::spawn_blocking(move || {
@@ -175,23 +178,38 @@ impl Registry {
                     })
                     .await
                     .expect("session loader finished");
-                    match &found {
-                        SessionLookup::Found(remembered) => {
-                            self.starts.lock().unwrap().cache(
-                                p.name,
-                                id.to_owned(),
-                                Some(remembered.clone()),
-                            );
+                    let mut starts = self.starts.lock().unwrap();
+                    let entry = starts
+                        .get(p.name, id)
+                        .cloned()
+                        .or_else(|| prior_unverified.map(StartEntry::Unverified));
+                    Ok(match (entry, found) {
+                        (Some(StartEntry::Unverified(expected)), SessionLookup::Found(disk))
+                            if sessions::matches_persisted(&disk, &expected) =>
+                        {
+                            starts.promote(p.name, id, &expected);
+                            SessionLookup::Found(expected)
                         }
-                        SessionLookup::Ambiguous => {
-                            self.starts
-                                .lock()
-                                .unwrap()
-                                .cache(p.name, id.to_owned(), None);
+                        (Some(StartEntry::Ambiguous), _)
+                        | (Some(StartEntry::Unverified(_)), SessionLookup::Found(_))
+                        | (_, SessionLookup::Ambiguous) => {
+                            starts.set(p.name, id.to_owned(), StartEntry::Ambiguous);
+                            SessionLookup::Ambiguous
                         }
-                        SessionLookup::Missing | SessionLookup::Corrupt(_) => {}
-                    }
-                    Ok(found)
+                        (Some(StartEntry::Unverified(_)), SessionLookup::Missing) => {
+                            SessionLookup::Corrupt(
+                                "session settings for this thread have not been persisted".into(),
+                            )
+                        }
+                        (_, SessionLookup::Corrupt(reason)) => SessionLookup::Corrupt(reason),
+                        (None | Some(StartEntry::Known(_)), SessionLookup::Found(disk)) => {
+                            starts.set(p.name, id.to_owned(), StartEntry::Known(disk.clone()));
+                            SessionLookup::Found(disk)
+                        }
+                        (None | Some(StartEntry::Known(_)), SessionLookup::Missing) => {
+                            SessionLookup::Missing
+                        }
+                    })
                 },
                 load_deadline,
                 cancel,
@@ -365,31 +383,55 @@ impl Registry {
                     settings: turn.settings.clone(),
                     reported_model: result.report.model.clone(),
                 };
+                // Mark the confirmed start Unverified (or Ambiguous on conflict) synchronously
+                // before attempting persistence. Only a confirmed Saved/Unconfigured write under
+                // `key_lock` (or a matching disk load on reply) can promote Unverified to Known,
+                // so timeouts, cancellations, errors, and panics fail closed without caller-side
+                // reconciliation.
+                self.starts.lock().unwrap().record_unverified(
+                    p.name,
+                    id.clone(),
+                    remembered.clone(),
+                );
                 let key_lock = self.session_locks.for_key(p.name, id);
                 let saved = await_bounded(
                     async {
-                        // Hold an owned key guard inside the blocking worker so StartStore and
-                        // disk are always reconciled atomically before any later reply or start
-                        // can take the key lock, even if this caller times out or is cancelled.
+                        // Hold an owned key guard and a shutdown Activity handle inside the
+                        // blocking worker so disk persistence and promotion finish before any
+                        // later reply or start takes the key lock, even after caller timeout or
+                        // cancellation.
                         let key_guard = key_lock.lock_owned().await;
                         let starts = Arc::clone(&self.starts);
                         let saved_id = id.clone();
                         let save_activity = activity.clone();
                         tokio::task::spawn_blocking(move || {
-                            let desired = match starts.lock().unwrap().get(p.name, &saved_id) {
-                                Some(None) => None,
-                                Some(Some(existing)) if existing != &remembered => None,
-                                _ => Some(remembered.clone()),
-                            };
-                            let outcome = sessions::save(p, &saved_id, desired.clone());
-                            let reconciled = reconcile_start_cache(
-                                &mut starts.lock().unwrap(),
+                            let desired = (!starts.lock().unwrap().conflicts_with(
                                 p.name,
                                 &saved_id,
                                 &remembered,
-                                desired,
-                                outcome,
-                            );
+                            ))
+                            .then(|| remembered.clone());
+                            let outcome = sessions::save(p, &saved_id, desired);
+                            let reconciled = match outcome {
+                                Ok(SaveOutcome::Ambiguous) => {
+                                    starts.lock().unwrap().set(
+                                        p.name,
+                                        saved_id,
+                                        StartEntry::Ambiguous,
+                                    );
+                                    Ok(())
+                                }
+                                Ok(SaveOutcome::Saved | SaveOutcome::Unconfigured) => {
+                                    starts
+                                        .lock()
+                                        .unwrap()
+                                        .promote(p.name, &saved_id, &remembered);
+                                    Ok(())
+                                }
+                                Err(error) => {
+                                    Err(Failure::new(FailureKind::Unknown, error.to_string()))
+                                }
+                            };
                             drop(key_guard);
                             drop(save_activity);
                             reconciled
@@ -421,41 +463,6 @@ impl Registry {
         result.excerpt(&self.answers).await;
         drop(activity);
         outcome
-    }
-}
-
-fn reconcile_start_cache(
-    starts: &mut StartStore,
-    provider: &'static str,
-    id: &str,
-    remembered: &RememberedStart,
-    desired: Option<RememberedStart>,
-    outcome: io::Result<SaveOutcome>,
-) -> Result<(), Failure> {
-    let conflicting = matches!(starts.get(provider, id), Some(None))
-        || matches!(starts.get(provider, id), Some(Some(existing)) if existing != remembered)
-        || desired.is_none();
-    match outcome {
-        Ok(SaveOutcome::Ambiguous) => {
-            starts.cache(provider, id.to_owned(), None);
-            Ok(())
-        }
-        Ok(SaveOutcome::Saved | SaveOutcome::Unconfigured) => {
-            starts.cache(
-                provider,
-                id.to_owned(),
-                (!conflicting).then_some(desired).flatten(),
-            );
-            Ok(())
-        }
-        Err(error) => {
-            if conflicting {
-                starts.cache(provider, id.to_owned(), None);
-            } else {
-                starts.remove(provider, id);
-            }
-            Err(Failure::new(FailureKind::Unknown, error.to_string()))
-        }
     }
 }
 

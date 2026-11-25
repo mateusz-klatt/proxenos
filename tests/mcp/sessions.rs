@@ -752,9 +752,13 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
         let saved_symlink_dir = call(
             &mut server2,
             "antigravity",
-            json!({"prompt": "save refuses symlink dir", "model": "other-model"}),
+            json!({"prompt": "save refuses symlink dir", "model": "seed-model"}),
         );
         assert_eq!(saved_symlink_dir["observed"]["state"], "finished");
+        assert_eq!(
+            saved_symlink_dir["observed"]["session_save_failure"]["kind"],
+            "unknown"
+        );
         assert_eq!(
             fs::read_to_string(&decoy_session).unwrap(),
             valid_json.to_string(),
@@ -1189,6 +1193,33 @@ fn save_refuses_session_payload_above_size_limit() {
         json_files.is_empty(),
         "oversized payload must not be written: {json_files:?}"
     );
+    // Because StartStore holds Unverified and disk is missing, a reply must fail closed instead of
+    // treating the unverified start as forgotten or dispatchable.
+    let before_reply = fleet.records().len();
+    let refused = call(
+        &mut server,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "must fail closed while missing on disk",
+            "cwd": fleet.root,
+            "access": "read-only",
+            "mode": "advisory",
+            "model": "saved-model"
+        }),
+    );
+    assert_eq!(
+        refused["observed"]["failure"]["kind"], "invalid_request",
+        "{refused}"
+    );
+    assert!(
+        refused["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not been persisted"),
+        "{refused}"
+    );
+    assert_eq!(fleet.records().len(), before_reply);
     assert!(server.finish().0.success());
 }
 
@@ -1333,6 +1364,100 @@ fn save_error_never_caches_unverified_settings_or_clears_ambiguity() {
     );
     assert_eq!(fleet2.records().len(), before_reply2);
     assert!(server2.finish().0.success());
+
+    // Part C: after a save error leaves StartStore in Unverified(s), a reply goes to disk:
+    // - when disk holds a conflicting non-tombstone record, the reply refuses as conflicting;
+    // - when disk holds a matching record, the reply verifies the match, promotes to Known, and
+    //   proceeds.
+    let fleet3 = Fleet::new(&["codex"]);
+    fleet3.script(
+        "codex",
+        json!([
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED, "final_message": "verified-from-disk-reply"}
+        ]),
+    );
+    let mut seed3 = fleet3.server("claude");
+    assert_eq!(
+        call(
+            &mut seed3,
+            "codex",
+            json!({"prompt": "seed-full", "access": "full"})
+        )["observed"]["state"],
+        "finished"
+    );
+    assert!(seed3.finish().0.success());
+
+    let session3 = single_session_file(&sessions_root(&fleet3.root).join("codex"));
+    let lock3 = session3.with_extension("lock");
+    fs::remove_file(&lock3).unwrap();
+    fs::create_dir(&lock3).unwrap();
+
+    // Conflicting start on a fresh server fails to save (Unverified(read-only)); once the lock
+    // obstruction clears, reply reads disk (access: full), detects the conflict, and refuses.
+    let mut conflict_srv = fleet3.server("claude");
+    let failed_conflict = call(
+        &mut conflict_srv,
+        "codex",
+        json!({"prompt": "conflict-save-err", "access": "read-only"}),
+    );
+    assert_eq!(failed_conflict["observed"]["state"], "finished");
+    assert_eq!(
+        failed_conflict["observed"]["session_save_failure"]["kind"],
+        "unknown"
+    );
+    fs::remove_dir(&lock3).unwrap();
+    let before_conflict_reply = fleet3.records().len();
+    let refused_conflict = call(
+        &mut conflict_srv,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "must detect disk conflict"}),
+    );
+    assert_eq!(
+        refused_conflict["observed"]["failure"]["kind"], "invalid_request",
+        "{refused_conflict}"
+    );
+    assert!(
+        refused_conflict["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting"),
+        "{refused_conflict}"
+    );
+    assert_eq!(fleet3.records().len(), before_conflict_reply);
+    assert!(conflict_srv.finish().0.success());
+
+    // Matching start on a fresh server fails to save (Unverified(full)); once the lock obstruction
+    // clears, reply reads disk (access: full), verifies the match, promotes to Known, and proceeds.
+    fs::create_dir(&lock3).unwrap();
+    let mut match_srv = fleet3.server("claude");
+    let failed_match = call(
+        &mut match_srv,
+        "codex",
+        json!({"prompt": "match-save-err", "access": "full"}),
+    );
+    assert_eq!(failed_match["observed"]["state"], "finished");
+    assert_eq!(
+        failed_match["observed"]["session_save_failure"]["kind"],
+        "unknown"
+    );
+    fs::remove_dir(&lock3).unwrap();
+    let verified_reply = call(
+        &mut match_srv,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "matches disk record"}),
+    );
+    assert_eq!(
+        verified_reply["observed"]["state"], "finished",
+        "{verified_reply}"
+    );
+    assert_eq!(
+        verified_reply["reported"]["content"], "verified-from-disk-reply",
+        "{verified_reply}"
+    );
+    assert!(match_srv.finish().0.success());
 }
 
 #[test]
@@ -1550,4 +1675,273 @@ fn session_save_respects_call_deadline_and_cancellation() {
     let after_cancel_disk: Value =
         serde_json::from_str(&fs::read_to_string(&session_b).unwrap()).unwrap();
     assert_eq!(after_cancel_disk["ambiguous"], true, "{after_cancel_disk}");
+}
+
+#[test]
+fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
+    use std::time::{Duration, Instant};
+
+    // Sub-case (a): a conflicting second start in the same process times out while waiting for
+    // `key_lock` (held by an earlier identical start's detached save worker), so no save worker is
+    // spawned for the conflicting start. The caller must still fail StartStore closed to None so
+    // the in-flight worker preserves None and a later reply is refused as conflicting.
+    let fleet_a = Fleet::new(&["codex"]);
+    fleet_a.script(
+        "codex",
+        json!([
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED, "final_message": "pre-spawn-timeout-answer"}
+        ]),
+    );
+    let mut server_a = fleet_a.server("claude");
+    let seeded_a = call(
+        &mut server_a,
+        "codex",
+        json!({"prompt": "seed", "access": "full"}),
+    );
+    assert_eq!(seeded_a["observed"]["state"], "finished", "{seeded_a}");
+
+    let session_a = single_session_file(&sessions_root(&fleet_a.root).join("codex"));
+    let lock_a = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(session_a.with_extension("lock"))
+        .unwrap();
+    lock_a.lock().unwrap();
+
+    // Start an identical repeat whose detached worker holds `key_lock` while blocked on `<key>.lock`.
+    let holder_a = call(
+        &mut server_a,
+        "codex",
+        json!({"prompt": "hold key lock", "access": "full", "timeout_ms": 400}),
+    );
+    assert_eq!(holder_a["observed"]["state"], "finished", "{holder_a}");
+    assert_eq!(
+        holder_a["observed"]["session_save_failure"]["kind"], "timeout",
+        "{holder_a}"
+    );
+
+    // Conflicting start times out in `key_lock.lock_owned().await` before spawning a save worker.
+    let conflict_timeout = call(
+        &mut server_a,
+        "codex",
+        json!({
+            "prompt": "conflicting pre-spawn timeout",
+            "access": "read-only",
+            "timeout_ms": 400
+        }),
+    );
+    assert_eq!(
+        conflict_timeout["observed"]["state"], "finished",
+        "{conflict_timeout}"
+    );
+    assert_eq!(
+        conflict_timeout["reported"]["content"], "pre-spawn-timeout-answer",
+        "{conflict_timeout}"
+    );
+    assert_eq!(
+        conflict_timeout["observed"]["session_save_failure"]["kind"], "timeout",
+        "{conflict_timeout}"
+    );
+
+    // Release `<key>.lock` so the identical repeat's worker finishes saving `access: full` to disk
+    // and reconciles StartStore, which must preserve the None ambiguity marker.
+    drop(lock_a);
+    let before_reply_a = fleet_a.records().len();
+    let reply_a = call(
+        &mut server_a,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "must fail closed after pre-spawn timeout"
+        }),
+    );
+    assert_eq!(
+        reply_a["observed"]["failure"]["kind"], "invalid_request",
+        "{reply_a}"
+    );
+    assert!(
+        reply_a["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting"),
+        "{reply_a}"
+    );
+    assert_eq!(fleet_a.records().len(), before_reply_a);
+    assert!(server_a.finish().0.success());
+
+    // Sub-case (b): same setup, except the conflicting start is cancelled via
+    // `notifications/cancelled` while waiting in `key_lock.lock_owned().await` before a worker is
+    // spawned.
+    let fleet_b = Fleet::new(&["codex"]);
+    fleet_b.script(
+        "codex",
+        json!([
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED}
+        ]),
+    );
+    let mut server_b = fleet_b.server("claude");
+    let seeded_b = call(
+        &mut server_b,
+        "codex",
+        json!({"prompt": "seed", "access": "full"}),
+    );
+    assert_eq!(seeded_b["observed"]["state"], "finished", "{seeded_b}");
+
+    let session_b = single_session_file(&sessions_root(&fleet_b.root).join("codex"));
+    let lock_b = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(session_b.with_extension("lock"))
+        .unwrap();
+    lock_b.lock().unwrap();
+
+    let holder_b = call(
+        &mut server_b,
+        "codex",
+        json!({"prompt": "hold key lock", "access": "full", "timeout_ms": 400}),
+    );
+    assert_eq!(holder_b["observed"]["state"], "finished", "{holder_b}");
+    assert_eq!(
+        holder_b["observed"]["session_save_failure"]["kind"], "timeout",
+        "{holder_b}"
+    );
+
+    let before_cancel = fleet_b.records().len();
+    server_b.start_call(
+        42,
+        "codex",
+        json!({"prompt": "conflicting pre-spawn cancel", "access": "read-only"}),
+    );
+    let until = Instant::now() + crate::common::WAIT;
+    while fleet_b.records().len() <= before_cancel {
+        assert!(Instant::now() < until, "conflicting stub did not run");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let records = fleet_b.records();
+    let output_path = PathBuf::from(argument(records.last().unwrap(), "-o").unwrap());
+    while output_path.exists() {
+        assert!(
+            Instant::now() < until,
+            "conflicting turn did not finish reading output"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    server_b.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": 42, "reason": "test" }
+    }));
+    server_b
+        .wait_for_stderr("could not save session settings: Saving session settings was cancelled.");
+
+    drop(lock_b);
+    let before_reply_b = fleet_b.records().len();
+    let reply_b = call(
+        &mut server_b,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "must fail closed after pre-spawn cancellation"
+        }),
+    );
+    assert_eq!(
+        reply_b["observed"]["failure"]["kind"], "invalid_request",
+        "{reply_b}"
+    );
+    assert!(
+        reply_b["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting"),
+        "{reply_b}"
+    );
+    assert_eq!(fleet_b.records().len(), before_reply_b);
+    assert!(server_b.finish().0.success());
+
+    // Sub-case (c): a start whose save times out while blocked on `<key>.lock` leaves
+    // Unverified(full) in StartStore; once `<key>.lock` is released and the detached save lands,
+    // a waiting reply proceeds with the landed settings.
+    let fleet_c = Fleet::new(&["codex"]);
+    fleet_c.script(
+        "codex",
+        json!([
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED, "final_message": "reply-after-save-landed"}
+        ]),
+    );
+    let mut seed_c = fleet_c.server("claude");
+    assert_eq!(
+        call(
+            &mut seed_c,
+            "codex",
+            json!({"prompt": "locate lock", "access": "full"})
+        )["observed"]["state"],
+        "finished"
+    );
+    assert!(seed_c.finish().0.success());
+
+    let session_c = single_session_file(&sessions_root(&fleet_c.root).join("codex"));
+    let lock_c = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(session_c.with_extension("lock"))
+        .unwrap();
+    lock_c.lock().unwrap();
+    fs::remove_file(&session_c).unwrap();
+
+    let mut server_c = fleet_c.server("claude");
+    server_c.request(1, "tools/list", json!({}));
+    let timed_c = call(
+        &mut server_c,
+        "codex",
+        json!({"prompt": "delayed save", "access": "full", "timeout_ms": 400}),
+    );
+    assert_eq!(timed_c["observed"]["state"], "finished", "{timed_c}");
+    assert_eq!(
+        timed_c["observed"]["session_save_failure"]["kind"], "timeout",
+        "{timed_c}"
+    );
+
+    let before_reply_c = fleet_c.records().len();
+    server_c.start_call(
+        36,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "waits for save to land"}),
+    );
+    assert!(
+        server_c
+            .next_frame(Instant::now() + Duration::from_millis(150))
+            .is_none(),
+        "reply must wait for in-flight save"
+    );
+    assert_eq!(fleet_c.records().len(), before_reply_c);
+
+    drop(lock_c);
+    let landed_reply: Value =
+        serde_json::from_str(crate::common::text(&server_c.response(36))).unwrap();
+    assert_eq!(
+        landed_reply["observed"]["state"], "finished",
+        "{landed_reply}"
+    );
+    assert_eq!(
+        landed_reply["reported"]["content"], "reply-after-save-landed",
+        "{landed_reply}"
+    );
+    let reply_record = fleet_c.records().pop().unwrap();
+    assert!(
+        reply_record["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "sandbox_mode=\"danger-full-access\""),
+        "reply should inherit full access from the landed save: {reply_record}"
+    );
+    assert!(server_c.finish().0.success());
 }

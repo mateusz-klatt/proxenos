@@ -156,6 +156,13 @@ fn stored_from(start: &RememberedStart) -> io::Result<(StoredSettings, Option<St
     Ok((stored, reported_model))
 }
 
+/// Checks whether a session loaded from disk matches the persisted subset of an in-memory start.
+pub fn matches_persisted(disk: &RememberedStart, expected: &RememberedStart) -> bool {
+    stored_from(expected)
+        .ok()
+        .is_some_and(|want| stored_from(disk).ok().as_ref() == Some(&want))
+}
+
 /// Persists a confirmed start or an ambiguity tombstone (`entry == None`).
 /// Returns `SaveOutcome::Unconfigured` when no durable state directory is configured,
 /// `SaveOutcome::Ambiguous` when the durable record is ambiguous (including on a cross-restart
