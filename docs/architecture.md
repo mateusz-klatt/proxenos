@@ -362,8 +362,8 @@ What this cannot do: when the server exits, its handles and the results it held 
 reliably wakes a client that does not call `await`: an Iris message that a provider has finished
 (D16) is voluntary.
 
-A client that limits the time of one call ends a call that waits at that limit, and the caller,
-who was given no handle, then has nothing to give to `await` or `cancel`. Kimi Code documents a
+If a client times out a `wait: true` start or reply, the caller has no handle for that
+delegation. A caller whose `await` times out keeps its handles. Kimi Code documents a
 default of 60 seconds, as Kimi pointed out in vote 6. What becomes of the delegation depends on
 whether the client also sends a cancellation, which has not been measured for any of the seven
 (section 5). Not decided: what to do about it. Kimi's proposals were a handle before a bounded
@@ -432,8 +432,8 @@ scope of Iris claims.
   another CLI by itself.
 - Some CLIs load instruction files from the working directory with no way to turn that off.
   Delegating into a repository you do not trust exposes the provider to what is written there.
-- When neither the call nor the user's overlay names a model, Proxenos passes none (D8). The
-  provider's CLI then runs its own default or refuses to start. Proxenos does not choose that
+- On a start, when neither the call nor the user's overlay names a model, Proxenos passes none
+  (D8); replies follow D19. The provider's CLI then runs its own default or refuses to start. Proxenos does not choose that
   default, and it can change with a release of the CLI or with the user's configuration of it. A
   model that is named is a request: the result names the one that ran only where the provider
   reports it.
