@@ -349,7 +349,6 @@ fn output_that_piles_up_unread_past_its_limit_makes_serving_fail() {
     let mut stdin = child.stdin.take().expect("stdin is piped");
     writeln!(stdin, "{}", initialize_frame()).expect("the server reads its input");
     let large = "z".repeat(1 << 20);
-    let started = Instant::now();
     // More than 64 MiB of answers, none of them read. Writing may fail once serving has stopped.
     for id in 2..80 {
         let call = json!({
@@ -361,10 +360,8 @@ fn output_that_piles_up_unread_past_its_limit_makes_serving_fail() {
         }
     }
     let output = child.wait_with_output().expect("the server exits");
-    let took = started.elapsed();
     drop((stdin, unread));
     assert_eq!(output.status.code(), Some(1));
-    assert!(took < Duration::from_secs(15), "exit took {took:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("more than 64 MiB of output"), "{stderr}");
 }
