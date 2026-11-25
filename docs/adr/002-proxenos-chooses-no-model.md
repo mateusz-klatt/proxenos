@@ -1,6 +1,7 @@
 # 002: Proxenos chooses no model
 
-Status: proposed on 2026-11-25, pending the owner's decision.
+Status: accepted by the owner on 2026-11-25: "3 x tak" (yes to all three), in answer to three
+questions, of which this was one. Proposed the same day.
 
 ## Problem
 
@@ -24,10 +25,11 @@ call names, or else the one that the user's own overlay sets for that provider, 
 none. A reply follows D19. The user of vote 5 who asked for the strongest model as the default can
 request it by naming it, in the call or in the overlay.
 
-D8 in [architecture.md](../architecture.md) is written to this proposal and says so. If the owner
-decides against it, D8 returns to the strongest model as each provider's default.
+D8 in [architecture.md](../architecture.md) is written to this decision.
 
 ## Open
+
+The owner's acceptance did not settle this question.
 
 What a reply does when it must name a model (D5) and its start passed none. It could repeat the
 model that the provider reported for the start, where the provider reported one, or ask the caller

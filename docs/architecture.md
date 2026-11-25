@@ -221,11 +221,11 @@ roster therefore needs no release. A user adds a role by adding a file.
   model ran (D2).
 - A catalogue entry never widens what a provider is declared to enforce (D5).
 
-The point on the model is written to the proposal of
-[ADR 002](adr/002-proxenos-chooses-no-model.md), which the owner has not decided. Until vote 6 it
-read "the default model of each provider is the strongest one it offers", a provisional choice of
-vote 4. In vote 6 seven of nine positions opposed that default. Five of them said to pass no model
-unless one is named, and three of those let the user's configuration name it.
+The point on the model is [ADR 002](adr/002-proxenos-chooses-no-model.md), which the owner accepted
+on 2026-11-25. Until vote 6 it read "the default model of each provider is the strongest one it
+offers", a provisional choice of vote 4. In vote 6 seven of nine positions opposed that default.
+Five of them said to pass no model unless one is named, and three of those let the user's
+configuration name it.
 
 ### D9. Usage is read, never spent
 
@@ -301,11 +301,12 @@ except in the platform modules of D6.
 Role texts are written for Proxenos, model-neutral, one per role. A call may also name no role and
 carry only `instructions`.
 
-Which roles ship is not decided. Three families, in four answers, agreed in vote 2 on code review,
-debugging, verification of claims, architecture, security and plan review, and on a redesigned
-cross-discipline role. The strongest model of each family would ship the code reviewer, the
-debugger and the claim verifier first. They did not agree on a scope analyst, a challenger or a
-separate test role.
+The first three to ship are the code reviewer, the debugger and the claim verifier, as the owner
+accepted on 2026-11-25. The rest of the roster is not decided. Three families, in four answers,
+agreed in vote 2 on code review, debugging, verification of claims, architecture, security and plan
+review, and on a redesigned cross-discipline role. The strongest model of each family would ship the
+code reviewer, the debugger and the claim verifier first. They did not agree on a scope analyst, a
+challenger or a separate test role.
 
 A role's text says what `implementation` allows it, and tells a role whose worth is its
 independence, such as one that verifies a claim, to stay advisory. That is an instruction: under
@@ -398,8 +399,8 @@ silently changed the model.
 
 Where the start passed no model (D8), there is none to reapply. Not decided: what a reply does
 when it must name a model (D5) and its start passed none. It could repeat the model that the
-provider reported for the start, where the provider reported one, or ask the caller for one. The
-proposal of ADR 002 opened this question, and no voter was asked it.
+provider reported for the start, where the provider reported one, or ask the caller for one.
+ADR 002 opened this question, and neither a voter nor the owner has answered it.
 
 The settings of a session are kept in a file in the user's state directory, without secrets, for a
 limited time. When a session is not found there, Proxenos asks for the settings and supplies no
