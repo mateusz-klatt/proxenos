@@ -666,7 +666,7 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
         json!({"prompt": "1", "model": "m1", "instructions": "cache-only-note"}),
     );
     assert_eq!(s1["observed"]["state"], "finished", "{s1}");
-    fleet.assert_steps_remaining("agy", 5);
+    fleet.assert_steps_remaining("agy", 10);
     let failed = call(
         &mut server,
         "antigravity",
@@ -679,14 +679,14 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
         "timeout waiting for response",
     );
     assert_eq!(failed["reported"]["thread_id"], "failed", "{failed}");
-    fleet.assert_steps_remaining("agy", 4);
+    fleet.assert_steps_remaining("agy", 9);
     let unremembered_failed = call(
         &mut server,
         "antigravity-reply",
         json!({"thread_id": "failed", "prompt": "retry"}),
     );
     assert_observed_failure(&unremembered_failed, "invalid_request", "no settings");
-    fleet.assert_steps_remaining("agy", 4);
+    fleet.assert_steps_remaining("agy", 9);
 
     let s2 = call(
         &mut server,
@@ -694,14 +694,14 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
         json!({"prompt": "2", "model": "m2", "instructions": "still-cached-note"}),
     );
     assert_eq!(s2["observed"]["state"], "finished", "{s2}");
-    fleet.assert_steps_remaining("agy", 3);
+    fleet.assert_steps_remaining("agy", 8);
     let s3 = call(
         &mut server,
         "antigravity",
         json!({"prompt": "3", "model": "m3"}),
     );
     assert_eq!(s3["observed"]["state"], "finished", "{s3}");
-    fleet.assert_steps_remaining("agy", 2);
+    fleet.assert_steps_remaining("agy", 7);
 
     // Limit is 2, so s2 remained in StartStore (retaining its non-persisted instructions) while
     // s1 was evicted from StartStore and served from the durable session file (retaining model
@@ -789,7 +789,7 @@ fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
         .into_iter()
         .filter(|record| record["args"] != json!(["--version"]))
         .count();
-    assert_eq!(turns, 6);
+    assert_eq!(turns, 11);
 }
 
 #[cfg(windows)]
