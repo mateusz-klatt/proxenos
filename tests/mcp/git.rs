@@ -166,6 +166,21 @@ fn git_handles_an_unborn_repo_and_omits_an_unavailable_worktree() {
 }
 
 #[test]
+fn unavailable_scratch_space_omits_git_observations_and_prevents_dispatch() {
+    let repo = Repository::new();
+    let mut server = repo.server(&repo.fleet.root.join("missing"));
+    let result = call(
+        &mut server,
+        "antigravity",
+        json!({"cwd": repo.repo, "prompt": "check"}),
+    );
+    assert_eq!(result["observed"]["failure"]["kind"], "launch");
+    assert!(result["observed"]["git"].is_null());
+    assert_eq!(repo.fleet.records().len(), 1);
+    assert_eq!(repo.fleet.records()[0]["args"], json!(["--version"]));
+}
+
+#[test]
 fn git_omits_an_unsupported_object_format_without_affecting_the_call() {
     let fleet = Fleet::new(&["git", "agy"]);
     let metadata = "worktree\nobjects\nindex\nunsupported-hash\n";

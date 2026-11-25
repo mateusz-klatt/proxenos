@@ -3,10 +3,12 @@
 mod git;
 
 use std::ffi::OsString;
-use std::io::{self, Read};
+use std::io;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::discovery::Executable;
@@ -195,11 +197,12 @@ async fn launch(
 ) -> io::Result<Attempt> {
     let scratch = PrivateDirectory::create()?;
     let output = scratch.path.join("output");
-    let reader = std::fs::OpenOptions::new()
+    let reader = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(&output)?;
+        .open(&output)
+        .await?;
     let mut args = exe.prefix.clone();
     let command = (p.argv)(turn, &output);
     args.extend(command.args);
@@ -214,9 +217,12 @@ async fn launch(
         temporary_files: vec![TemporaryFile::Directory(scratch.clone())],
     };
     let done = supervise::run(launch, cancel, activity).await?;
-    let file_bytes = reader.metadata()?.len();
+    let file_bytes = reader.metadata().await?.len();
     let mut bytes = Vec::new();
-    reader.take(CAPTURE_LIMIT as u64).read_to_end(&mut bytes)?;
+    reader
+        .take(CAPTURE_LIMIT as u64)
+        .read_to_end(&mut bytes)
+        .await?;
     Ok(Attempt {
         finished: done,
         output: String::from_utf8_lossy(&bytes).into_owned(),

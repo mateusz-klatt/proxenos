@@ -93,18 +93,18 @@ pub(super) async fn snapshot(
     }
     // git status can invoke arbitrary clean filters from repository config. Give it the real
     // objects, index and worktree, but our own Git directory with no hooks, filters or remotes.
-    let view = PrivateDirectory::create().ok()?;
-    fs::create_dir(view.path.join("refs")).ok()?;
-    fs::write(
-        view.path.join("config"),
-        format!("[core]\nrepositoryformatversion=1\n[extensions]\nobjectformat={format}\n"),
-    )
-    .ok()?;
-    fs::write(
-        view.path.join("HEAD"),
-        format!("{}\n", commit.unwrap_or("ref: refs/heads/unborn")),
-    )
-    .ok()?;
+    let config =
+        format!("[core]\nrepositoryformatversion=1\n[extensions]\nobjectformat={format}\n");
+    let head = format!("{}\n", commit.unwrap_or("ref: refs/heads/unborn"));
+    let view = tokio::task::spawn_blocking(move || {
+        let view = PrivateDirectory::create().ok()?;
+        fs::create_dir(view.path.join("refs")).ok()?;
+        fs::write(view.path.join("config"), config).ok()?;
+        fs::write(view.path.join("HEAD"), head).ok()?;
+        Some(view)
+    })
+    .await
+    .expect("Git view setup worker finished")?;
     let mut status = launch(
         root,
         &[
