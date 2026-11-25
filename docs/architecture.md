@@ -6,7 +6,8 @@ changes it. [ADR 001](adr/001-decisions-by-the-families-that-can-answer.md) says
 taken, and [votes.md](votes.md) records who proposed and who supported each one.
 
 **Status: milestone 1 in progress.** `proxenos mcp --client <client>` serves the MCP layer of D4.
-The D6 supervisor runs the stub CLI in the behavioural tests. The first provider comes later.
+Codex and Antigravity run through the D6 supervisor. Behavioural tests install the crate’s stub
+in a private search path.
 The remaining decisions describe the design.
 
 ## 1. Terms
@@ -101,6 +102,28 @@ is still provisional. Claude (Fable 5.2, max) chose it in vote 4; over votes 4 a
 positions are for it, one of them only if D2 defines a retention that is secure and stable, which
 it does not do yet. Two would have the rest read in pages, and one would keep the file only if a
 tool of Proxenos can read it back.
+
+In step 3 the server sends schema version 1. Each attempt records its process status, elapsed
+time, deadline, last output, total and captured byte counts, including the private CLI output
+file. The request's timeout covers discovery, workspace inspection and both attempts of a retry.
+Version probes have a ten-second deadline and git commands two seconds each. Their cleanup
+budgets also apply, so the response can arrive later. A cancelled MCP request has no response. A connection whose input ends can still
+receive the cancellation result during the drain described in D4.
+
+The supervisor keeps the first 4 MiB from each stream and reads up to 4 MiB of the Codex
+final-message file. Output beyond the limit can include a terminal record that the parser cannot
+see. Answers longer than 16 KiB have a UTF-8 excerpt and an archive path. This step keeps the
+eight most recent long answers per server, up to 4 MiB apiece, in a separate temporary directory.
+An orderly exit removes its files where permitted. An abrupt exit or a denied deletion can leave
+them behind. Unix directories use mode 0700 and answer files 0600. Windows inherits the user's
+temporary directory permissions. A caller inside another sandbox may only be able to read the
+excerpt. This is the current implementation, pending a durable retention decision.
+
+Git observations use a private configuration with the worktree, index and object database.
+This avoids executing repository-configured filters and hooks. The two samples can differ from
+the user's own status, including its configured filters, excludes and submodule changes. Paths
+are relative to the worktree root. If Git is unavailable, the directory is outside a worktree,
+or a bounded, UTF-8 listing cannot be obtained, that sample is absent.
 
 The same object as MCP structured content is left out until it has been measured on the seven
 clients: sent twice, a long answer could cost its reader twice.
@@ -197,6 +220,15 @@ alone.
 
 Where providers differ, each one's tests assert its own behaviour through the compiled binary.
 Antigravity's reply must name a model; Cursor's must not. A shared test could assert neither.
+
+For Codex, a completed turn and a final answer are separate evidence. A turn that explicitly
+lacks its answer can be asked once for that answer in the same confirmed thread. The server
+does not repeat the original task. Antigravity's print command can direct an unknown ID to a
+different conversation. The server requires an exact regular `<id>.db` or `<id>.pb` entry,
+checks again after discovery and the initial git snapshot, and compares the ID the CLI reports.
+These checks cannot make the store lookup atomic with Antigravity's own lookup.
+`PROXENOS_AGY_CONVERSATIONS_DIR` takes precedence over `CLAUDE_DELEGATOR_AGY_CONVERSATIONS_DIR`
+and the default `~/.gemini/antigravity-cli/conversations`.
 
 ### D6. Children are supervised to the end
 
@@ -697,7 +729,14 @@ ADR 002 opened this question, and neither a voter nor the owner has answered it.
 The settings of a session are kept in a file in the user's state directory, without secrets, for a
 limited time. When a session is not found there, Proxenos asks for the settings and supplies no
 defaults of its own. It cannot check that the settings a caller then gives match the forgotten
-start. A reply may change the mode, since a session that advised may be asked to implement.
+start. A reply may change the mode where the CLI accepts it. Codex keeps the start's developer
+instructions, including its mode, for the session. Proxenos refuses a change before dispatch.
+
+At milestone 1 step 3 the server remembers starts only in process memory. Restarting it loses
+that continuity. A reply to an unremembered session must supply its directory, access, mode and
+the optional settings used at the start. Proxenos cannot verify these values against that start.
+Pending the owner decision above, an Antigravity reply with no remembered start model must
+supply a model explicitly. Proxenos never infers one from provider output.
 
 The file was a provisional choice of vote 4, where one reviewer would keep the settings only in
 the server's memory, and vote 6 backed it: eight of nine positions are for a file. How long it is

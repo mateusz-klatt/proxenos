@@ -1,11 +1,45 @@
 //! Release the files owned by a launch after its child has been reaped.
 
+#[cfg(feature = "test-tools")]
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::PathBuf;
 
-pub(crate) struct TemporaryFile {
+pub(crate) enum TemporaryFile {
+    #[cfg(feature = "test-tools")]
+    Reserved(ReservedFile),
+    // Both the parser and the reaper retain the directory. The last owner releases it.
+    Directory(std::sync::Arc<PrivateDirectory>),
+}
+
+pub(crate) struct PrivateDirectory {
+    pub path: PathBuf,
+}
+
+impl PrivateDirectory {
+    pub fn create() -> io::Result<std::sync::Arc<Self>> {
+        let directory = std::env::temp_dir().join(format!("proxenos-run-{}", uuid::Uuid::new_v4()));
+        create_private_directory(&directory)?;
+        Ok(std::sync::Arc::new(Self { path: directory }))
+    }
+}
+
+pub(crate) fn create_private_directory(directory: &std::path::Path) -> io::Result<()> {
+    let builder = &mut fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(builder, 0o700);
+    builder.create(directory)
+}
+
+impl Drop for PrivateDirectory {
+    fn drop(&mut self) {
+        report_error(&self.path, fs::remove_dir_all(&self.path));
+    }
+}
+
+#[cfg(feature = "test-tools")]
+pub(crate) struct ReservedFile {
     path: PathBuf,
     reservation: PathBuf,
     #[cfg(windows)]
@@ -13,6 +47,7 @@ pub(crate) struct TemporaryFile {
 }
 
 impl TemporaryFile {
+    #[cfg(feature = "test-tools")]
     pub(crate) async fn create(
         path: PathBuf,
         #[cfg(windows)] retry_budget: std::time::Duration,
@@ -29,28 +64,39 @@ impl TemporaryFile {
                 let _ = fs::remove_dir(reservation);
                 return Err(error);
             }
-            Ok(Self {
+            Ok(Self::Reserved(ReservedFile {
                 path,
                 reservation,
                 #[cfg(windows)]
                 retry_budget,
-            })
+            }))
         })
         .await?
     }
 }
 
 /// Called on the blocking launch or reaper worker.
-pub(crate) fn remove_files_blocking(files: &[TemporaryFile]) {
+pub(crate) fn remove_files_blocking(files: Vec<TemporaryFile>) {
     for file in files {
-        let removed = fs::remove_file(&file.path);
+        match file {
+            #[cfg(feature = "test-tools")]
+            TemporaryFile::Reserved(file) => file.remove(),
+            TemporaryFile::Directory(directory) => drop(directory),
+        }
+    }
+}
+
+#[cfg(feature = "test-tools")]
+impl ReservedFile {
+    fn remove(&self) {
+        let removed = fs::remove_file(&self.path);
         #[cfg(windows)]
-        let removed = retry_shared_file(&file.path, removed, file.retry_budget);
+        let removed = retry_shared_file(&self.path, removed, self.retry_budget);
         // No further unlink will target this name. Return the reservation before writing a
         // diagnostic, which can block when a client stops reading stderr.
-        let released = fs::remove_dir(&file.reservation);
-        report_error(&file.path, removed);
-        report_error(&file.reservation, released);
+        let released = fs::remove_dir(&self.reservation);
+        report_error(&self.path, removed);
+        report_error(&self.reservation, released);
     }
 }
 
@@ -66,7 +112,7 @@ fn report_error(path: &std::path::Path, result: io::Result<()>) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-tools"))]
 fn retry_shared_file(
     path: &std::path::Path,
     mut removed: std::io::Result<()>,

@@ -49,6 +49,7 @@ impl From<io::Error> for StartError {
     }
 }
 
+#[cfg(feature = "test-tools")]
 impl Ending {
     pub fn name(&self) -> &'static str {
         match self {
@@ -155,7 +156,7 @@ pub async fn run(
         let _ = publish.send(child);
         // Only failed or skipped launches have files left here. This worker holds its
         // shutdown handle while removing them, even if a diagnostic blocks on stderr.
-        cleanup::remove_files_blocking(&launch.temporary_files);
+        cleanup::remove_files_blocking(launch.temporary_files);
     });
     let mut child = match launched.await.map_err(io::Error::other)? {
         Ok(child) => child,

@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"eeb3a731-d53a-4444-8a6a-4d9d89e76073"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","id":"item_1","text":"Examining the text."}}
+{"type":"item.completed","item":{"type":"command_execution","id":"item_1","aggregated_output":"An untrusted tool said authentication failed."}}
+{"type":"item.completed","item":{"type":"agent_message","id":"item_1","text":"The two paragraphs agree."}}
+{"type":"turn.completed","usage":{"input_tokens":17,"cached_input_tokens":3,"output_tokens":6}}

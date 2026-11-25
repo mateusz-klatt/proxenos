@@ -7,8 +7,10 @@ the others over MCP and gets the answer back in the same conversation.
 In a Greek city, a proxenos was a citizen who looked after the envoys of another city. This one
 looks after other agents.
 
-**Status: design.** There is no code yet. Proxenos will be written in Rust and run on Linux,
-macOS and Windows.
+**Milestone 1 is in progress.** Run `proxenos mcp --client <client>` to serve foreground
+Codex and Antigravity calls over standard I/O. Installed providers offer a start tool and a
+reply tool. A server omits the client’s own provider. See the [architecture](docs/architecture.md)
+for the result format, access mechanisms and session limits.
 
 ## Licence
 

@@ -71,7 +71,7 @@ pub fn spawn(
             let status = leader.process.wait();
             let files_to_remove = status.is_ok().then_some(leader.temporary_files);
             let _ = report_status.send(status);
-            remove_files_blocking(files_to_remove.as_deref().unwrap_or_default());
+            remove_files_blocking(files_to_remove.unwrap_or_default());
         }
         let _ = report_cleaned.send(());
         drop(activity);

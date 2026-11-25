@@ -143,7 +143,7 @@ pub fn spawn(
         let _ = report_status.send(status);
         let _ = done.send(());
         let _ = released.blocking_recv();
-        cleanup::remove_files_blocking(files_to_remove.as_deref().unwrap_or_default());
+        cleanup::remove_files_blocking(files_to_remove.unwrap_or_default());
         let _ = report_cleaned.send(());
         drop(activity);
     });

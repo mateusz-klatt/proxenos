@@ -1,21 +1,45 @@
-//! The tools that `proxenos mcp` serves.
-//!
-//! Providers are added in later steps of milestone 1. Until then the server lists only the
-//! tools of the `test-tools` feature, which exists so that the MCP layer can be tested through
-//! the compiled binary. A release is built without it.
+//! Routes the client's installed providers and the optional protocol test tools.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::client::Client;
+use crate::discovery::Discovery;
 use crate::mcp::{Activity, Service, ToolOutcome, ToolSpec, UnknownTool};
+use crate::providers::{self, Settings};
 
-pub struct Registry;
+pub struct Registry {
+    client: Client,
+    pub discovery: Discovery,
+    pub answers: crate::envelope::AnswerArchive,
+    pub starts: Mutex<HashMap<(&'static str, String), Settings>>,
+}
+
+impl Registry {
+    pub fn new(client: Client) -> Self {
+        Self {
+            client,
+            discovery: Discovery::new(client),
+            starts: Mutex::default(),
+            answers: Default::default(),
+        }
+    }
+}
 
 impl Service for Registry {
-    fn tools(&self) -> Vec<ToolSpec> {
-        extra_tools()
+    async fn tools(&self, cancel: &CancellationToken, activity: Activity) -> Vec<ToolSpec> {
+        let installed = self.discovery.listed(cancel, activity).await;
+        let mut tools = extra_tools();
+        for provider in providers::ALL
+            .iter()
+            .filter(|p| installed.contains(&p.name))
+        {
+            tools.extend([provider.tool(false), provider.tool(true)]);
+        }
+        tools
     }
 
     async fn call(
@@ -25,6 +49,15 @@ impl Service for Registry {
         cancel: CancellationToken,
         activity: Activity,
     ) -> Result<ToolOutcome, UnknownTool> {
+        let bare = name.strip_suffix("-reply").unwrap_or(&name);
+        if let Some(provider) = providers::ALL
+            .iter()
+            .find(|p| p.name == bare && bare != self.client.name())
+        {
+            return Ok(self
+                .delegate(provider, bare != name, arguments, cancel, activity)
+                .await);
+        }
         extra_call(&name, &arguments, &cancel, activity)
             .await
             .ok_or(UnknownTool)
