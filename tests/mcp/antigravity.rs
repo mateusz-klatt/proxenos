@@ -382,19 +382,36 @@ fn a_reply_checks_the_confirmed_id_as_well_as_the_store() {
         "error": "failed"
     })
     .to_string();
+    let success_missing_id = json!({
+        "status": "SUCCESS",
+        "response": "unconfirmed conversation text"
+    })
+    .to_string();
+    let quota_without_id = json!({
+        "status": "ERROR",
+        "response": "must not leak without id",
+        "error": "Quota exhausted. Resets at 2030-04-02T15:00:00Z."
+    })
+    .to_string();
     fleet.script(
         "agy",
         json!([
             {"stdout": FINISHED},
             {"stdout": long_other},
-            {"stdout": error_other}
+            {"stdout": error_other},
+            {"stdout": success_missing_id},
+            {"stdout": quota_without_id, "code": 1}
         ]),
     );
     let mut server = fleet.server("claude");
-    for _ in 0..3 {
+    for expect_id in [Some(ID), Some(ID), Some(ID), None] {
         let result = resume(&mut server, "old-thread", &fleet.root);
         assert_eq!(result["observed"]["state"], "failed", "{result}");
-        assert_eq!(result["reported"]["thread_id"], ID, "{result}");
+        assert_eq!(
+            result["reported"]["thread_id"].as_str(),
+            expect_id,
+            "{result}"
+        );
         assert!(
             result["reported"]["content"].is_null(),
             "mismatched reply leaked foreign content: {result}"
@@ -415,6 +432,48 @@ fn a_reply_checks_the_confirmed_id_as_well_as_the_store() {
             "{result}"
         );
     }
+    let quota = resume(&mut server, "old-thread", &fleet.root);
+    assert_eq!(quota["observed"]["state"], "failed", "{quota}");
+    assert!(quota["reported"]["thread_id"].is_null(), "{quota}");
+    assert!(
+        quota["reported"]["content"].is_null(),
+        "error reply without id must not populate content: {quota}"
+    );
+    assert_eq!(quota["reported"]["failure"]["kind"], "quota", "{quota}");
+    assert_eq!(
+        quota["reported"]["failure"]["reset_at"], "2030-04-02T15:00:00Z",
+        "{quota}"
+    );
+}
+
+#[test]
+fn invalid_or_oversized_antigravity_conversation_ids_are_dropped() {
+    let fleet = Fleet::new(&["agy"]);
+    let oversized = "a".repeat(200);
+    let bad_start = json!({"status": "SUCCESS", "conversation_id": "../escape", "response": "ok"});
+    let long_start = json!({"status": "SUCCESS", "conversation_id": oversized, "response": "ok"});
+    fleet.script(
+        "agy",
+        json!([
+            {"stdout": bad_start.to_string()},
+            {"stdout": long_start.to_string()}
+        ]),
+    );
+    let mut server = fleet.server("claude");
+    let rejected = resume(&mut server, &oversized, &fleet.root);
+    assert_eq!(
+        rejected["observed"]["failure"]["kind"], "invalid_request",
+        "{rejected}"
+    );
+    assert!(fleet.records().is_empty());
+    for _ in 0..2 {
+        let start = call(&mut server, "antigravity", json!({"prompt": "start"}));
+        assert_eq!(start["observed"]["state"], "finished", "{start}");
+        assert!(
+            start["reported"]["thread_id"].is_null(),
+            "invalid/oversized conversation_id was not dropped: {start}"
+        );
+    }
 }
 
 #[test]
@@ -426,9 +485,11 @@ fn a_conversation_removed_during_discovery_never_receives_the_reply() {
     fs::create_dir_all(&directory).unwrap();
     let history = directory.join(format!("{ID}.db"));
     fs::write(&history, []).unwrap();
+    let ready = fleet.root.join("probe.ready");
+    let release = fleet.root.join("probe.release");
     fs::write(
         fleet.root.join("agy.version"),
-        json!({"stdout":"1.2.3", "sleep_ms":1000}).to_string(),
+        json!({"stdout": "1.2.3", "ready": ready, "wait_for": release}).to_string(),
     )
     .unwrap();
     fleet.script("agy", json!([{"stdout": FINISHED}]));
@@ -442,11 +503,12 @@ fn a_conversation_removed_during_discovery_never_receives_the_reply() {
         }),
     );
     let until = Instant::now() + crate::common::WAIT;
-    while fleet.records().is_empty() {
+    while !ready.exists() {
         assert!(Instant::now() < until, "the version probe did not start");
         std::thread::sleep(Duration::from_millis(10));
     }
     fs::remove_file(history).unwrap();
+    fs::write(&release, []).unwrap();
     let answer = server.response(41);
     let result: Value = serde_json::from_str(crate::common::text(&answer)).unwrap();
     assert_eq!(

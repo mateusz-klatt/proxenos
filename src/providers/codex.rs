@@ -135,6 +135,24 @@ fn diagnostic(raw: &str) -> Failure {
     failure
 }
 
+fn parse_usage(value: Option<&Value>) -> Option<Value> {
+    let object = value?.as_object()?;
+    let filtered: serde_json::Map<String, Value> = [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        let count = object.get(key)?.as_u64()?;
+        Some((key.to_owned(), Value::from(count)))
+    })
+    .collect();
+    (!filtered.is_empty()).then_some(Value::Object(filtered))
+}
+
 fn parse(run: &Finished, final_message: &str, expected: Option<&str>) -> Report {
     let mut report = Report::default();
     let mut streamed = None;
@@ -150,7 +168,7 @@ fn parse(run: &Finished, final_message: &str, expected: Option<&str>) -> Report 
                 report.thread_id = event["thread_id"]
                     .as_str()
                     .map(str::trim)
-                    .and_then(nonempty)
+                    .filter(|id| is_canonical_uuid(id))
                     .map(str::to_owned);
             }
             Some("item.completed") if event["item"]["type"] == "agent_message" => {
@@ -161,7 +179,7 @@ fn parse(run: &Finished, final_message: &str, expected: Option<&str>) -> Report 
             }
             Some("turn.completed") => {
                 report.completed = true;
-                report.usage = event.get("usage").filter(|v| v.is_object()).cloned();
+                report.usage = parse_usage(event.get("usage"));
             }
             Some("error") => last_error = event["message"].as_str().map(diagnostic),
             Some("turn.failed") => {
@@ -219,9 +237,6 @@ fn parse(run: &Finished, final_message: &str, expected: Option<&str>) -> Report 
             let parsed = diagnostic(&stderr);
             (parsed.kind != FailureKind::Unknown).then_some(parsed)
         });
-    }
-    if !report.thread_id.as_deref().is_some_and(is_canonical_uuid) {
-        report.retry_missing_final = false;
     }
     report
 }

@@ -375,34 +375,46 @@ fn post_spawn_output_capture_failure_keeps_dispatch_evidence() {
     let finished = include_str!("fixtures/codex/finished.jsonl");
     fleet.script(
         "codex",
-        json!([{"stdout": finished, "remove_output": true}]),
+        json!([
+            {"stdout": finished, "remove_output": true},
+            {"stdout": finished, "replace_output_with_dir": true}
+        ]),
     );
     let mut server = fleet.server("claude");
-    let failed = call(&mut server, "codex", json!({"prompt": "delete output"}));
-    assert_eq!(failed["observed"]["state"], "failed", "{failed}");
-    assert_eq!(
-        failed["observed"]["failure"]["kind"], "capture",
-        "post-spawn read error must not be reported as launch: {failed}"
-    );
-    assert!(failed["observed"]["passed"].is_object(), "{failed}");
-    assert!(
-        failed["observed"]["access_mechanism"].is_string(),
-        "{failed}"
-    );
-    assert_eq!(
-        failed["observed"]["attempts"]
-            .as_array()
-            .unwrap_or_else(|| panic!("missing attempts: {failed}"))
-            .len(),
-        1
-    );
-    assert_eq!(failed["observed"]["attempts"][0]["exit_code"], 0);
-    assert!(
-        failed["observed"]["attempts"][0]["stdout_bytes"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
+    for (prompt, expected_detail) in [("delete output", ""), ("dir output", "not a regular file")] {
+        let failed = call(&mut server, "codex", json!({"prompt": prompt}));
+        assert_eq!(failed["observed"]["state"], "failed", "{failed}");
+        assert_eq!(
+            failed["observed"]["failure"]["kind"], "capture",
+            "post-spawn read error must not be reported as launch: {failed}"
+        );
+        assert!(
+            failed["observed"]["failure"]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing failure message: {failed}"))
+                .contains(expected_detail),
+            "{failed}"
+        );
+        assert!(failed["observed"]["passed"].is_object(), "{failed}");
+        assert!(
+            failed["observed"]["access_mechanism"].is_string(),
+            "{failed}"
+        );
+        assert_eq!(
+            failed["observed"]["attempts"]
+                .as_array()
+                .unwrap_or_else(|| panic!("missing attempts: {failed}"))
+                .len(),
+            1
+        );
+        assert_eq!(failed["observed"]["attempts"][0]["exit_code"], 0);
+        assert!(
+            failed["observed"]["attempts"][0]["stdout_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
 }
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -461,11 +473,7 @@ mod linux_supervision {
         fleet.script("agy", json!([{"ready": ready, "sleep_ms": 60000}]));
         let mut server = server_without_sigterm(&fleet);
         server.request(1, "tools/list", json!({}));
-        server.start_call(
-            9,
-            "antigravity",
-            json!({"prompt": "denied stop", "timeout_ms": 400}),
-        );
+        server.start_call(9, "antigravity", json!({"prompt": "denied stop"}));
         let until = Instant::now() + common::WAIT;
         while !ready.exists() {
             assert!(Instant::now() < until, "stub did not start");
@@ -478,6 +486,7 @@ mod linux_supervision {
             std::path::PathBuf::from(args[pos + 1].as_str().unwrap())
         };
         assert!(log.exists(), "provider scratch must exist while stub runs");
+        server.close_input();
         let failed: Value = serde_json::from_str(common::text(&server.response(9))).unwrap();
         assert_eq!(failed["observed"]["state"], "failed", "{failed}");
         assert_eq!(
@@ -503,8 +512,203 @@ mod linux_supervision {
         );
         assert_eq!(failed["observed"]["attempts"][0]["signal"], libc::SIGKILL);
         assert!(!log.exists(), "reaped provider scratch was not removed");
-        assert!(server.finish().0.success());
+        assert!(server.wait_for_exit(common::EXIT_WAIT).0.success());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_replacement_of_output_file_fails_without_blocking() {
+    let fleet = Fleet::new(&["codex"]);
+    let finished = include_str!("fixtures/codex/finished.jsonl");
+    fleet.script(
+        "codex",
+        json!([{"stdout": finished, "replace_output_with_fifo": true}]),
+    );
+    let mut server = fleet.server("claude");
+    let failed = call(&mut server, "codex", json!({"prompt": "fifo output"}));
+    assert_eq!(failed["observed"]["state"], "failed", "{failed}");
+    assert_eq!(failed["observed"]["failure"]["kind"], "capture", "{failed}");
+    assert!(
+        failed["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing failure message: {failed}"))
+            .contains("not a regular file"),
+        "{failed}"
+    );
+    assert!(failed["observed"]["passed"].is_object(), "{failed}");
+    assert_eq!(failed["observed"]["attempts"][0]["exit_code"], 0);
+}
+
+#[test]
+fn preflight_respects_call_deadline_and_cancellation() {
+    // Part A: expired call deadline stops post-discovery preflight immediately.
+    let fleet = Fleet::new(&["git", "agy"]);
+    let store = fleet.root.join(".gemini/antigravity-cli/conversations");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("paper-crane.db"), []).unwrap();
+    fleet.script("git", json!([{"sleep_ms": 5000}]));
+    let mut server = fleet.server("claude");
+    server.request(1, "tools/list", json!({}));
+    let timed = call(
+        &mut server,
+        "antigravity-reply",
+        json!({
+            "thread_id": "paper-crane", "prompt": "timeout preflight",
+            "model": "named", "access": "full", "mode": "advisory",
+            "cwd": fleet.root, "timeout_ms": 150
+        }),
+    );
+    assert_eq!(timed["observed"]["failure"]["kind"], "timeout", "{timed}");
+    assert!(
+        timed["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing failure message: {timed}"))
+            .contains("preflight"),
+        "{timed}"
+    );
+    assert_eq!(timed["observed"]["attempts"], json!([]));
+
+    // Part B: connection EOF cancels post-discovery preflight cleanly.
+    let fleet2 = Fleet::new(&["git", "agy"]);
+    let store2 = fleet2.root.join(".gemini/antigravity-cli/conversations");
+    std::fs::create_dir_all(&store2).unwrap();
+    std::fs::write(store2.join("paper-crane.db"), []).unwrap();
+    let ready = fleet2.root.join("git.ready");
+    fleet2.script("git", json!([{"ready": ready, "sleep_ms": 60000}]));
+    let mut server2 = fleet2.server("claude");
+    server2.request(1, "tools/list", json!({}));
+    server2.start_call(
+        20,
+        "antigravity-reply",
+        json!({
+            "thread_id": "paper-crane", "prompt": "cancel preflight",
+            "model": "named", "access": "full", "mode": "advisory",
+            "cwd": fleet2.root
+        }),
+    );
+    let until = Instant::now() + common::WAIT;
+    while !ready.exists() {
+        assert!(Instant::now() < until, "git before-snapshot did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    server2.close_input();
+    let cancelled: Value = serde_json::from_str(common::text(&server2.response(20))).unwrap();
+    assert_eq!(cancelled["observed"]["state"], "cancelled", "{cancelled}");
+    assert_eq!(
+        cancelled["observed"]["failure"]["kind"], "cancellation",
+        "{cancelled}"
+    );
+    assert!(
+        cancelled["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing failure message: {cancelled}"))
+            .contains("preflight"),
+        "{cancelled}"
+    );
+    assert_eq!(cancelled["observed"]["attempts"], json!([]));
+}
+
+#[test]
+fn start_store_ignores_failed_starts_and_evicts_oldest_entries() {
+    let fleet = Fleet::new(&["agy"]);
+    let store = fleet.root.join(".gemini/antigravity-cli/conversations");
+    std::fs::create_dir_all(&store).unwrap();
+    for id in ["s1", "s2", "s3", "failed"] {
+        std::fs::write(store.join(format!("{id}.db")), []).unwrap();
+    }
+    let ok = |id: &str| {
+        json!({
+            "stdout": json!({"status": "SUCCESS", "conversation_id": id, "response": id}).to_string()
+        })
+    };
+    let err_step = json!({
+        "stdout": json!({"status": "ERROR", "conversation_id": "failed", "response": "", "error": "timeout waiting for response"}).to_string(),
+        "code": 1
+    });
+    fleet.script(
+        "agy",
+        json!([ok("s1"), err_step, ok("s2"), ok("s3"), ok("s2"), ok("s1")]),
+    );
+    let mut command = fleet.command("claude");
+    command.env("PROXENOS_TEST_START_LIMIT", "2");
+    let mut server = common::Server::start_command(command);
+    server.initialize("2025-11-25");
+
+    let s1 = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "1", "model": "m1"}),
+    );
+    assert_eq!(s1["observed"]["state"], "finished", "{s1}");
+    let failed = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "bad", "model": "m-bad"}),
+    );
+    assert_eq!(failed["observed"]["state"], "failed", "{failed}");
+    let unremembered_failed = call(
+        &mut server,
+        "antigravity-reply",
+        json!({"thread_id": "failed", "prompt": "retry"}),
+    );
+    assert_eq!(
+        unremembered_failed["observed"]["failure"]["kind"], "invalid_request",
+        "failed start must not be recorded in starts: {unremembered_failed}"
+    );
+
+    let s2 = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "2", "model": "m2"}),
+    );
+    assert_eq!(s2["observed"]["state"], "finished", "{s2}");
+    let s3 = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "3", "model": "m3"}),
+    );
+    assert_eq!(s3["observed"]["state"], "finished", "{s3}");
+
+    // Limit is 2, so s1 was evicted while s2 and s3 remain remembered.
+    let evicted = call(
+        &mut server,
+        "antigravity-reply",
+        json!({"thread_id": "s1", "prompt": "evicted"}),
+    );
+    assert_eq!(
+        evicted["observed"]["failure"]["kind"], "invalid_request",
+        "oldest start was not evicted: {evicted}"
+    );
+    assert!(
+        evicted["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing failure message: {evicted}"))
+            .contains("no settings"),
+        "{evicted}"
+    );
+
+    let kept = call(
+        &mut server,
+        "antigravity-reply",
+        json!({"thread_id": "s2", "prompt": "still remembered"}),
+    );
+    assert_eq!(kept["observed"]["state"], "finished", "{kept}");
+    assert_eq!(kept["observed"]["passed"]["model"], "m2", "{kept}");
+
+    let explicit = call(
+        &mut server,
+        "antigravity-reply",
+        json!({
+            "thread_id": "s1", "prompt": "explicit",
+            "cwd": fleet.root, "access": "full", "mode": "advisory", "model": "m1-explicit"
+        }),
+    );
+    assert_eq!(explicit["observed"]["state"], "finished", "{explicit}");
+    assert_eq!(
+        explicit["observed"]["passed"]["model"], "m1-explicit",
+        "{explicit}"
+    );
 }
 
 #[cfg(windows)]

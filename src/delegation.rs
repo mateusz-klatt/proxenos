@@ -2,10 +2,10 @@
 
 mod git;
 
-use std::collections::hash_map::Entry;
 use std::ffi::OsString;
+use std::future::Future;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -29,17 +29,6 @@ const DEPTH: &[&str] = &[
     "CLAUDE_DELEGATOR_GROK_DEPTH",
     "CLAUDE_DELEGATOR_CURSOR_DEPTH",
     "CLAUDE_DELEGATOR_COPILOT_DEPTH",
-];
-
-const POST_SPAWN: [(FailureKind, &str); 2] = [
-    (
-        FailureKind::Capture,
-        "Could not read the provider output file",
-    ),
-    (
-        FailureKind::Unknown,
-        "Supervision failed after starting the provider",
-    ),
 ];
 
 impl Registry {
@@ -82,13 +71,8 @@ impl Registry {
             match args
                 .get("thread_id")
                 .and_then(Value::as_str)
-                .and_then(|id| {
-                    self.starts
-                        .lock()
-                        .unwrap()
-                        .get(&(p.name, id.into()))
-                        .cloned()
-                }) {
+                .and_then(|id| self.starts.lock().unwrap().get(p.name, id).cloned())
+            {
                 Some(None) => {
                     return Err(Failure::new(
                         FailureKind::InvalidRequest,
@@ -104,8 +88,8 @@ impl Registry {
         let mut turn = p
             .turn(args, reply, start)
             .map_err(|message| Failure::new(FailureKind::InvalidRequest, message))?;
-        prepare(p, &turn).await?;
         let call_deadline = result.started() + Duration::from_millis(turn.timeout_ms);
+        prepare(p, &turn, call_deadline, cancel, activity.clone()).await?;
         let exe = match self
             .discovery
             .resolve(p.name, cancel, call_deadline, activity.clone())
@@ -131,7 +115,9 @@ impl Registry {
         let mut retry = false;
         let outcome = loop {
             // Discovery and workspace inspection can outlast a conversation store entry.
-            if let Err(error) = prepare(p, &turn).await {
+            if turn.thread_id.is_some()
+                && let Err(error) = prepare(p, &turn, call_deadline, cancel, activity.clone()).await
+            {
                 break Err(error);
             }
             let attempt = launch(&exe, p, &turn, call_deadline, cancel, activity.clone()).await;
@@ -147,9 +133,7 @@ impl Registry {
             };
             result.observe(&attempt, p, &turn);
             let finished = &attempt.finished;
-            if matches!(finished.ending, Ending::Exited)
-                && let Some(error) = attempt.error
-            {
+            if let Some(error) = attempt.error {
                 result.report = Report {
                     thread_id: result.report.thread_id.take(),
                     ..Report::default()
@@ -166,21 +150,6 @@ impl Registry {
             {
                 let diagnostic = &finished.stderr.bytes[..finished.stderr.bytes.len().min(2048)];
                 result.report.diagnostic = Some(String::from_utf8_lossy(diagnostic).into_owned());
-            }
-            if !reply
-                && !retry
-                && let Some(id) = &result.report.thread_id
-            {
-                match self.starts.lock().unwrap().entry((p.name, id.clone())) {
-                    Entry::Vacant(slot) => {
-                        slot.insert(Some(turn.settings.clone()));
-                    }
-                    Entry::Occupied(mut slot) => {
-                        if slot.get().as_ref() != Some(&turn.settings) {
-                            slot.insert(None);
-                        }
-                    }
-                }
             }
             match finished.ending {
                 Ending::TimedOut => {
@@ -232,6 +201,16 @@ impl Registry {
                     "The CLI exited without evidence of a completed turn.",
                 ));
             }
+            if !reply
+                && result.report.completed
+                && result.report.failure.is_none()
+                && let Some(id) = &result.report.thread_id
+            {
+                self.starts
+                    .lock()
+                    .unwrap()
+                    .record(p.name, id.clone(), turn.settings.clone());
+            }
             break Ok(());
         };
         if let Some(snapshot) = git::snapshot(&turn.settings.cwd, cancel, None, activity).await {
@@ -242,12 +221,50 @@ impl Registry {
     }
 }
 
-async fn prepare(p: &'static Provider, turn: &Turn) -> Result<(), Failure> {
+async fn await_bounded<T>(
+    fut: impl Future<Output = Result<T, Failure>>,
+    deadline: Instant,
+    cancel: &CancellationToken,
+    what: &str,
+) -> Result<T, Failure> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(Failure::new(
+            FailureKind::Cancellation,
+            format!("{what} was cancelled."),
+        )),
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(Failure::new(
+            FailureKind::Timeout,
+            format!("{what} exceeded the call's deadline."),
+        )),
+        result = fut => result,
+    }
+}
+
+async fn prepare(
+    p: &'static Provider,
+    turn: &Turn,
+    deadline: Instant,
+    cancel: &CancellationToken,
+    activity: Activity,
+) -> Result<(), Failure> {
     let check = turn.clone();
-    tokio::task::spawn_blocking(move || (p.prepare)(&check))
-        .await
-        .expect("preflight worker finished")
-        .map_err(|reason| Failure::new(FailureKind::InvalidRequest, reason))
+    let task = tokio::task::spawn_blocking(move || {
+        let result = (p.prepare)(&check);
+        drop(activity);
+        result
+    });
+    await_bounded(
+        async {
+            task.await
+                .expect("preflight worker finished")
+                .map_err(|reason| Failure::new(FailureKind::InvalidRequest, reason))
+        },
+        deadline,
+        cancel,
+        "Provider preflight",
+    )
+    .await
 }
 
 pub struct Attempt {
@@ -260,14 +277,67 @@ pub struct Attempt {
     pub cli_timeout_ms: Option<u64>,
 }
 
-async fn read_output(path: &Path) -> io::Result<(Vec<u8>, u64)> {
-    let file = tokio::fs::File::open(path).await?;
-    let total = file.metadata().await?.len();
+fn require_regular(meta: &std::fs::Metadata) -> io::Result<()> {
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider output is not a regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn open_output_blocking(path: &Path) -> io::Result<(std::fs::File, u64)> {
+    require_regular(&std::fs::symlink_metadata(path)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NONBLOCK | libc::O_NOFOLLOW,
+    );
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    require_regular(&metadata)?;
+    Ok((file, metadata.len()))
+}
+
+async fn read_regular_file(path: PathBuf, activity: Activity) -> io::Result<(Vec<u8>, u64)> {
+    let (file, total) = tokio::task::spawn_blocking(move || {
+        let result = open_output_blocking(&path);
+        drop(activity);
+        result
+    })
+    .await
+    .expect("output open worker finished")?;
     let mut bytes = Vec::new();
-    file.take(CAPTURE_LIMIT as u64)
+    tokio::fs::File::from_std(file)
+        .take(CAPTURE_LIMIT as u64)
         .read_to_end(&mut bytes)
         .await?;
     Ok((bytes, total))
+}
+
+async fn read_output(
+    path: PathBuf,
+    deadline: Instant,
+    cancel: &CancellationToken,
+    activity: Activity,
+) -> Result<(Vec<u8>, u64), Failure> {
+    await_bounded(
+        async {
+            read_regular_file(path, activity).await.map_err(|err| {
+                Failure::new(
+                    FailureKind::Capture,
+                    format!("Could not read the provider output file: {err}"),
+                )
+            })
+        },
+        deadline,
+        cancel,
+        "Reading the provider output file",
+    )
+    .await
 }
 
 async fn launch(
@@ -305,23 +375,30 @@ async fn launch(
         capture_limit: CAPTURE_LIMIT,
         temporary_files: vec![scratch.for_child()],
     };
-    let mut done = supervise::run(launch, cancel, activity).await?;
-    let read = if done.spawned && done.error.is_none() {
-        read_output(&output).await
+    let mut done = supervise::run(launch, cancel, activity.clone()).await?;
+    let read = if done.spawned && done.error.is_none() && matches!(done.ending, Ending::Exited) {
+        read_output(output, deadline, cancel, activity).await
     } else {
         Ok((Vec::new(), 0))
     };
     scratch.finish().await;
-    let (kind, detail) = POST_SPAWN[usize::from(done.error.is_some())];
+    let supervision = done.error.take();
+    let is_supervision = supervision.is_some();
     let (bytes, file_bytes, read_error) = match read {
         Ok((bytes, file_bytes)) => (bytes, file_bytes, None),
         Err(error) => (Vec::new(), 0, Some(error)),
     };
-    let error = done
-        .error
-        .take()
-        .or(read_error)
-        .map(|err| Failure::new(kind, format!("{detail}: {err}")));
+    let (read_kind, read_msg) = read_error.map_or((FailureKind::Capture, None), |failure| {
+        (failure.kind, Some(failure.message))
+    });
+    let kind = [read_kind, FailureKind::Unknown][usize::from(is_supervision)];
+    let prefix =
+        ["", "Supervision failed after starting the provider: "][usize::from(is_supervision)];
+    let error = supervision
+        .as_ref()
+        .map(ToString::to_string)
+        .or(read_msg)
+        .map(|msg| Failure::new(kind, format!("{prefix}{msg}")));
     Ok(Attempt {
         finished: done,
         output: String::from_utf8_lossy(&bytes).into_owned(),

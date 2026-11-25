@@ -50,17 +50,23 @@ fn conversations() -> Option<PathBuf> {
     .or_else(|| std::env::home_dir().map(|home| home.join(".gemini/antigravity-cli/conversations")))
 }
 
+const MAX_CONVERSATION_ID_LEN: usize = 128;
+
+fn is_valid_id(id: &str) -> bool {
+    (1..=MAX_CONVERSATION_ID_LEN).contains(&id.len())
+        && id.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+}
+
 fn prepare(turn: &Turn) -> Result<(), String> {
     let Some(id) = &turn.thread_id else {
         return Ok(());
     };
     // agy can deliver a prompt addressed to an unknown ID to a different conversation.
     // Check the spelling from the directory listing even on case-insensitive filesystems.
-    let valid = id.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'));
-    if !valid {
+    if !is_valid_id(id) {
         return Err("thread_id must be an Antigravity conversation identifier".into());
     }
     let directory =
@@ -169,19 +175,25 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
         };
     };
     let text = |key: &str| value[key].as_str().filter(|s| !s.trim().is_empty());
+    let raw_id = text("conversation_id");
     let mut report = Report {
-        thread_id: text("conversation_id").map(String::from),
+        thread_id: raw_id.filter(|id| is_valid_id(id)).map(String::from),
         ..Report::default()
     };
-    if expected.is_some() && expected != report.thread_id.as_deref() {
+    let success = value["status"] == "SUCCESS";
+    let id_matches = expected.is_none() || expected == report.thread_id.as_deref();
+    let foreign_id = expected.is_some() && raw_id.is_some() && expected != raw_id;
+    if foreign_id || (success && !id_matches) {
         report.failure = Some(Failure::new(
             FailureKind::Unknown,
             "Antigravity did not confirm the requested conversation ID",
         ));
         return report;
     }
-    report.content = text("response").map(String::from);
-    if value["status"] != "SUCCESS" {
+    if id_matches {
+        report.content = text("response").map(String::from);
+    }
+    if !success {
         let reason = text("error").unwrap_or(stderr.trim());
         let reason = if reason.is_empty() {
             "Antigravity returned an unsuccessful status"

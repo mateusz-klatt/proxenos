@@ -407,8 +407,54 @@ fn codex_rejects_non_uuid_thread_ids_on_reply_and_retry() {
             .len(),
         1
     );
-    assert_eq!(no_retry["reported"]["thread_id"], "named-session");
+    assert!(
+        no_retry["reported"]["thread_id"].is_null(),
+        "non-UUID thread_id must not be returned or cached: {no_retry}"
+    );
     assert_eq!(invocations(&fleet).len(), 1);
+}
+
+#[test]
+fn codex_filters_usage_to_expected_scalar_fields_and_drops_invalid_thread_ids() {
+    let fleet = Fleet::new(&["codex"]);
+    let bloated_usage = format!(
+        "{}\n{}\n{}\n",
+        json!({"type": "thread.started", "thread_id": "x".repeat(200)}),
+        json!({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}),
+        json!({
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": "not-a-number",
+                "output_tokens": 9,
+                "reasoning_output_tokens": 4,
+                "junk": "z".repeat(50_000),
+                "nested": {"a": 1}
+            }
+        })
+    );
+    let only_junk_usage = format!(
+        "{}\n{}\n{}\n",
+        json!({"type": "thread.started", "thread_id": THREAD}),
+        json!({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}),
+        json!({"type": "turn.completed", "usage": {"junk": 1}})
+    );
+    fleet.script(
+        "codex",
+        json!([{"stdout": bloated_usage}, {"stdout": only_junk_usage}]),
+    );
+    let mut server = fleet.server("claude");
+    let first = call(&mut server, "codex", json!({"prompt": "first"}));
+    assert_eq!(first["observed"]["state"], "finished", "{first}");
+    assert!(first["reported"]["thread_id"].is_null(), "{first}");
+    assert_eq!(
+        first["reported"]["usage"],
+        json!({"output_tokens": 9, "reasoning_output_tokens": 4}),
+        "{first}"
+    );
+    let second = call(&mut server, "codex", json!({"prompt": "second"}));
+    assert_eq!(second["observed"]["state"], "finished", "{second}");
+    assert_eq!(second["reported"]["thread_id"], THREAD, "{second}");
+    assert!(second["reported"]["usage"].is_null(), "{second}");
 }
 
 #[test]

@@ -349,6 +349,76 @@ fn discovery_waits_are_bounded_by_each_callers_deadline_and_cancellation() {
     assert_eq!(recovered["reported"]["content"], "recovered");
 }
 
+#[test]
+fn resolve_waits_only_for_its_own_provider_probe() {
+    let fleet = Fleet::new(&["codex", "agy"]);
+    let ready = fleet.root.join("codex.ready");
+    let release = fleet.root.join("codex.release");
+    version(
+        &fleet,
+        "codex",
+        json!({"ready": ready, "wait_for": release, "stdout": "1.2.3"}),
+    );
+    fleet.script("agy", json!([turn("fast path")]));
+    let mut server = fleet.server("claude");
+    let started = Instant::now();
+    let fast = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "run quickly", "timeout_ms": 1500}),
+    );
+    assert_eq!(fast["observed"]["state"], "finished", "{fast}");
+    assert_eq!(fast["reported"]["content"], "fast path");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "fast provider waited on slow probe: {:?}",
+        started.elapsed()
+    );
+    assert!(!release.exists(), "slow probe was never released");
+    fs::write(&release, []).unwrap();
+    assert_eq!(listed(&mut server).len(), 4);
+}
+
+#[test]
+fn an_early_caller_timeout_does_not_cancel_the_shared_discovery_probe() {
+    let fleet = Fleet::new(&["agy"]);
+    let ready = fleet.root.join("shared.ready");
+    let release = fleet.root.join("shared.release");
+    version(
+        &fleet,
+        "agy",
+        json!({"ready": ready, "wait_for": release, "stdout": "1.2.3"}),
+    );
+    fleet.script("agy", json!([turn("healthy")]));
+    let mut server = fleet.server("claude");
+    server.start_call(
+        1,
+        "antigravity",
+        json!({"prompt": "times out first", "timeout_ms": 300}),
+    );
+    let until = Instant::now() + WAIT;
+    while !ready.exists() {
+        assert!(Instant::now() < until, "shared probe did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    server.start_call(2, "antigravity", json!({"prompt": "waits for probe"}));
+    let first: Value = serde_json::from_str(text(&server.response(1))).unwrap();
+    assert_eq!(first["observed"]["failure"]["kind"], "timeout", "{first}");
+    fs::write(&release, []).unwrap();
+    let second: Value = serde_json::from_str(text(&server.response(2))).unwrap();
+    assert_eq!(second["observed"]["state"], "finished", "{second}");
+    assert_eq!(second["reported"]["content"], "healthy");
+    let version_probes = fleet
+        .records()
+        .into_iter()
+        .filter(|record| record["args"] == json!(["--version"]))
+        .count();
+    assert_eq!(
+        version_probes, 1,
+        "normal return of request 1 cancelled the shared probe"
+    );
+}
+
 #[cfg(unix)]
 mod unix_signals {
     #![allow(unsafe_code)]

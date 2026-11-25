@@ -756,14 +756,15 @@ defaults of its own. It cannot check that the settings a caller then gives match
 start. A reply may change the mode where the CLI accepts it. Codex keeps the start's developer
 instructions, including its mode, for the session. Proxenos refuses a change before dispatch.
 
-At milestone 1 step 3 the server remembers starts only in process memory. Restarting it loses
-that continuity. `timeout_ms` is initialized per request and is never inherited by a reply. If two
-starts report the same `thread_id` with conflicting settings, the server marks that ID ambiguous
-and refuses to dispatch a reply from it. A reply to an unremembered session must supply its
-directory, access, mode and the optional settings used at the start. Proxenos cannot verify these
-values against that start. Pending the owner decision above, an Antigravity reply with no
-remembered start model must supply a model explicitly. Proxenos never infers one from provider
-output.
+At milestone 1 step 3 the server remembers confirmed, successful starts only in a bounded
+in-memory store (at most 1024 entries, evicting the oldest entry first). Restarting the server
+loses that continuity, and a reply to an evicted session must supply its directory, access, mode
+and any optional settings used at the start, just like after a restart. `timeout_ms` is
+initialized per request and is never inherited by a reply. If two confirmed starts report the
+same `thread_id` with conflicting settings, the server marks that ID ambiguous and refuses to
+dispatch a reply from it. Proxenos cannot verify explicit reply settings against a forgotten or
+evicted start. Pending the owner decision above, an Antigravity reply with no remembered start
+model must supply a model explicitly. Proxenos never infers one from provider output.
 
 The file was a provisional choice of vote 4, where one reviewer would keep the settings only in
 the server's memory, and vote 6 backed it: eight of nine positions are for a file. How long it is

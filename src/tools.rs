@@ -1,6 +1,6 @@
 //! Routes the client's installed providers and the optional protocol test tools.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
@@ -11,12 +11,63 @@ use crate::discovery::Discovery;
 use crate::mcp::{Activity, Service, ToolOutcome, ToolSpec, UnknownTool};
 use crate::providers::{self, Settings};
 
+const MAX_STARTS: usize = 1024;
+
+fn start_limit() -> usize {
+    #[cfg(feature = "test-tools")]
+    if let Some(limit) = std::env::var("PROXENOS_TEST_START_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return limit;
+    }
+    MAX_STARTS
+}
+
+/// Bounded in-memory D19 session map. `Some(settings)` remembers a unique confirmed start;
+/// `None` marks a conflicting duplicate ID. Oldest entries are evicted past `limit`.
+pub struct StartStore {
+    entries: HashMap<(&'static str, String), Option<Settings>>,
+    order: VecDeque<(&'static str, String)>,
+    limit: usize,
+}
+
+impl StartStore {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            limit: start_limit(),
+        }
+    }
+
+    pub fn get(&self, provider: &'static str, id: &str) -> Option<&Option<Settings>> {
+        self.entries.get(&(provider, id.into()))
+    }
+
+    pub fn record(&mut self, provider: &'static str, id: String, settings: Settings) {
+        let key = (provider, id);
+        if let Some(slot) = self.entries.get_mut(&key) {
+            if slot.as_ref() != Some(&settings) {
+                *slot = None;
+            }
+            return;
+        }
+        if self.entries.len() == self.limit {
+            let oldest = self.order.pop_front().expect("bounded store is non-empty");
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, Some(settings));
+    }
+}
+
 pub struct Registry {
     client: Client,
     pub discovery: Discovery,
     pub answers: crate::envelope::AnswerArchive,
-    /// `Some(settings)` remembers a unique start; `None` marks a conflicting duplicate ID.
-    pub starts: Mutex<HashMap<(&'static str, String), Option<Settings>>>,
+    pub starts: Mutex<StartStore>,
 }
 
 impl Registry {
@@ -24,7 +75,7 @@ impl Registry {
         Self {
             client,
             discovery: Discovery::new(client),
-            starts: Mutex::default(),
+            starts: Mutex::new(StartStore::new()),
             answers: Default::default(),
         }
     }

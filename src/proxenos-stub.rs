@@ -143,6 +143,22 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
             .ok_or("missing output flag")?;
         fs::remove_file(&args[pos + 1])?;
     }
+    if step["replace_output_with_dir"] == true {
+        let pos = args
+            .iter()
+            .position(|arg| arg == "-o" || arg == "--log-file")
+            .ok_or("missing output flag")?;
+        fs::remove_file(&args[pos + 1])?;
+        fs::create_dir(&args[pos + 1])?;
+    }
+    #[cfg(unix)]
+    if step["replace_output_with_fifo"] == true {
+        let pos = args
+            .iter()
+            .position(|arg| arg == "-o" || arg == "--log-file")
+            .ok_or("missing output flag")?;
+        platform::replace_with_fifo(Path::new(&args[pos + 1]))?;
+    }
     io::stdout().write_all(step["stdout"].as_str().unwrap_or("").as_bytes())?;
     io::stdout().flush()?;
     io::stderr().write_all(step["stderr"].as_str().unwrap_or("").as_bytes())?;
@@ -233,6 +249,17 @@ mod platform {
     pub(super) fn await_term(ready: &str) -> io::Result<()> {
         fs::write(ready, [])?;
         super::wait_until(|| Ok(RECEIVED_TERM.load(Ordering::Relaxed)))
+    }
+
+    pub(super) fn replace_with_fifo(path: &std::path::Path) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        fs::remove_file(path)?;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        // SAFETY: c_path is a valid NUL-terminated path created by this stub test.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        (rc == 0).then_some(()).ok_or_else(io::Error::last_os_error)
     }
 }
 

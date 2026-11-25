@@ -204,15 +204,25 @@ fn retry_sharing_violation(
     budget: Duration,
 ) -> io::Result<()> {
     use std::time::Instant;
-    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, ERROR_SHARING_VIOLATION,
+    };
 
-    // Terminating a job can return while its processes still hold a file without delete sharing.
+    // Terminating a job can return while its processes still hold a file without delete sharing,
+    // leave a delete pending (ERROR_ACCESS_DENIED), or hold a subdirectory open
+    // (ERROR_DIR_NOT_EMPTY).
+    const RETRYABLE: [i32; 3] = [
+        ERROR_SHARING_VIOLATION.cast_signed(),
+        ERROR_ACCESS_DENIED.cast_signed(),
+        ERROR_DIR_NOT_EMPTY.cast_signed(),
+    ];
     let started = Instant::now();
     let mut removed = remove();
-    while removed
-        .as_ref()
-        .is_err_and(|error| error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()))
-    {
+    while removed.as_ref().is_err_and(|error| {
+        error
+            .raw_os_error()
+            .is_some_and(|code| RETRYABLE.contains(&code))
+    }) {
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             break;

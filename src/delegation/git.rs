@@ -1,10 +1,11 @@
 //! Best-effort observations from Git, with private configuration for the worktree scan.
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::Activity;
@@ -15,17 +16,30 @@ use crate::supervise::{self, Ending, Finished, Launch};
 // If the listing does not fit, omit it instead of presenting an incomplete inventory.
 const LIMIT: usize = 256 * 1024;
 
+async fn find_git() -> Option<PathBuf> {
+    static GIT: OnceCell<Option<PathBuf>> = OnceCell::const_new();
+    GIT.get_or_init(|| async {
+        tokio::task::spawn_blocking(|| {
+            // Never look up git in the provider's working directory or execute a shell launcher.
+            std::env::split_paths(&std::env::var_os("PATH")?)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join(format!("git{}", std::env::consts::EXE_SUFFIX)))
+                .find(|candidate| candidate.is_file())
+        })
+        .await
+        .expect("git lookup worker finished")
+    })
+    .await
+    .clone()
+}
+
 pub(super) async fn snapshot(
     cwd: &Path,
     cancel: &CancellationToken,
     deadline: Option<Instant>,
     activity: Activity,
 ) -> Option<Value> {
-    // Never look up git in the provider's working directory or execute a shell launcher.
-    let program = std::env::split_paths(&std::env::var_os("PATH")?)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(format!("git{}", std::env::consts::EXE_SUFFIX)))
-        .find(|candidate| candidate.is_file())?;
+    let program = find_git().await?;
     let launch = |cwd: &Path, args: &[&str]| {
         let limit = Instant::now() + Duration::from_secs(2);
         Launch {

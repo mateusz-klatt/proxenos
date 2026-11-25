@@ -344,7 +344,7 @@ impl<S: Service> ServerHandler for Handler<S> {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let cancel = self.stopper.shutdown.child_token();
-        let _stop_on_drop = cancel.clone().drop_guard();
+        let stop_on_drop = cancel.clone().drop_guard();
         let listing = self.service.tools(&cancel, self.active.clone());
         tokio::pin!(listing);
         let tools = tokio::select! {
@@ -357,6 +357,7 @@ impl<S: Service> ServerHandler for Handler<S> {
         .into_iter()
         .map(|spec| Tool::new(spec.name, spec.description, Arc::new(spec.input_schema)))
         .collect();
+        stop_on_drop.disarm();
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -369,7 +370,7 @@ impl<S: Service> ServerHandler for Handler<S> {
         let stopper = Arc::clone(&self.stopper);
         let cancel = stopper.shutdown.child_token();
         // If rmcp drops this request, the call is told to stop rather than left running.
-        let _cancel_on_drop = cancel.clone().drop_guard();
+        let cancel_on_drop = cancel.clone().drop_guard();
         let service = Arc::clone(&self.service);
         let arguments = request.arguments.unwrap_or_default();
         let call_name = name.clone();
@@ -404,6 +405,7 @@ impl<S: Service> ServerHandler for Handler<S> {
                 task.await
             }
         };
+        cancel_on_drop.disarm();
         let outcome = joined.map_err(|_| {
             ErrorData::internal_error(
                 format!("The {name} tool failed unexpectedly; the server is still running."),

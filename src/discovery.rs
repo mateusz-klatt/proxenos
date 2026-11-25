@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, watch};
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
@@ -99,87 +98,54 @@ struct Located {
     check: Mutex<Result<(), DiscoveryError>>,
 }
 
-type Inventory = BTreeMap<&'static str, Located>;
+type ProviderSlot = watch::Receiver<Option<Arc<Located>>>;
+type Slots = BTreeMap<&'static str, ProviderSlot>;
 
 pub struct Discovery {
     client: Client,
-    scan: StdMutex<Option<watch::Receiver<Option<Arc<Inventory>>>>>,
+    slots: StdMutex<Option<Slots>>,
 }
 
 impl Discovery {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            scan: StdMutex::new(None),
+            slots: StdMutex::new(None),
         }
     }
 
-    fn scan(
-        &self,
-        cancel: &CancellationToken,
-        activity: Activity,
-    ) -> watch::Receiver<Option<Arc<Inventory>>> {
-        let mut slot = self.scan.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(done) = &*slot {
-            return done.clone();
+    fn slots(&self, cancel: &CancellationToken, activity: Activity) -> Slots {
+        let mut guard = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slots) = &*guard {
+            return slots.clone();
         }
-        let (publish, done) = watch::channel(None);
         let scan_cancel = cancel.child_token();
-        let client = self.client;
-        tokio::spawn(async move {
-            let mut checks = JoinSet::new();
-            for provider in providers::ALL
-                .iter()
-                .filter(|provider| provider.name != client.name())
-            {
-                let cancel = scan_cancel.clone();
-                let activity = activity.clone();
-                checks.spawn(async move {
-                    let executable = tokio::task::spawn_blocking(move || locate(provider))
-                        .await
-                        .expect("resolver finished");
-                    let check = match &executable {
-                        Ok(exe) => probe(exe, &cancel, None, activity).await,
-                        Err(error) => Err(DiscoveryError::from(error.clone())),
-                    };
-                    (
-                        provider.name,
-                        Located {
-                            executable,
-                            check: Mutex::new(check),
-                        },
-                    )
-                });
-            }
-            let inventory: Inventory = checks.join_all().await.into_iter().collect();
-            let _ = publish.send(Some(Arc::new(inventory)));
-            drop(activity);
-        });
-        *slot = Some(done.clone());
-        done
-    }
-
-    async fn inventory(
-        &self,
-        cancel: &CancellationToken,
-        deadline: Option<Instant>,
-        activity: Activity,
-    ) -> Result<(Arc<Inventory>, bool), DiscoveryError> {
-        let mut done = self.scan(cancel, activity);
-        let checked_before = done.borrow().is_some();
-        let inventory = wait_for(
-            async {
-                done.wait_for(Option::is_some)
+        let mut slots = BTreeMap::new();
+        for provider in providers::ALL
+            .iter()
+            .filter(|provider| provider.name != self.client.name())
+        {
+            let (publish, done) = watch::channel(None);
+            let cancel = scan_cancel.clone();
+            let activity = activity.clone();
+            tokio::spawn(async move {
+                let executable = tokio::task::spawn_blocking(move || locate(provider))
                     .await
-                    .expect("discovery scan completed")
-                    .clone()
-                    .expect("inventory published")
-            },
-            cancel,
-            deadline,
-        )
-        .await?;
-        Ok((inventory, checked_before))
+                    .expect("resolver finished");
+                let check = match &executable {
+                    Ok(exe) => probe(exe, &cancel, None, activity.clone()).await,
+                    Err(error) => Err(DiscoveryError::from(error.clone())),
+                };
+                let _ = publish.send(Some(Arc::new(Located {
+                    executable,
+                    check: Mutex::new(check),
+                })));
+                drop(activity);
+            });
+            slots.insert(provider.name, done);
+        }
+        *guard = Some(slots.clone());
+        slots
     }
 
     pub async fn listed(
@@ -187,16 +153,17 @@ impl Discovery {
         cancel: &CancellationToken,
         activity: Activity,
     ) -> Vec<&'static str> {
-        let Ok((inventory, _)) = self.inventory(cancel, None, activity).await else {
-            return Vec::new();
-        };
-        inventory
-            .iter()
-            .filter_map(|(&name, entry)| {
-                (!matches!(&entry.executable, Err(error) if error.kind == FailureKind::NotFound))
-                    .then_some(name)
-            })
-            .collect()
+        let slots = self.slots(cancel, activity);
+        let mut visible = Vec::new();
+        for (name, slot) in slots {
+            let Ok((entry, _)) = await_slot(slot, cancel, None).await else {
+                return Vec::new();
+            };
+            if !matches!(&entry.executable, Err(error) if error.kind == FailureKind::NotFound) {
+                visible.push(name);
+            }
+        }
+        visible
     }
 
     pub async fn resolve(
@@ -206,18 +173,16 @@ impl Discovery {
         deadline: Instant,
         activity: Activity,
     ) -> Result<Executable, DiscoveryError> {
-        let (inventory, checked_before) = self
-            .inventory(cancel, Some(deadline), activity.clone())
-            .await?;
         // The registry has already matched this tool against the visible provider declarations.
-        let entry = &inventory[name];
+        let slot = self.slots(cancel, activity.clone())[name].clone();
+        let (entry, checked_before) = await_slot(slot, cancel, Some(deadline)).await?;
         let executable = entry
             .executable
             .as_ref()
             .map_err(|error| DiscoveryError::from(error.clone()))?;
         let mut check = wait_for(entry.check.lock(), cancel, Some(deadline)).await?;
-        // Only the request that started the shared scan can cancel its probes. An unrelated
-        // request already waiting on that scan gets a fresh check under its own token.
+        // Only an explicit cancellation of the request that started the shared scan cancels its
+        // probes. An unrelated caller waiting on that scan gets a fresh check under its own token.
         if let Err(previous) = &*check
             && (checked_before
                 || (previous.failure.kind == FailureKind::Cancellation && !cancel.is_cancelled()))
@@ -226,6 +191,27 @@ impl Discovery {
         }
         check.clone().map(|()| executable.clone())
     }
+}
+
+async fn await_slot(
+    mut done: ProviderSlot,
+    cancel: &CancellationToken,
+    deadline: Option<Instant>,
+) -> Result<(Arc<Located>, bool), DiscoveryError> {
+    let checked_before = done.borrow().is_some();
+    let entry = wait_for(
+        async {
+            done.wait_for(Option::is_some)
+                .await
+                .expect("provider discovery completed")
+                .clone()
+                .expect("provider entry published")
+        },
+        cancel,
+        deadline,
+    )
+    .await?;
+    Ok((entry, checked_before))
 }
 
 async fn wait_for<T>(
