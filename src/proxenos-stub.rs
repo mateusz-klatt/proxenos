@@ -6,14 +6,13 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 #[path = "platform/session.rs"]
 mod session;
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
-    let mut locks = Vec::new();
     for step in std::env::args().skip(1) {
         let (name, value) = step.split_once(':').unwrap_or((&step, ""));
         match name {
@@ -22,6 +21,7 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
             "flood" => io::stdout().write_all(&vec![0xff; value.parse()?])?,
             "flood-err" => io::stderr().write_all(&vec![0xfe; value.parse()?])?,
             "sleep" => thread::sleep(Duration::from_millis(value.parse()?)),
+            "close-output" => platform::close_output()?,
             "stdin" => {
                 let count = io::copy(&mut io::stdin().lock(), &mut io::sink())?;
                 writeln!(io::stdout(), "stdin={count}")?;
@@ -32,33 +32,37 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
             },
             "cwd" => writeln!(io::stdout(), "{}", std::env::current_dir()?.display())?,
             "exists" => writeln!(io::stdout(), "exists={}", Path::new(value).try_exists()?)?,
+            "remove" => fs::remove_file(value)?,
+            "mkdir" => fs::create_dir(value)?,
             "hold" => {
                 let lock = File::create(value)?;
                 lock.lock()?;
                 fs::write(format!("{value}.ready"), [])?;
-                locks.push(lock);
+                // The OS releases this after exit handlers, including the coverage profile writer.
+                std::mem::forget(lock);
             }
-            "grandchild" => drop(grandchild(value)?.spawn()?),
+            "grandchild" => spawn_and_wait_ready(&mut grandchild(value)?, value)?,
+            "until-released" => wait_for_file(&format!("{value}.release"))?,
             #[cfg(unix)]
             "ignore-term" => platform::ignore_term(),
             #[cfg(unix)]
             "session" => platform::report_session()?,
+            #[cfg(unix)]
+            "await-term" => platform::await_term(value)?,
             #[cfg(unix)]
             "escape" => {
                 let mut copy = Command::new(std::env::current_exe()?);
                 copy.arg("detach")
                     .arg(format!("hold:{value}"))
                     .arg(format!("until-released:{value}"));
-                drop(copy.spawn()?);
+                spawn_and_wait_ready(&mut copy, value)?;
             }
             #[cfg(unix)]
             "detach" => session::create()?,
-            #[cfg(unix)]
-            "until-released" => platform::until_released(value),
             #[cfg(windows)]
-            "breakaway" => platform::breakaway(value)?,
+            "breakaway" => writeln!(io::stdout(), "breakaway={}", platform::breakaway(value)?)?,
             #[cfg(windows)]
-            "terminal" => writeln!(io::stdout(), "terminal={}", File::open("CONIN$").is_ok())?,
+            "window" => writeln!(io::stdout(), "visible={}", platform::visible_console())?,
             _ => {
                 let code = step.strip_prefix("exit:").ok_or("unknown stub argument")?;
                 return Ok(ExitCode::from(code.parse::<u8>()?));
@@ -74,25 +78,62 @@ fn grandchild(path: &str) -> io::Result<Command> {
     let mut copy = Command::new(std::env::current_exe()?);
     #[cfg(unix)]
     copy.arg("ignore-term");
-    copy.arg(format!("hold:{path}"))
-        .arg("out:grandchild ready")
+    copy.arg("out:grandchild ready")
+        .arg(format!("hold:{path}"))
         .arg("sleep:60000");
     Ok(copy)
+}
+
+fn spawn_and_wait_ready(command: &mut Command, path: &str) -> io::Result<()> {
+    drop(command.spawn()?);
+    wait_for_file(&format!("{path}.ready"))
+}
+
+fn wait_for_file(path: &str) -> io::Result<()> {
+    wait_until(|| Path::new(path).try_exists())
+}
+
+fn wait_until(mut ready: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready()? {
+        (Instant::now() < deadline)
+            .then_some(())
+            .ok_or(io::ErrorKind::TimedOut)?;
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
 mod platform {
     #![allow(unsafe_code)]
 
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::io::{self, Write};
-    use std::path::PathBuf;
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static RECEIVED_TERM: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn close_output() -> io::Result<()> {
+        let null = File::options().write(true).open("/dev/null")?;
+        for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            // SAFETY: this single-threaded stub owns its output descriptors. Replacing each
+            // pipe with an open file keeps the descriptor valid for Rust's standard streams.
+            let result = unsafe { libc::dup2(null.as_raw_fd(), fd) };
+            (result >= 0)
+                .then_some(())
+                .ok_or_else(io::Error::last_os_error)?;
+        }
+        Ok(())
+    }
 
     pub(super) fn ignore_term() {
-        // SAFETY: SIG_IGN installs no handler and SIGTERM is a valid, catchable signal.
-        unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        extern "C" fn received(_: libc::c_int) {
+            RECEIVED_TERM.store(true, Ordering::Relaxed);
+        }
+        // SAFETY: the handler has the signal ABI and only writes a lock-free atomic flag.
+        unsafe { libc::signal(libc::SIGTERM, received as *const () as libc::sighandler_t) };
     }
 
     pub(super) fn report_session() -> io::Result<()> {
@@ -102,36 +143,60 @@ mod platform {
         writeln!(io::stdout(), "terminal={}", File::open("/dev/tty").is_ok())
     }
 
-    pub(super) fn until_released(path: &str) {
-        let release = PathBuf::from(format!("{path}.release"));
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !release.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
+    pub(super) fn await_term(ready: &str) -> io::Result<()> {
+        fs::write(ready, [])?;
+        super::wait_until(|| Ok(RECEIVED_TERM.load(Ordering::Relaxed)))
     }
 }
 
 #[cfg(windows)]
 mod platform {
-    use std::io::{self, Write};
-    use std::os::windows::process::CommandExt;
+    #![allow(unsafe_code)]
 
+    use std::io;
+    use std::os::windows::process::CommandExt;
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleWindow, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandleEx,
+    };
     use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+    pub(super) fn visible_console() -> bool {
+        // SAFETY: GetConsoleWindow takes no arguments. IsWindowVisible accepts a window
+        // handle and returns zero when there is no such window.
+        unsafe { IsWindowVisible(GetConsoleWindow()) != 0 }
+    }
+
+    pub(super) fn close_output() -> io::Result<()> {
+        for stream in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let mut previous = null_mut();
+            // SAFETY: this single-threaded stub owns two distinct output pipes. The call
+            // clears the selected standard handle and writes its previous value to our local.
+            let replaced = unsafe { SetStdHandleEx(stream, null_mut(), &raw mut previous) };
+            (replaced != 0)
+                .then_some(())
+                .ok_or_else(io::Error::last_os_error)?;
+            // SAFETY: the handle was removed from the table above and is closed only here.
+            let closed = unsafe { CloseHandle(previous) };
+            (closed != 0)
+                .then_some(())
+                .ok_or_else(io::Error::last_os_error)?;
+        }
+        Ok(())
+    }
 
     /// Ask Windows to create this grandchild outside the job. Report the OS reason for the
     /// refusal and retry the same grandchild in the job, where the test can witness its death.
-    pub(super) fn breakaway(path: &str) -> io::Result<()> {
+    pub(super) fn breakaway(path: &str) -> io::Result<i32> {
         let mut copy = super::grandchild(path)?;
         let refusal = copy
             .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
             .spawn()
             .expect_err("the job allowed a grandchild to escape");
-        writeln!(
-            io::stdout(),
-            "breakaway={}",
-            refusal.raw_os_error().unwrap_or_default()
-        )?;
-        drop(copy.creation_flags(0).spawn()?);
-        Ok(())
+        super::spawn_and_wait_ready(copy.creation_flags(0), path)?;
+        Ok(refusal.raw_os_error().unwrap_or_default())
     }
 }

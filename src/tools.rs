@@ -95,7 +95,8 @@ mod test_tools {
                         "env_remove": { "type": "array", "items": { "type": "string" } },
                         "deadline_ms": { "type": "integer", "minimum": 0 },
                         "capture_limit": { "type": "integer", "minimum": 0 },
-                        "temp_file": { "type": "string", "description": "Create a new temporary file for the child at this path." }
+                        "temp_file": { "type": "string", "description": "Create a new temporary file for the child at this path." },
+                        "on_cancel": { "enum": ["start", "drop"], "description": "Start with the cancelled token, or drop the running supervisor when the call is cancelled." }
                     },
                     "required": ["program", "deadline_ms", "capture_limit"]
                 }),
@@ -146,7 +147,7 @@ mod test_tools {
         let env = arguments.get("env").and_then(Value::as_object);
         let mut temporary_files = Vec::new();
         if let Some(path) = text("temp_file") {
-            std::fs::File::create_new(&path)?;
+            tokio::fs::File::create_new(&path).await?;
             temporary_files.push(path.into());
         }
         let launch = Launch {
@@ -170,7 +171,17 @@ mod test_tools {
                 .unwrap_or(usize::MAX),
             temporary_files,
         };
-        supervise::run(launch, cancel).await
+        let on_cancel = arguments.get("on_cancel").and_then(Value::as_str);
+        if on_cancel == Some("start") {
+            cancel.cancelled().await;
+        }
+        tokio::select! {
+            biased;
+            result = supervise::run(launch, cancel) => result,
+            () = cancel.cancelled(), if on_cancel == Some("drop") => {
+                Err(std::io::Error::other("caller dropped the supervisor"))
+            }
+        }
     }
 
     fn run_outcome(result: std::io::Result<Finished>) -> ToolOutcome {

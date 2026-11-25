@@ -4,10 +4,11 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::{ChildExt, CommandExt};
-use std::process::{Child as StdChild, ExitStatus};
+use std::path::PathBuf;
+use std::process::{Child as StdChild, Command, ExitStatus};
 use std::ptr::{NonNull, null};
 
-use tokio::process::{ChildStderr, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use windows_sys::Win32::System::JobObjects::{
@@ -17,7 +18,9 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED, ResumeThread};
 
-pub struct Group(OwnedHandle);
+use crate::supervise::{StartError, cleanup};
+
+struct Group(OwnedHandle);
 
 impl Group {
     fn new() -> io::Result<Self> {
@@ -43,17 +46,10 @@ impl Group {
         Ok(Self(job))
     }
 
-    pub async fn wait_for_exit(&mut self, child: &mut Child) -> io::Result<()> {
-        (&mut child.exited).await.map_err(io::Error::other)
-    }
-
-    pub async fn stop(&self) {
-        self.kill();
-    }
-
-    pub fn kill(&self) {
+    fn terminate(&self) -> io::Result<()> {
         // SAFETY: this is our live job handle, with the right to terminate its members.
-        let _ = unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) };
+        let rc = unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) };
+        (rc != 0).then_some(()).ok_or_else(io::Error::last_os_error)
     }
 }
 
@@ -70,6 +66,10 @@ impl Drop for Process {
 }
 
 pub struct Child {
+    // Fields drop in declaration order. Close the job before releasing the file cleanup worker,
+    // including when the supervisor's future is dropped.
+    job: Group,
+    release: oneshot::Sender<()>,
     exited: oneshot::Receiver<()>,
     status: JoinHandle<io::Result<ExitStatus>>,
     pub stdout: Option<ChildStdout>,
@@ -77,20 +77,31 @@ pub struct Child {
 }
 
 impl Child {
-    pub async fn wait(self) -> io::Result<ExitStatus> {
+    pub async fn wait_for_exit(&mut self) -> io::Result<()> {
+        (&mut self.exited).await.map_err(io::Error::other)
+    }
+
+    pub async fn stop(&self) -> io::Result<()> {
+        self.job.terminate()
+    }
+
+    pub async fn finish(self) -> io::Result<ExitStatus> {
+        drop(self.job);
+        drop(self.release);
         self.status.await?
     }
 }
 
-pub fn spawn(command: &mut Command) -> io::Result<(Child, Group)> {
+pub fn spawn(
+    mut command: Command,
+    files: &mut Vec<PathBuf>,
+    before_spawn: impl FnOnce() -> Result<(), StartError>,
+) -> Result<Child, StartError> {
     let job = Group::new()?;
     // Rust exposes the primary thread handle on std's Child. Keep it through job assignment.
-    let mut process = Process(
-        command
-            .as_std_mut()
-            .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)
-            .spawn()?,
-    );
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    before_spawn()?;
+    let mut process = Process(command.spawn()?);
     // SAFETY: the job and suspended process handles are open with assignment rights.
     let rc = unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), process.0.as_raw_handle()) };
     (rc != 0)
@@ -116,18 +127,23 @@ pub fn spawn(command: &mut Command) -> io::Result<(Child, Group)> {
     // Only one blocking wait owns the process. The notification can be cancelled without
     // consuming the status the supervisor collects after it has finished with the pipes.
     let (done, exited) = oneshot::channel();
+    let (release, released) = oneshot::channel::<()>();
+    let files = std::mem::take(files);
     let status = tokio::task::spawn_blocking(move || {
         let status = process.0.wait();
+        drop(process);
         let _ = done.send(());
-        status
+        let _ = released.blocking_recv();
+        status.inspect(|_| cleanup::remove_files_blocking(&files))
     });
-    let child = Child {
+    Ok(Child {
+        job,
+        release,
         exited,
         status,
         stdout,
         stderr,
-    };
-    Ok((child, job))
+    })
 }
 
 pub fn exit_signal(_status: &ExitStatus) -> Option<i32> {

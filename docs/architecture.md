@@ -204,12 +204,14 @@ Antigravity's reply must name a model; Cursor's must not. A shared test could as
   the group and gives it three seconds before SIGKILL, even when the leader exits first.
   Proxenos observes the leader's exit with `waitid` and keeps its PID reserved until the last
   group signal, so a reused PID cannot take that signal to another group.
-- **Windows**: Proxenos creates a job with kill-on-close and starts the CLI suspended, without
-  a console window. It assigns the process to the job and only then resumes its primary thread.
+- **Windows**: Proxenos creates a job with kill-on-close and starts the CLI suspended with
+  `CREATE_NO_WINDOW`. The child has a hidden console. Proxenos assigns the process to the job
+  and only then resumes its primary thread.
   A stop terminates the job. The job handle belongs to Proxenos alone, so its members also die
   when Proxenos dies. The Windows behavioural test proves containment by making the stub request
   breakaway as it spawns a grandchild. It checks that Windows denies the request and that the
-  same grandchild, started inside the job, dies when the job is stopped.
+  same grandchild, started inside the job, dies when the job is stopped. It also checks whether
+  the child's console window is visible.
 - **Everywhere**: the child reads EOF from the null device on standard input. Proxenos captures
   output as bytes up to a limit per stream and removes temporary files only after reaping the
   child. Past the limit it still drains the pipes, or the child would block. Once the child exits,
@@ -218,9 +220,11 @@ Antigravity's reply must name a model; Cursor's must not. A shared test could as
   the time of the last read from either stream, including bytes beyond the capture limit.
 
 What this cannot do: on Unix, if Proxenos itself is killed outright, its children survive, and a
-descendant that leaves the process group is not reached. On Windows, if Proxenos dies between
-creating the suspended process and assigning it to the job, the process can remain suspended.
-It has run no CLI code at that point. Stopping a child does not undo what it wrote.
+descendant that leaves the process group is not reached. If the OS denies a group signal,
+Proxenos reports the error. Its reaper retains the child's files until the leader exits.
+On Windows a CLI that opens `CONIN$` directly can wait on the hidden console until its deadline.
+If Proxenos dies between creating the suspended process and assigning it to the job, the process
+can remain suspended before it runs any CLI code. Stopping a child does not undo what it wrote.
 
 ### D7. A CLI is found by reading `PATH`, and a batch file is never run
 

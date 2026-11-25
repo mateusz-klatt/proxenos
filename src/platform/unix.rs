@@ -1,25 +1,55 @@
-//! Each child leads a new Unix session and process group.
+//! A session per child, with its leader's PID reserved until the final group signal.
 #![allow(unsafe_code)]
 
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::unix::process::ExitStatusExt;
-use std::process::ExitStatus;
+use std::os::fd::OwnedFd;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::PathBuf;
+use std::process::{Child as NativeChild, Command, ExitStatus};
+use std::sync::{Mutex, PoisonError, mpsc};
+use std::thread;
 use std::time::Duration;
 
-use tokio::process::{Child, Command};
+use tokio::process::{ChildStderr, ChildStdout};
 use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::oneshot;
 
 use super::session;
+use crate::supervise::{StartError, cleanup::remove_files_blocking};
 
 const GRACE: Duration = Duration::from_secs(3);
+const REAP_WAIT: Duration = Duration::from_secs(2);
+static SPAWNING: Mutex<()> = Mutex::new(());
 
-pub struct Group {
-    id: libc::pid_t,
-    changes: Signal,
+struct Leader {
+    process: NativeChild,
+    temporary_files: Vec<PathBuf>,
 }
 
-pub fn spawn(command: &mut Command) -> io::Result<(Child, Group)> {
+impl Leader {
+    fn reap(mut self) -> io::Result<ExitStatus> {
+        let status = self.process.wait()?;
+        remove_files_blocking(&self.temporary_files);
+        Ok(status)
+    }
+}
+
+pub struct Child {
+    pid: libc::pid_t,
+    changes: Signal,
+    leader: Option<Leader>,
+    reap: mpsc::Sender<Leader>,
+    status: oneshot::Receiver<io::Result<ExitStatus>>,
+    pub stdout: Option<ChildStdout>,
+    pub stderr: Option<ChildStderr>,
+}
+
+pub fn spawn(
+    mut command: Command,
+    files: &mut Vec<PathBuf>,
+    before_spawn: impl FnOnce() -> Result<(), StartError>,
+) -> Result<Child, StartError> {
     // Install the handler before spawn. An inherited SIG_IGN for SIGCHLD would otherwise
     // let the kernel reap a short-lived child before waitid could observe its exit.
     let changes = signal(SignalKind::child())?;
@@ -36,23 +66,52 @@ pub fn spawn(command: &mut Command) -> io::Result<(Child, Group)> {
     (error == 0)
         .then_some(())
         .ok_or(io::Error::from_raw_os_error(error))?;
+    // The reaper exists before the child does. Runtime shutdown can drop the supervisor,
+    // and a denied stop can outlive the request that reports it. In either case this thread
+    // can still wait for the leader and remove its files as long as the server is alive.
+    let (reap, released) = mpsc::channel::<Leader>();
+    let (send, status) = oneshot::channel();
+    let reap_when_released = move || {
+        if let Ok(leader) = released.recv() {
+            let _ = send.send(leader.reap());
+        }
+    };
+    thread::Builder::new()
+        .name("proxenos-reap".into())
+        .spawn(reap_when_released)?;
+
+    // Pipe creation and FD_CLOEXEC can be separate operations on macOS. Serialize both our
+    // output pipes and std's exec-status pipe against every other fork in the supervisor.
+    let spawning = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+    let (out, stdout_writer) = io::pipe()?;
+    let (err, stderr_writer) = io::pipe()?;
+    let stdout = ChildStdout::from_std(OwnedFd::from(out).into())?;
+    let stderr = ChildStderr::from_std(OwnedFd::from(err).into())?;
+    command.stdout(stdout_writer).stderr(stderr_writer);
     // SAFETY: create only calls setsid and reads errno, without allocating or taking locks.
     unsafe { command.pre_exec(session::create) };
-    let child = command.spawn()?;
-    let pid = child.id().expect("a newly spawned child has its pid");
-    Ok((
-        child,
-        Group {
-            id: pid.cast_signed(),
-            changes,
-        },
-    ))
+    before_spawn()?;
+    // All pipe registration has already succeeded. From this point onward setup is infallible.
+    let process = command.spawn()?;
+    drop(spawning);
+    let pid = process.id().cast_signed();
+    Ok(Child {
+        pid,
+        changes,
+        leader: Some(Leader {
+            process,
+            temporary_files: std::mem::take(files),
+        }),
+        reap,
+        status,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+    })
 }
 
-impl Group {
-    /// Observe exit without reaping. Until the final group signal, the leader's PID must stay
-    /// reserved even if all its descendants exit or leave the group.
-    pub async fn wait_for_exit(&mut self, _child: &mut Child) -> io::Result<()> {
+impl Child {
+    /// Observe exit without reaping so that the final group signal still targets our group.
+    pub async fn wait_for_exit(&mut self) -> io::Result<()> {
         while !self.exited()? {
             self.changes.recv().await;
         }
@@ -65,7 +124,7 @@ impl Group {
         let rc = unsafe {
             libc::waitid(
                 libc::P_PID,
-                self.id.cast_unsigned(),
+                self.pid.cast_unsigned(),
                 info.as_mut_ptr(),
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
@@ -78,20 +137,44 @@ impl Group {
         Ok(unsafe { info.assume_init_ref().si_pid() } != 0)
     }
 
-    fn signal(&self, signal: libc::c_int) {
-        // SAFETY: the leader has not been reaped. The negative PID selects only its group.
-        let _ = unsafe { libc::kill(-self.id, signal) };
+    fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        // SAFETY: until the leader is handed to the reaper its PID reserves the group ID.
+        let result = unsafe { libc::kill(-self.pid, signal) };
+        let error = io::Error::last_os_error();
+        (result == 0 || error.raw_os_error() == Some(libc::ESRCH))
+            .then_some(())
+            .ok_or(error)
     }
 
-    pub async fn stop(&self) {
-        self.signal(libc::SIGTERM);
+    pub async fn stop(&self) -> io::Result<()> {
+        self.signal(libc::SIGTERM)?;
         // A descendant may need the grace even after the leader has exited and closed its pipes.
         tokio::time::sleep(GRACE).await;
-        self.kill();
+        self.signal(libc::SIGKILL)
     }
 
-    pub fn kill(&self) {
-        self.signal(libc::SIGKILL);
+    fn release(&mut self) {
+        // Moving the sole native Child disarms the drop guard before wait can recycle its PID.
+        let leader = self.leader.take().expect("the group still owns its leader");
+        self.reap
+            .send(leader)
+            .expect("reaper waits for this leader");
+    }
+
+    pub async fn finish(mut self) -> io::Result<ExitStatus> {
+        self.signal(libc::SIGKILL)?;
+        tokio::time::timeout(REAP_WAIT, self.wait_for_exit()).await??;
+        self.release();
+        (&mut self.status).await.map_err(io::Error::other)?
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if self.leader.is_some() {
+            let _ = self.signal(libc::SIGKILL);
+            self.release();
+        }
     }
 }
 

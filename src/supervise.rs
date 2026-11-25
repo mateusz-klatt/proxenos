@@ -1,14 +1,15 @@
 //! The delegation task owns the child, its output pipes and its temporary files (D3, D6).
 
+pub(crate) mod cleanup;
+
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::pin::pin;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::platform;
@@ -33,6 +34,17 @@ pub enum Ending {
     Exited,
     TimedOut,
     Cancelled,
+}
+
+pub(crate) enum StartError {
+    Io(io::Error),
+    Skipped(Ending),
+}
+
+impl From<io::Error> for StartError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 impl Ending {
@@ -84,20 +96,8 @@ pub struct Finished {
     pub last_output: Option<Duration>,
 }
 
-/// Owns the files through reap, including when the MCP request is cancelled. A failed spawn
-/// also releases the files. Attempt every removal even if one fails.
-pub async fn run(launch: Launch, cancel: &CancellationToken) -> io::Result<Finished> {
-    let finished = run_child(&launch, cancel).await;
-    let mut removed = Ok(());
-    for path in launch.temporary_files {
-        removed = removed.and(std::fs::remove_file(path));
-    }
-    let finished = finished?;
-    removed?;
-    Ok(finished)
-}
-
-async fn run_child(launch: &Launch, cancel: &CancellationToken) -> io::Result<Finished> {
+pub async fn run(mut launch: Launch, cancel: &CancellationToken) -> io::Result<Finished> {
+    let started = Instant::now();
     let mut command = Command::new(&launch.program);
     command
         .args(&launch.args)
@@ -112,8 +112,35 @@ async fn run_child(launch: &Launch, cancel: &CancellationToken) -> io::Result<Fi
     }
     command.envs(launch.env_set.iter().map(|(name, value)| (name, value)));
 
-    let started = Instant::now();
-    let (mut child, mut group) = platform::spawn(&mut command)?;
+    // The platform makes this check immediately before native spawn, after preparing the job
+    // or acquiring the Unix spawn lock. A successful spawn transfers its files to the reaper.
+    let child = platform::spawn(command, &mut launch.temporary_files, || {
+        if cancel.is_cancelled() {
+            return Err(StartError::Skipped(Ending::Cancelled));
+        }
+        if started.elapsed() >= launch.deadline {
+            return Err(StartError::Skipped(Ending::TimedOut));
+        }
+        Ok(())
+    });
+    let mut child = match child {
+        Ok(child) => child,
+        Err(reason) => {
+            cleanup::remove_files(launch.temporary_files).await;
+            return match reason {
+                StartError::Io(error) => Err(error),
+                StartError::Skipped(ending) => Ok(Finished {
+                    ending,
+                    code: None,
+                    signal: None,
+                    stdout: Captured::default(),
+                    stderr: Captured::default(),
+                    elapsed: started.elapsed(),
+                    last_output: None,
+                }),
+            };
+        }
+    };
     let out = child.stdout.take().expect("stdout was piped");
     let err = child.stderr.take().expect("stderr was piped");
     let mut stdout = Captured::default();
@@ -130,11 +157,11 @@ async fn run_child(launch: &Launch, cancel: &CancellationToken) -> io::Result<Fi
             let remaining = launch.deadline.saturating_sub(started.elapsed());
             let ending = tokio::select! {
                 biased;
-                result = group.wait_for_exit(&mut child) => return result.map(|()| Ending::Exited),
+                result = child.wait_for_exit() => return result.map(|()| Ending::Exited),
                 () = cancel.cancelled() => Ending::Cancelled,
                 () = tokio::time::sleep(remaining) => Ending::TimedOut,
             };
-            group.stop().await;
+            child.stop().await?;
             Ok(ending)
         };
         let mut read = pin!(read);
@@ -144,13 +171,13 @@ async fn run_child(launch: &Launch, cancel: &CancellationToken) -> io::Result<Fi
             ending = &mut watch => (ending, tokio::time::timeout(DRAIN, read).await.unwrap_or(Ok(()))),
         }
     };
-    // A descendant may have closed its pipes and kept running. On Unix the leader still owns
-    // its PID here, so the final signal cannot be delivered to a recycled process-group ID.
-    group.kill();
-    let status = child.wait().await?;
+    // Close the group or job even when a reader or the stop failed. Preserve the first error.
+    let status = child.finish().await;
+    let ending = ending?;
+    let status = status?;
     read_result?;
     Ok(Finished {
-        ending: ending?,
+        ending,
         code: status.code(),
         signal: platform::exit_signal(&status),
         elapsed: started.elapsed(),
