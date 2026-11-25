@@ -168,9 +168,10 @@ What the `mcp` module has to do itself, because the library does not:
 - **Calls still running when the connection ends.** When rmcp sees the end of its input it gives
   handlers five seconds to finish. A call cancelled by the end of input gets a reply if it
   finishes within that drain. A call that finishes later gets no reply. Proxenos still waits for
-  running calls to clean up. Ten seconds after Proxenos sees the end of input, the first
-  failure, or the library stopping, it abandons any remaining calls and output and exits with a
-  failure. When a failure was already recorded, that failure is the one reported.
+  running calls and the workers that reap their children and remove their files. Ten seconds
+  after Proxenos sees the end of input, the first failure, or the library stopping, it abandons
+  any remaining work and output and exits with a failure. When a failure was already recorded,
+  that failure is the one reported.
 
 Known differences from claude-delegator, accepted: a line that is not JSON is ignored instead of
 answered with a parse error, and a `tools/call` without a name is "method not found" instead of
@@ -203,7 +204,10 @@ Antigravity's reply must name a model; Cursor's must not. A shared test could as
   process group and starts without a controlling terminal. On a stop, Proxenos sends SIGTERM to
   the group and gives it three seconds before SIGKILL, even when the leader exits first.
   Proxenos observes the leader's exit with `waitid` and keeps its PID reserved until the last
-  group signal, so a reused PID cannot take that signal to another group.
+  group signal, so a reused PID cannot take that signal to another group. Launches run on
+  blocking workers. Their pipe setup and native spawn are serialized, with cancellation and
+  the deadline checked under the lock immediately before spawn. If the OS stalls inside spawn,
+  that launch and the launches queued behind it can return late. Other calls keep their timers.
 - **Windows**: Proxenos creates a job with kill-on-close and starts the CLI suspended with
   `CREATE_NO_WINDOW`. The child has a hidden console. Proxenos assigns the process to the job
   and only then resumes its primary thread.
@@ -218,10 +222,21 @@ Antigravity's reply must name a model; Cursor's must not. A shared test could as
   a descendant gets up to two more seconds to finish writing. Proxenos then closes its readers
   and kills the remaining group or job members. The result keeps the child's exit status and
   the time of the last read from either stream, including bytes beyond the capture limit.
+  After the final group signal or job close, the caller waits up to two seconds for the leader's
+  status and file cleanup together. Once reaped, the status can be returned while a worker
+  finishes cleanup. A temporary input's pathname stays reserved until cleanup ends, even if
+  the CLI unlinks the input. A sibling directory reserves the name for cooperating launches
+  that use a stable parent directory. Both names must fit the filesystem's name limit.
+  D4 counts these workers toward its shutdown deadline.
 
 What this cannot do: on Unix, if Proxenos itself is killed outright, its children survive, and a
 descendant that leaves the process group is not reached. If the OS denies a group signal,
-Proxenos reports the error. Its reaper retains the child's files until the leader exits.
+Proxenos reports the error. On macOS a group containing only its zombie leader also returns
+`EPERM`. Once `waitid` confirms the leader has exited, Proxenos accepts that result. A live
+descendant that Proxenos lacks permission to signal can go undetected in that case.
+The reaper retains the child's files until the leader exits. If the reaper is still running
+when D4's shutdown deadline expires, the server exits with a failure. An abrupt exit can leave
+the temporary input and its reservation directory behind.
 On Windows a CLI that opens `CONIN$` directly can wait on the hidden console until its deadline.
 If Proxenos dies between creating the suspended process and assigning it to the job, the process
 can remain suspended before it runs any CLI code. Stopping a child does not undo what it wrote.

@@ -6,12 +6,14 @@ use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::pin::pin;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::mcp::Activity;
 use crate::platform;
 
 /// How long a descendant may hold the pipes after the child exits or its group is stopped.
@@ -27,7 +29,7 @@ pub struct Launch {
     /// How many bytes to keep from each stream.
     pub capture_limit: usize,
     /// Files created exclusively for this launch. Their ownership passes to the supervisor.
-    pub temporary_files: Vec<PathBuf>,
+    pub temporary_files: Vec<cleanup::TemporaryFile>,
 }
 
 pub enum Ending {
@@ -96,7 +98,25 @@ pub struct Finished {
     pub last_output: Option<Duration>,
 }
 
-pub async fn run(mut launch: Launch, cancel: &CancellationToken) -> io::Result<Finished> {
+/// The worker publishes the status as soon as it reaps the leader. Give file cleanup the
+/// remainder of the same budget. The worker retains the files and its shutdown handle.
+pub(crate) async fn finish_reap(
+    status: &mut oneshot::Receiver<io::Result<ExitStatus>>,
+    cleaned: &mut oneshot::Receiver<()>,
+) -> io::Result<ExitStatus> {
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    let status = tokio::time::timeout_at(until, status)
+        .await?
+        .map_err(io::Error::other)??;
+    let _ = tokio::time::timeout_at(until, cleaned).await;
+    Ok(status)
+}
+
+pub async fn run(
+    mut launch: Launch,
+    cancel: &CancellationToken,
+    activity: Activity,
+) -> io::Result<Finished> {
     let started = Instant::now();
     let mut command = Command::new(&launch.program);
     command
@@ -114,19 +134,32 @@ pub async fn run(mut launch: Launch, cancel: &CancellationToken) -> io::Result<F
 
     // The platform makes this check immediately before native spawn, after preparing the job
     // or acquiring the Unix spawn lock. A successful spawn transfers its files to the reaper.
-    let child = platform::spawn(command, &mut launch.temporary_files, || {
-        if cancel.is_cancelled() {
-            return Err(StartError::Skipped(Ending::Cancelled));
+    let queued = cancel.child_token();
+    let _cancel_abandoned_launch = queued.clone().drop_guard();
+    let child = tokio::task::spawn_blocking(move || {
+        let child = platform::spawn(
+            command,
+            &mut launch.temporary_files,
+            activity.clone(),
+            || {
+                if queued.is_cancelled() {
+                    return Err(StartError::Skipped(Ending::Cancelled));
+                }
+                if started.elapsed() >= launch.deadline {
+                    return Err(StartError::Skipped(Ending::TimedOut));
+                }
+                Ok(())
+            },
+        );
+        if child.is_err() {
+            cleanup::remove_files_blocking(&launch.temporary_files);
         }
-        if started.elapsed() >= launch.deadline {
-            return Err(StartError::Skipped(Ending::TimedOut));
-        }
-        Ok(())
-    });
+        child
+    })
+    .await?;
     let mut child = match child {
         Ok(child) => child,
         Err(reason) => {
-            cleanup::remove_files(launch.temporary_files).await;
             return match reason {
                 StartError::Io(error) => Err(error),
                 StartError::Skipped(ending) => Ok(Finished {

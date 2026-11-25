@@ -5,7 +5,6 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::PathBuf;
 use std::process::{Child as NativeChild, Command, ExitStatus};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread;
@@ -16,23 +15,16 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::oneshot;
 
 use super::session;
-use crate::supervise::{StartError, cleanup::remove_files_blocking};
+use crate::mcp::Activity;
+use crate::supervise::cleanup::{TemporaryFile, remove_files_blocking};
+use crate::supervise::{StartError, finish_reap};
 
 const GRACE: Duration = Duration::from_secs(3);
-const REAP_WAIT: Duration = Duration::from_secs(2);
 static SPAWNING: Mutex<()> = Mutex::new(());
 
 struct Leader {
     process: NativeChild,
-    temporary_files: Vec<PathBuf>,
-}
-
-impl Leader {
-    fn reap(mut self) -> io::Result<ExitStatus> {
-        let status = self.process.wait()?;
-        remove_files_blocking(&self.temporary_files);
-        Ok(status)
-    }
+    temporary_files: Vec<TemporaryFile>,
 }
 
 pub struct Child {
@@ -41,20 +33,22 @@ pub struct Child {
     leader: Option<Leader>,
     reap: mpsc::Sender<Leader>,
     status: oneshot::Receiver<io::Result<ExitStatus>>,
+    cleaned: oneshot::Receiver<()>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
 }
 
 pub fn spawn(
     mut command: Command,
-    files: &mut Vec<PathBuf>,
+    files: &mut Vec<TemporaryFile>,
+    activity: Activity,
     before_spawn: impl FnOnce() -> Result<(), StartError>,
 ) -> Result<Child, StartError> {
     // Install the handler before spawn. An inherited SIG_IGN for SIGCHLD would otherwise
     // let the kernel reap a short-lived child before waitid could observe its exit.
     let changes = signal(SignalKind::child())?;
-    // Some clients block SIGCHLD in every thread. Let this serving thread receive exits and
-    // let the child use SIGCHLD for its own descendants.
+    // Some clients block SIGCHLD in every thread. Unmask it on the blocking launcher so its
+    // reaper can receive exit notifications and its child can use SIGCHLD for descendants.
     let mut set = MaybeUninit::<libc::sigset_t>::uninit();
     // SAFETY: sigemptyset initializes the storage, SIGCHLD is valid, and pthread_sigmask
     // reads the set for this call only. A null last argument discards the previous mask.
@@ -70,11 +64,17 @@ pub fn spawn(
     // and a denied stop can outlive the request that reports it. In either case this thread
     // can still wait for the leader and remove its files as long as the server is alive.
     let (reap, released) = mpsc::channel::<Leader>();
-    let (send, status) = oneshot::channel();
+    let (report_status, status) = oneshot::channel();
+    let (report_cleaned, cleaned) = oneshot::channel();
     let reap_when_released = move || {
-        if let Ok(leader) = released.recv() {
-            let _ = send.send(leader.reap());
+        if let Ok(mut leader) = released.recv() {
+            let status = leader.process.wait();
+            let files_to_remove = status.is_ok().then_some(leader.temporary_files);
+            let _ = report_status.send(status);
+            remove_files_blocking(files_to_remove.as_deref().unwrap_or_default());
         }
+        let _ = report_cleaned.send(());
+        drop(activity);
     };
     thread::Builder::new()
         .name("proxenos-reap".into())
@@ -104,6 +104,7 @@ pub fn spawn(
         }),
         reap,
         status,
+        cleaned,
         stdout: Some(stdout),
         stderr: Some(stderr),
     })
@@ -141,6 +142,12 @@ impl Child {
         // SAFETY: until the leader is handed to the reaper its PID reserves the group ID.
         let result = unsafe { libc::kill(-self.pid, signal) };
         let error = io::Error::last_os_error();
+        // XNU returns EPERM when only the zombie remains. Keep the PID reserved while
+        // checking the leader. An unsignalable descendant beside that zombie looks the same.
+        #[cfg(target_os = "macos")]
+        if result != 0 && error.raw_os_error() == Some(libc::EPERM) && self.exited()? {
+            return Ok(());
+        }
         (result == 0 || error.raw_os_error() == Some(libc::ESRCH))
             .then_some(())
             .ok_or(error)
@@ -163,9 +170,8 @@ impl Child {
 
     pub async fn finish(mut self) -> io::Result<ExitStatus> {
         self.signal(libc::SIGKILL)?;
-        tokio::time::timeout(REAP_WAIT, self.wait_for_exit()).await??;
         self.release();
-        (&mut self.status).await.map_err(io::Error::other)?
+        finish_reap(&mut self.status, &mut self.cleaned).await
     }
 }
 

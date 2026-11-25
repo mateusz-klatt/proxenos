@@ -45,7 +45,17 @@ pub struct Server {
 
 impl Server {
     pub fn start(args: &[&str]) -> Self {
-        let (server, stdout, sender) = Self::spawn(args);
+        Self::start_command(Self::command(args))
+    }
+
+    fn command(args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_proxenos"));
+        command.args(args).stderr(Stdio::piped());
+        command
+    }
+
+    pub fn start_command(command: Command) -> Self {
+        let (server, stdout, sender) = Self::spawn(command);
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if sender.send(line).is_err() {
@@ -58,31 +68,31 @@ impl Server {
 
     /// Gives the test the read end of stdout so it can withhold reads or close the pipe.
     pub fn mcp_with_unread_output() -> (Self, ChildStdout) {
-        let (server, stdout, _) = Self::spawn(&["mcp", "--client", "claude"]);
+        let (server, stdout, _) = Self::spawn(Self::command(&["mcp", "--client", "claude"]));
         (server, stdout)
     }
 
-    fn spawn(args: &[&str]) -> (Self, ChildStdout, Sender<String>) {
+    fn spawn(mut command: Command) -> (Self, ChildStdout, Sender<String>) {
         let spawning = spawning();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_proxenos"))
-            .args(args)
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .spawn()
             .expect("the binary starts");
         drop(spawning);
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
-        let stderr = child.stderr.take().expect("stderr is piped");
+        let stderr = child.stderr.take();
         let captured = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&captured);
         let (drained, stderr_done) = channel();
         thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let mut text = sink.lock().expect("stderr lock");
-                text.push_str(&line);
-                text.push('\n');
+            if let Some(stderr) = stderr {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let mut text = sink.lock().expect("stderr lock");
+                    text.push_str(&line);
+                    text.push('\n');
+                }
             }
             let _ = drained.send(());
         });
@@ -104,7 +114,12 @@ impl Server {
     /// Starts a server and completes the `initialize` handshake of an earlier revision.
     pub fn initialized(version: &str) -> (Self, Value) {
         let mut server = Self::mcp();
-        let answer = server.request(
+        let answer = server.initialize(version);
+        (server, answer)
+    }
+
+    pub fn initialize(&mut self, version: &str) -> Value {
+        let answer = self.request(
             0,
             "initialize",
             json!({
@@ -113,8 +128,8 @@ impl Server {
                 "clientInfo": { "name": "proxenos-tests", "version": "0" }
             }),
         );
-        server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
-        (server, answer)
+        self.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        answer
     }
 
     pub fn send(&mut self, frame: &Value) {

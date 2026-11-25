@@ -15,6 +15,39 @@ fn a_cli_may_remove_its_own_temporary_file() {
 }
 
 #[test]
+fn a_removed_input_remains_reserved_until_its_call_finishes() {
+    let directory = Directory::new();
+    let temp = directory.0.join("instructions");
+    let gate = directory.0.join("gate");
+    let mut first = launch(json!([
+        format!("remove:{}", temp.display()),
+        format!("hold:{}", gate.display()),
+        format!("until-released:{}", gate.display()),
+        "exit:7",
+    ]));
+    first["temp_file"] = json!(temp);
+    let mut owner = server();
+    owner.start_call(1, "test_run", first);
+    let child = lock_file(&gate);
+    assert!(!is_free(&child));
+    assert!(!temp.exists());
+
+    let mut contender = server();
+    let mut second = launch(json!([format!("exists:{}", temp.display()), "exit:8"]));
+    second["temp_file"] = json!(directory.0.join(".").join("instructions"));
+    let refused = contender.call(1, "test_run", second.clone());
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(!temp.exists());
+    fs::write(gate.with_extension("release"), []).unwrap();
+    assert_eq!(finished(&owner.response(1))["code"], 7);
+
+    let result = finished(&contender.call(2, "test_run", second));
+    assert_eq!(result["code"], 8);
+    assert_eq!(result["stdout"], "exists=true\n");
+    assert!(!temp.exists());
+}
+
+#[test]
 fn cleanup_reports_the_path_and_keeps_the_child_result_on_failure() {
     let directory = Directory::new();
     let temp = directory.0.join("instructions");
@@ -43,7 +76,11 @@ fn cleanup_reports_the_path_and_keeps_the_child_result_on_failure() {
 }
 
 #[cfg(windows)]
-fn deny_deletion_before_exit(server: &mut Server, directory: &Directory) -> (PathBuf, File, File) {
+fn deny_deletion_before_exit(
+    server: &mut Server,
+    directory: &Directory,
+    retry_ms: Option<u64>,
+) -> (PathBuf, File, File) {
     use std::os::windows::fs::OpenOptionsExt;
 
     let temp = directory.0.join("instructions");
@@ -54,6 +91,9 @@ fn deny_deletion_before_exit(server: &mut Server, directory: &Directory) -> (Pat
         "exit:21",
     ]));
     args["temp_file"] = json!(temp);
+    if let Some(budget) = retry_ms {
+        args["sharing_retry_ms"] = json!(budget);
+    }
     server.start_call(1, "test_run", args);
     let child = lock_file(&gate);
     assert!(!is_free(&child));
@@ -70,7 +110,7 @@ fn deny_deletion_before_exit(server: &mut Server, directory: &Directory) -> (Pat
 fn a_persistent_sharing_violation_has_a_bounded_retry_period() {
     let directory = Directory::new();
     let mut server = server();
-    let (temp, child, deny_delete) = deny_deletion_before_exit(&mut server, &directory);
+    let (temp, child, deny_delete) = deny_deletion_before_exit(&mut server, &directory, None);
     let started = Instant::now();
     fs::write(directory.0.join("gate.release"), []).unwrap();
     let result = finished(&server.response(1));
@@ -90,19 +130,16 @@ fn a_persistent_sharing_violation_has_a_bounded_retry_period() {
 fn cleanup_retries_a_temporary_file_after_a_sharing_violation_clears() {
     let directory = Directory::new();
     let mut server = server();
-    let (temp, child, deny_delete) = deny_deletion_before_exit(&mut server, &directory);
+    // The worker can keep trying past the client's entire bounded wait for the call's result.
+    let (temp, child, deny_delete) =
+        deny_deletion_before_exit(&mut server, &directory, Some(u64::MAX));
     fs::write(directory.0.join("gate.release"), []).unwrap();
-    wait_for("stub did not exit", || is_free(&child));
-    // Give the supervisor an opportunity to attempt deletion while this handle is still open.
-    assert!(
-        server
-            .next_frame(Instant::now() + Duration::from_millis(100))
-            .is_none()
-    );
-    drop(deny_delete);
     let result = finished(&server.response(1));
     assert_eq!(result["code"], 21);
-    assert!(!temp.exists());
+    assert!(is_free(&child));
+    assert!(temp.exists());
+    drop(deny_delete);
     assert!(server.finish().0.success());
+    assert!(!temp.exists(), "{}", server.stderr());
     assert!(!server.stderr().contains("could not remove temporary file"));
 }

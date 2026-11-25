@@ -15,6 +15,9 @@ mod cleanup;
 #[path = "supervisor/lifecycle.rs"]
 mod lifecycle;
 #[cfg(unix)]
+#[path = "supervisor/shutdown.rs"]
+mod shutdown;
+#[cfg(unix)]
 #[path = "supervisor/unix.rs"]
 mod unix;
 

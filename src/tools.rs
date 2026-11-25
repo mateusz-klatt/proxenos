@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::mcp::{Service, ToolOutcome, ToolSpec, UnknownTool};
+use crate::mcp::{Activity, Service, ToolOutcome, ToolSpec, UnknownTool};
 
 pub struct Registry;
 
@@ -23,8 +23,9 @@ impl Service for Registry {
         name: String,
         arguments: Map<String, Value>,
         cancel: CancellationToken,
+        activity: Activity,
     ) -> Result<ToolOutcome, UnknownTool> {
-        extra_call(&name, &arguments, &cancel)
+        extra_call(&name, &arguments, &cancel, activity)
             .await
             .ok_or(UnknownTool)
     }
@@ -45,8 +46,9 @@ async fn extra_call(
     name: &str,
     arguments: &Map<String, Value>,
     cancel: &CancellationToken,
+    activity: Activity,
 ) -> Option<ToolOutcome> {
-    test_tools::call(name, arguments, cancel).await
+    test_tools::call(name, arguments, cancel, activity).await
 }
 
 #[cfg(not(feature = "test-tools"))]
@@ -54,6 +56,7 @@ async fn extra_call(
     _name: &str,
     _arguments: &Map<String, Value>,
     _cancel: &CancellationToken,
+    _activity: Activity,
 ) -> Option<ToolOutcome> {
     None
 }
@@ -65,7 +68,7 @@ mod test_tools {
     use serde_json::{Map, Value, json};
     use tokio_util::sync::CancellationToken;
 
-    use crate::mcp::{ToolOutcome, ToolSpec};
+    use crate::mcp::{Activity, ToolOutcome, ToolSpec};
     use crate::supervise::{self, Finished, Launch};
 
     fn spec(name: &str, description: &str, schema: Value) -> ToolSpec {
@@ -96,6 +99,7 @@ mod test_tools {
                         "deadline_ms": { "type": "integer", "minimum": 0 },
                         "capture_limit": { "type": "integer", "minimum": 0 },
                         "temp_file": { "type": "string", "description": "Create a new temporary file for the child at this path." },
+                        "sharing_retry_ms": { "type": "integer", "minimum": 0, "description": "Windows sharing-violation retry budget for the temporary file, in milliseconds (default 1000)." },
                         "on_cancel": { "enum": ["start", "drop"], "description": "Start with the cancelled token, or drop the running supervisor when the call is cancelled." }
                     },
                     "required": ["program", "deadline_ms", "capture_limit"]
@@ -137,6 +141,7 @@ mod test_tools {
     async fn run(
         arguments: &Map<String, Value>,
         cancel: &CancellationToken,
+        activity: Activity,
     ) -> std::io::Result<Finished> {
         let text = |name: &str| {
             arguments
@@ -147,8 +152,13 @@ mod test_tools {
         let env = arguments.get("env").and_then(Value::as_object);
         let mut temporary_files = Vec::new();
         if let Some(path) = text("temp_file") {
-            tokio::fs::File::create_new(&path).await?;
-            temporary_files.push(path.into());
+            let file = supervise::cleanup::TemporaryFile::create(
+                path.into(),
+                #[cfg(windows)]
+                Duration::from_millis(millis(arguments, "sharing_retry_ms").unwrap_or(1000)),
+            )
+            .await?;
+            temporary_files.push(file);
         }
         let launch = Launch {
             program: text("program").unwrap_or_default().into(),
@@ -175,9 +185,15 @@ mod test_tools {
         if on_cancel == Some("start") {
             cancel.cancelled().await;
         }
+        // In drop mode the client abandons a live supervisor without asking it to stop.
+        let supervisor_cancel = if on_cancel == Some("drop") {
+            CancellationToken::new()
+        } else {
+            cancel.clone()
+        };
         tokio::select! {
             biased;
-            result = supervise::run(launch, cancel) => result,
+            result = supervise::run(launch, &supervisor_cancel, activity) => result,
             () = cancel.cancelled(), if on_cancel == Some("drop") => {
                 Err(std::io::Error::other("caller dropped the supervisor"))
             }
@@ -214,6 +230,7 @@ mod test_tools {
         name: &str,
         arguments: &Map<String, Value>,
         cancel: &CancellationToken,
+        activity: Activity,
     ) -> Option<ToolOutcome> {
         let outcome = match name {
             "test_echo" => ToolOutcome {
@@ -225,7 +242,7 @@ mod test_tools {
                 is_error: true,
             },
             "test_panic" => panic!("test_panic was called"),
-            "test_run" => run_outcome(run(arguments, cancel).await),
+            "test_run" => run_outcome(run(arguments, cancel, activity).await),
             "test_wait" => {
                 let ms = arguments.get("ms").and_then(Value::as_u64).unwrap_or(0);
                 // The tests read these lines to know the call is running, and how it ended.

@@ -1,31 +1,68 @@
 //! Release the files owned by a launch after its child has been reaped.
 
-use std::io::{ErrorKind, Write};
+use std::ffi::OsString;
+use std::fs;
+use std::io::{self, ErrorKind, Write};
 use std::path::PathBuf;
 
-pub(crate) async fn remove_files(paths: Vec<PathBuf>) {
-    if !paths.is_empty() {
-        let _ = tokio::task::spawn_blocking(move || remove_files_blocking(&paths)).await;
+pub(crate) struct TemporaryFile {
+    path: PathBuf,
+    reservation: PathBuf,
+    #[cfg(windows)]
+    retry_budget: std::time::Duration,
+}
+
+impl TemporaryFile {
+    pub(crate) async fn create(
+        path: PathBuf,
+        #[cfg(windows)] retry_budget: std::time::Duration,
+    ) -> io::Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let name = path.file_name().ok_or(ErrorKind::InvalidInput)?;
+            let mut reserved_name = OsString::from(".proxenos-reserved-");
+            reserved_name.push(name);
+            let reservation = path.with_file_name(reserved_name);
+            // mkdir reserves the name across server processes, even after the CLI unlinks its
+            // own input. As a directory it cannot be unlinked by another file's cleanup.
+            fs::create_dir(&reservation)?;
+            if let Err(error) = fs::File::create_new(&path) {
+                let _ = fs::remove_dir(reservation);
+                return Err(error);
+            }
+            Ok(Self {
+                path,
+                reservation,
+                #[cfg(windows)]
+                retry_budget,
+            })
+        })
+        .await?
     }
 }
 
-/// Also used by a reaper that already runs on a blocking thread.
-pub(crate) fn remove_files_blocking(paths: &[PathBuf]) {
-    #[cfg(windows)]
-    let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    for path in paths {
-        let removed = std::fs::remove_file(path);
+/// Called on the blocking launch or reaper worker.
+pub(crate) fn remove_files_blocking(files: &[TemporaryFile]) {
+    for file in files {
+        let removed = fs::remove_file(&file.path);
         #[cfg(windows)]
-        let removed = retry_shared_file(path, removed, retry_until);
-        if let Err(error) = removed
-            && error.kind() != ErrorKind::NotFound
-        {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "proxenos: could not remove temporary file {}: {error}",
-                path.display()
-            );
-        }
+        let removed = retry_shared_file(&file.path, removed, file.retry_budget);
+        // No further unlink will target this name. Return the reservation before writing a
+        // diagnostic, which can block when a client stops reading stderr.
+        let released = fs::remove_dir(&file.reservation);
+        report_error(&file.path, removed);
+        report_error(&file.reservation, released);
+    }
+}
+
+fn report_error(path: &std::path::Path, result: io::Result<()>) {
+    if let Err(error) = result
+        && error.kind() != ErrorKind::NotFound
+    {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "proxenos: could not remove temporary file {}: {error}",
+            path.display()
+        );
     }
 }
 
@@ -33,17 +70,18 @@ pub(crate) fn remove_files_blocking(paths: &[PathBuf]) {
 fn retry_shared_file(
     path: &std::path::Path,
     mut removed: std::io::Result<()>,
-    until: std::time::Instant,
+    budget: std::time::Duration,
 ) -> std::io::Result<()> {
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
     // Terminating a job can return while its processes still hold this file without delete sharing.
+    let started = Instant::now();
     while removed
         .as_ref()
         .is_err_and(|error| error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()))
     {
-        let remaining = until.saturating_duration_since(Instant::now());
+        let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             break;
         }

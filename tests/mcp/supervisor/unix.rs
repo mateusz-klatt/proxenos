@@ -1,15 +1,17 @@
-//! Errors from the operating system while stopping a live child.
+//! Unix kernel behavior at launch and while stopping a live child.
 
 #[cfg(target_os = "linux")]
-mod platform {
+pub(super) mod platform {
     #![allow(unsafe_code)]
 
     use super::super::*;
     use libc::{BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W};
+    use std::os::fd::AsRawFd;
+    use std::process::{Command, Stdio};
 
     /// The test launcher gives its server a kernel policy that refuses kill(2). Only this
     /// thread, the server it launches and their descendants inherit the filter.
-    fn server_without_signal_permission() -> Server {
+    pub(in super::super) fn server_without_signal_permission() -> Server {
         let (send, receive) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let instruction = |code: u32, jf, k| libc::sock_filter {
@@ -50,6 +52,65 @@ mod platform {
         receive
             .recv_timeout(WAIT)
             .expect("server with a restricted signal policy")
+    }
+
+    #[test]
+    fn a_stalled_exec_allows_other_timers_and_a_queued_call_can_be_dropped() {
+        let directory = Directory::new();
+        let executable = directory.0.join("leased-stub");
+        fs::copy(STUB, &executable).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_proxenos"));
+        command
+            .args(["mcp", "--client", "claude"])
+            .env("TOKIO_WORKER_THREADS", "1")
+            .stderr(Stdio::piped());
+        let mut server = Server::start_command(command);
+        server.initialize("2025-11-25");
+
+        // Opening this executable for reading will block in execve until we release the
+        // write lease. Clear the notification owner because we observe the break by polling.
+        let lease = File::options().write(true).open(&executable).unwrap();
+        let fd = lease.as_raw_fd();
+        // SAFETY: both fcntl commands take one integer argument and use our open descriptor.
+        unsafe {
+            assert_eq!(libc::fcntl(fd, libc::F_SETLEASE, libc::F_WRLCK), 0);
+            assert_eq!(libc::fcntl(fd, libc::F_SETOWN, 0), 0);
+        }
+        let mut blocked = launch(json!(["exit:27"]));
+        blocked["program"] = json!(executable);
+        server.start_call(1, "test_run", blocked);
+        wait_for("stub did not reach execve", || {
+            // SAFETY: F_GETLEASE reads the lease type for our live file descriptor.
+            unsafe { libc::fcntl(fd, libc::F_GETLEASE) == libc::F_RDLCK }
+        });
+
+        let input = directory.0.join("queued-input");
+        let marker = directory.0.join("queued-child");
+        let mut queued = launch(json!([format!("hold:{}", marker.display())]));
+        queued["temp_file"] = json!(input);
+        queued["on_cancel"] = json!("drop");
+        server.start_call(2, "test_run", queued);
+        wait_for("queued call did not prepare its input", || input.exists());
+        // The sole async worker must service this timer while native spawn owns the lock.
+        assert_eq!(
+            text(&server.call(3, "test_wait", json!({"ms": 10}))),
+            "waited"
+        );
+        // EOF cancels both calls, but unlike a cancellation notification it lets the client
+        // observe that the queued future has actually been dropped before releasing the lease.
+        server.close_input();
+        let dropped = server.response(2);
+        assert!(
+            text(&dropped).contains("caller dropped the supervisor"),
+            "{dropped}"
+        );
+        drop(lease);
+        assert!(server.finish().0.success(), "{}", server.stderr());
+        wait_for("dropped launch kept its temporary file", || !input.exists());
+        assert!(
+            !marker.exists(),
+            "the dropped launch started after the lock opened"
+        );
     }
 
     #[test]

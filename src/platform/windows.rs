@@ -4,13 +4,11 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::{ChildExt, CommandExt};
-use std::path::PathBuf;
 use std::process::{Child as StdChild, Command, ExitStatus};
 use std::ptr::{NonNull, null};
 
 use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -18,7 +16,9 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED, ResumeThread};
 
-use crate::supervise::{StartError, cleanup};
+use crate::mcp::Activity;
+use crate::supervise::cleanup::{self, TemporaryFile};
+use crate::supervise::{StartError, finish_reap};
 
 struct Group(OwnedHandle);
 
@@ -71,7 +71,8 @@ pub struct Child {
     job: Group,
     release: oneshot::Sender<()>,
     exited: oneshot::Receiver<()>,
-    status: JoinHandle<io::Result<ExitStatus>>,
+    status: oneshot::Receiver<io::Result<ExitStatus>>,
+    cleaned: oneshot::Receiver<()>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
 }
@@ -85,16 +86,17 @@ impl Child {
         self.job.terminate()
     }
 
-    pub async fn finish(self) -> io::Result<ExitStatus> {
+    pub async fn finish(mut self) -> io::Result<ExitStatus> {
         drop(self.job);
         drop(self.release);
-        self.status.await?
+        finish_reap(&mut self.status, &mut self.cleaned).await
     }
 }
 
 pub fn spawn(
     mut command: Command,
-    files: &mut Vec<PathBuf>,
+    files: &mut Vec<TemporaryFile>,
+    activity: Activity,
     before_spawn: impl FnOnce() -> Result<(), StartError>,
 ) -> Result<Child, StartError> {
     let job = Group::new()?;
@@ -127,20 +129,27 @@ pub fn spawn(
     // Only one blocking wait owns the process. The notification can be cancelled without
     // consuming the status the supervisor collects after it has finished with the pipes.
     let (done, exited) = oneshot::channel();
+    let (report_status, status) = oneshot::channel();
+    let (report_cleaned, cleaned) = oneshot::channel();
     let (release, released) = oneshot::channel::<()>();
     let files = std::mem::take(files);
-    let status = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let status = process.0.wait();
         drop(process);
+        let files_to_remove = status.is_ok().then_some(files);
+        let _ = report_status.send(status);
         let _ = done.send(());
         let _ = released.blocking_recv();
-        status.inspect(|_| cleanup::remove_files_blocking(&files))
+        cleanup::remove_files_blocking(files_to_remove.as_deref().unwrap_or_default());
+        let _ = report_cleaned.send(());
+        drop(activity);
     });
     Ok(Child {
         job,
         release,
         exited,
         status,
+        cleaned,
         stdout,
         stderr,
     })
