@@ -1339,13 +1339,18 @@ fn save_error_never_caches_unverified_settings_or_clears_ambiguity() {
 fn session_save_respects_call_deadline_and_cancellation() {
     use std::time::{Duration, Instant};
 
+    // Part A: external holder of `<key>.lock` blocks start A (conflicting with disk) past its
+    // short timeout. Start A returns the finished answer with session_save_failure=timeout while
+    // its detached worker retains the owned key lock. A reply issued afterward must wait (never
+    // bypassing the detached save to cache pre-conflict disk state), and once the external lock
+    // releases, the detached worker writes the ambiguity tombstone and reconciles StartStore so
+    // pending and subsequent replies are refused as ambiguous.
     let fleet = Fleet::new(&["codex"]);
     fleet.script(
         "codex",
         json!([
             {"stdout": CODEX_FINISHED},
-            {"stdout": CODEX_FINISHED, "final_message": "saved-timeout-answer"},
-            {"stdout": CODEX_FINISHED, "final_message": "saved-cancel-answer"}
+            {"stdout": CODEX_FINISHED, "final_message": "saved-timeout-answer"}
         ]),
     );
     let mut server1 = fleet.server("claude");
@@ -1365,8 +1370,6 @@ fn session_save_respects_call_deadline_and_cancellation() {
         .unwrap();
     lock.lock().unwrap();
 
-    // Part A: a blocked save respects call_deadline, still returns the finished provider answer
-    // with observed.session_save_failure = timeout, and does NOT cache the unverified start.
     let mut server2 = fleet.server("claude");
     server2.request(1, "tools/list", json!({}));
     let began = Instant::now();
@@ -1375,7 +1378,7 @@ fn session_save_respects_call_deadline_and_cancellation() {
         "codex",
         json!({
             "prompt": "save times out",
-            "model": "uncached-model",
+            "access": "read-only",
             "timeout_ms": 400
         }),
     );
@@ -1399,13 +1402,14 @@ fn session_save_respects_call_deadline_and_cancellation() {
         server2.stderr()
     );
 
-    // Because the start was not cached, a reply still hits the session lock instead of using cache.
+    // Reply with a short timeout waits on the detached save's owned key lock and times out.
+    let before_replies = fleet.records().len();
     let reply_blocked = call(
         &mut server2,
         "codex-reply",
         json!({
             "thread_id": CODEX_THREAD,
-            "prompt": "must not read from cache",
+            "prompt": "must wait for detached save",
             "timeout_ms": 150
         }),
     );
@@ -1421,24 +1425,111 @@ fn session_save_respects_call_deadline_and_cancellation() {
         "{reply_blocked}"
     );
 
+    // Issue a reply while the detached save is still holding the owned key lock, then release the
+    // external file lock so the detached save detects the conflict against disk (`access: full`),
+    // writes the ambiguity tombstone, and reconciles StartStore before the reply acquires the lock.
+    server2.start_call(
+        35,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "must observe detached save ambiguity"
+        }),
+    );
+    assert!(
+        server2
+            .next_frame(Instant::now() + Duration::from_millis(150))
+            .is_none(),
+        "reply must wait for detached save worker"
+    );
+    assert_eq!(fleet.records().len(), before_replies);
+    drop(lock);
+
+    let pending_reply: Value =
+        serde_json::from_str(crate::common::text(&server2.response(35))).unwrap();
+    assert_eq!(
+        pending_reply["observed"]["failure"]["kind"], "invalid_request",
+        "{pending_reply}"
+    );
+    assert!(
+        pending_reply["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting"),
+        "{pending_reply}"
+    );
+    let after_disk: Value =
+        serde_json::from_str(&fs::read_to_string(&session_file).unwrap()).unwrap();
+    assert_eq!(after_disk["ambiguous"], true, "{after_disk}");
+
+    // A later reply also refuses immediately as ambiguous without dispatching.
+    let later_reply = call(
+        &mut server2,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "still ambiguous"
+        }),
+    );
+    assert_eq!(
+        later_reply["observed"]["failure"]["kind"], "invalid_request",
+        "{later_reply}"
+    );
+    assert!(
+        later_reply["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting"),
+        "{later_reply}"
+    );
+    assert_eq!(fleet.records().len(), before_replies);
+    assert!(server2.finish().0.success());
+
     // Part B: cancellation (connection EOF) during a blocked save still returns the finished
     // answer promptly with observed.session_save_failure = cancellation while lock is still held.
-    let before = fleet.records().len();
-    server2.start_call(
+    let fleet_b = Fleet::new(&["codex"]);
+    fleet_b.script(
+        "codex",
+        json!([
+            {"stdout": CODEX_FINISHED},
+            {"stdout": CODEX_FINISHED, "final_message": "saved-cancel-answer"}
+        ]),
+    );
+    let mut seed_b = fleet_b.server("claude");
+    let seeded_b = call(
+        &mut seed_b,
+        "codex",
+        json!({"prompt": "seed", "access": "full"}),
+    );
+    assert_eq!(seeded_b["observed"]["state"], "finished", "{seeded_b}");
+    assert!(seed_b.finish().0.success());
+
+    let session_b = single_session_file(&sessions_root(&fleet_b.root).join("codex"));
+    let lock_b = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(session_b.with_extension("lock"))
+        .unwrap();
+    lock_b.lock().unwrap();
+
+    let mut server_b = fleet_b.server("claude");
+    server_b.request(1, "tools/list", json!({}));
+    let before = fleet_b.records().len();
+    server_b.start_call(
         40,
         "codex",
         json!({"prompt": "save cancelled", "model": "cancelled-save-model"}),
     );
     let until = Instant::now() + crate::common::WAIT;
-    while fleet.records().len() <= before {
+    while fleet_b.records().len() <= before {
         assert!(Instant::now() < until, "start stub did not finish");
         std::thread::sleep(Duration::from_millis(10));
     }
     std::thread::sleep(Duration::from_millis(100));
     let cancel_began = Instant::now();
-    server2.close_input();
+    server_b.close_input();
     let cancelled: Value =
-        serde_json::from_str(crate::common::text(&server2.response(40))).unwrap();
+        serde_json::from_str(crate::common::text(&server_b.response(40))).unwrap();
     let cancel_elapsed = cancel_began.elapsed();
     assert!(
         cancel_elapsed < Duration::from_secs(2),
@@ -1454,6 +1545,9 @@ fn session_save_respects_call_deadline_and_cancellation() {
         "{cancelled}"
     );
 
-    drop(lock);
-    assert!(server2.finish().0.success());
+    drop(lock_b);
+    assert!(server_b.finish().0.success());
+    let after_cancel_disk: Value =
+        serde_json::from_str(&fs::read_to_string(&session_b).unwrap()).unwrap();
+    assert_eq!(after_cancel_disk["ambiguous"], true, "{after_cancel_disk}");
 }

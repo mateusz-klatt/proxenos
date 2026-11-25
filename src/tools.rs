@@ -99,7 +99,7 @@ pub struct Registry {
     client: Client,
     pub discovery: Discovery,
     pub answers: crate::envelope::AnswerArchive,
-    pub starts: Mutex<StartStore>,
+    pub starts: Arc<Mutex<StartStore>>,
     pub session_locks: SessionLocks,
     pub background: Arc<Background>,
 }
@@ -110,7 +110,7 @@ impl Registry {
             client,
             discovery: Discovery::new(client),
             answers: Default::default(),
-            starts: Mutex::new(StartStore::new()),
+            starts: Arc::new(Mutex::new(StartStore::new())),
             session_locks: SessionLocks::default(),
             background: Background::new(),
         }

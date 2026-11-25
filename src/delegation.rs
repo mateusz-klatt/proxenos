@@ -368,43 +368,34 @@ impl Registry {
                 let key_lock = self.session_locks.for_key(p.name, id);
                 let saved = await_bounded(
                     async {
-                        let _key_guard = key_lock.lock().await;
-                        let desired = match self.starts.lock().unwrap().get(p.name, id) {
-                            Some(None) => None,
-                            Some(Some(existing)) if existing != &remembered => None,
-                            _ => Some(remembered.clone()),
-                        };
+                        // Hold an owned key guard inside the blocking worker so StartStore and
+                        // disk are always reconciled atomically before any later reply or start
+                        // can take the key lock, even if this caller times out or is cancelled.
+                        let key_guard = key_lock.lock_owned().await;
+                        let starts = Arc::clone(&self.starts);
                         let saved_id = id.clone();
                         let save_activity = activity.clone();
-                        let (desired, outcome) = tokio::task::spawn_blocking(move || {
+                        tokio::task::spawn_blocking(move || {
+                            let desired = match starts.lock().unwrap().get(p.name, &saved_id) {
+                                Some(None) => None,
+                                Some(Some(existing)) if existing != &remembered => None,
+                                _ => Some(remembered.clone()),
+                            };
                             let outcome = sessions::save(p, &saved_id, desired.clone());
+                            let reconciled = reconcile_start_cache(
+                                &mut starts.lock().unwrap(),
+                                p.name,
+                                &saved_id,
+                                &remembered,
+                                desired,
+                                outcome,
+                            );
+                            drop(key_guard);
                             drop(save_activity);
-                            (desired, outcome)
+                            reconciled
                         })
                         .await
-                        .expect("session saver finished");
-                        match outcome {
-                            Ok(SaveOutcome::Ambiguous) => {
-                                self.starts.lock().unwrap().cache(p.name, id.clone(), None);
-                                Ok(())
-                            }
-                            Ok(SaveOutcome::Saved | SaveOutcome::Unconfigured) => {
-                                self.starts
-                                    .lock()
-                                    .unwrap()
-                                    .cache(p.name, id.clone(), desired);
-                                Ok(())
-                            }
-                            Err(error) => {
-                                fail_closed_start_cache(
-                                    &mut self.starts.lock().unwrap(),
-                                    p.name,
-                                    id,
-                                    &remembered,
-                                );
-                                Err(Failure::new(FailureKind::Unknown, error.to_string()))
-                            }
-                        }
+                        .expect("session saver finished")
                     },
                     call_deadline,
                     cancel,
@@ -412,12 +403,6 @@ impl Registry {
                 )
                 .await;
                 if let Err(failure) = saved {
-                    fail_closed_start_cache(
-                        &mut self.starts.lock().unwrap(),
-                        p.name,
-                        id,
-                        &remembered,
-                    );
                     result.session_save_failure(&failure);
                     write_diagnostic(format!(
                         "could not save session settings: {}",
@@ -439,18 +424,38 @@ impl Registry {
     }
 }
 
-fn fail_closed_start_cache(
+fn reconcile_start_cache(
     starts: &mut StartStore,
     provider: &'static str,
     id: &str,
     remembered: &RememberedStart,
-) {
+    desired: Option<RememberedStart>,
+    outcome: io::Result<SaveOutcome>,
+) -> Result<(), Failure> {
     let conflicting = matches!(starts.get(provider, id), Some(None))
-        || matches!(starts.get(provider, id), Some(Some(existing)) if existing != remembered);
-    if conflicting {
-        starts.cache(provider, id.to_owned(), None);
-    } else {
-        starts.remove(provider, id);
+        || matches!(starts.get(provider, id), Some(Some(existing)) if existing != remembered)
+        || desired.is_none();
+    match outcome {
+        Ok(SaveOutcome::Ambiguous) => {
+            starts.cache(provider, id.to_owned(), None);
+            Ok(())
+        }
+        Ok(SaveOutcome::Saved | SaveOutcome::Unconfigured) => {
+            starts.cache(
+                provider,
+                id.to_owned(),
+                (!conflicting).then_some(desired).flatten(),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            if conflicting {
+                starts.cache(provider, id.to_owned(), None);
+            } else {
+                starts.remove(provider, id);
+            }
+            Err(Failure::new(FailureKind::Unknown, error.to_string()))
+        }
     }
 }
 
