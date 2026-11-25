@@ -35,17 +35,27 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # Once as released, and once with the tools that exist only for the tests. Separate
+      # steps, because a Windows shell reports only the exit status of its last command.
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Lint with the test tools
+        run: cargo clippy --all-targets --locked --features test-tools -- -D warnings
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-llvm-cov@0.9.2
 
-      # Runs the tests. Each platform must cover every line it compiles.
+      # The build as released, without the test tools.
+      - name: Test the release configuration
+        run: cargo test --locked
+
+      # Runs the tests. Each platform must cover every line it compiles. The MCP tests need
+      # the `test-tools` feature, which a release is built without.
       - name: Test with full line coverage
-        run: cargo llvm-cov --locked --lcov --output-path lcov.info --fail-under-lines 100
+        run: cargo llvm-cov --locked --features test-tools --lcov --output-path lcov.info --fail-under-lines 100
 
       # SonarCloud reads the Linux profile. The gate above is what holds every platform
       # to 100%; the paths in the other platforms' profiles would not resolve on the

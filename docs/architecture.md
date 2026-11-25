@@ -5,7 +5,8 @@ what was measured, and what is still unknown. A decision here stands until a rec
 changes it. [ADR 001](adr/001-decisions-by-the-families-that-can-answer.md) says how decisions are
 taken, and [votes.md](votes.md) records who proposed and who supported each one.
 
-**Status: design.** Apart from the crate skeleton, nothing below is built yet. Sentences in the
+**Status: milestone 1 in progress.** Built so far: the MCP layer of D4, served by
+`proxenos mcp --client <client>` with no provider yet. Nothing else below is built. Sentences in the
 present tense describe the design, not a running program.
 
 ## 1. Terms
@@ -141,13 +142,35 @@ Measured on 2026-11-24 with a throwaway server on Linux, `rmcp` 3.11.0, features
 
 What the `mcp` module has to do itself, because the library does not:
 
-- **End of input.** The library waits a fixed five seconds after standard input closes before it
-  cancels running calls. Proxenos watches its input and stops its children at once.
+- **End of input.** Proxenos reads ahead on standard input and signals running calls as soon as
+  it sees the input end. Up to 16 chunks of at most 64 KiB each can wait in the input queue.
+  When rmcp falls further behind, the reader waits for space before reading again. Only that
+  backpressure delays its observation of the end of input.
+- **Read and write failures.** The library ends quietly when it cannot read or write. Proxenos
+  takes the library's answers from it frame by frame as they are written, and writes them to
+  standard output itself, so that a failure in either direction stops serving and ends it with
+  exit status 1 and the first reason recorded. Exit status 0 means the client closed the
+  connection. On failure Proxenos stops forwarding bytes into the library. If the library
+  dispatches a buffered tool call after the halt, the handler returns an internal error without
+  invoking the tool. A failed connection may be unable to deliver that error.
+- **A client that does not read.** Up to 64 MiB of output can wait for the client, including the
+  frame being collected and the frame being written. The collector passes complete frames to the
+  writer in order. Crossing the limit or reaching the end of the library's output partway through
+  a frame fails the connection. After a failure, serving can end even if standard output is blocked.
 - **Cancellation.** The library signals a token and does not stop the handler. Every handler
   waits on that token.
 - **Panics.** A handler that panics is never answered. Proxenos catches the panic and answers
   with an error.
 - **Identity.** The server name and version are set; the default is the library's own.
+- **Batches.** The revision of 2025-03-26 requires a server to accept JSON-RPC batches, and the
+  library refuses them. Proxenos does not offer that revision: a client that asks for it is
+  offered 2025-11-25, which it may accept or not.
+- **Calls still running when the connection ends.** When rmcp sees the end of its input it gives
+  handlers five seconds to finish. A call cancelled by the end of input gets a reply if it
+  finishes within that drain. A call that finishes later gets no reply. Proxenos still waits for
+  running calls to clean up. Ten seconds after Proxenos sees the end of input, the first
+  failure, or the library stopping, it abandons any remaining calls and output and exits with a
+  failure. When a failure was already recorded, that failure is the one reported.
 
 Known differences from claude-delegator, accepted: a line that is not JSON is ignored instead of
 answered with a parse error, and a `tools/call` without a name is "method not found" instead of
@@ -264,6 +287,9 @@ Not measured: any of this for Proxenos. The cross-builds are the first thing to 
 - Line coverage is 100% on each platform for the code that platform compiles, enforced in CI.
 - Behavioural tests start the compiled binary and speak MCP to it. Providers run against a stub
   CLI built from this crate, which records what it was started with.
+- Tools that exist only to test the MCP layer, such as one that panics, are compiled in only with
+  the `test-tools` feature. CI lints with and without it and measures coverage with it; a release
+  is built without it.
 - During the migration, the same scenarios are replayed against claude-delegator 3.5.0 and the
   results compared, apart from a short list of intended differences.
 - No test starts a real agent CLI or spends a model call.
