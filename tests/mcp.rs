@@ -4,6 +4,8 @@
 mod common;
 
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{NEW_VERSION, Server, meta, text};
@@ -262,18 +264,30 @@ fn a_failed_write_stops_calls_and_makes_serving_fail() {
     drop(stdout);
     // A write succeeds while any process still holds the read end. A process that another test
     // is starting at this moment holds a copy until it executes the binary (measured on Linux), so
-    // answers are asked for until one fails to be written. Input is still open: cancellation shows
-    // that the failed write halted serving.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    for id in 3.. {
-        if server.stderr().contains("test_wait: cancelled") {
-            break;
-        }
-        assert!(Instant::now() < deadline, "{}", server.stderr());
-        server.start_call(id, "test_echo", json!({}));
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // answers are asked for until one fails to be written. They are asked for on their own thread,
+    // so that a server that stops reading cannot hold this one past its deadline.
     let mut stdin = server.take_input();
+    let probing = Arc::new(AtomicBool::new(true));
+    let probes = {
+        let probing = Arc::clone(&probing);
+        std::thread::spawn(move || {
+            for id in 3_u32.. {
+                let echo = json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": { "name": "test_echo", "arguments": {} }
+                });
+                if !probing.load(Ordering::SeqCst) || writeln!(stdin, "{echo}").is_err() {
+                    return stdin;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            stdin
+        })
+    };
+    // Input is still open: cancellation shows that the failed write halted serving.
+    server.wait_for_stderr("test_wait: cancelled");
+    probing.store(false, Ordering::SeqCst);
+    let mut stdin = probes.join().expect("the probes finish");
     let late = json!({
         "jsonrpc": "2.0", "id": "after-the-failure", "method": "tools/call",
         "params": { "name": "test_wait", "arguments": { "ms": 0 } }
@@ -360,7 +374,7 @@ fn output_that_piles_up_unread_past_its_limit_makes_serving_fail() {
 fn input_that_cannot_be_read_makes_serving_fail() {
     let directory = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).expect("a directory opens");
     let spawning = common::spawning();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_proxenos"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_proxenos"))
         .args(["mcp", "--client", "claude"])
         .stdin(directory)
         .stdout(std::process::Stdio::piped())
@@ -368,6 +382,15 @@ fn input_that_cannot_be_read_makes_serving_fail() {
         .spawn()
         .expect("the binary starts");
     drop(spawning);
+    let deadline = Instant::now() + common::WAIT;
+    while child
+        .try_wait()
+        .expect("the child can be waited on")
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "the server did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let output = child.wait_with_output().expect("the binary runs");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -398,18 +421,20 @@ fn a_connection_that_cannot_be_served_is_a_failure() {
 #[test]
 fn a_failed_handshake_is_reported_while_output_is_blocked() {
     let (mut server, _unread) = Server::mcp_with_unread_output();
-    let mut stdin = server.take_input();
+    let stdin = server.take_input();
     // On its own thread, so that the wait below is bounded even if the server stops reading.
     let writing = std::thread::spawn(move || {
         // Answers to pings before initialize, more than a pipe holds and none of them read.
         let pings = (0..20_000).map(|id| json!({ "jsonrpc": "2.0", "id": id, "method": "ping" }));
         let wrong = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        let mut input = std::io::BufWriter::new(stdin);
         for frame in pings.chain([wrong]) {
-            if writeln!(stdin, "{frame}").is_err() {
+            if writeln!(input, "{frame}").is_err() {
                 break;
             }
         }
-        stdin // Input stays open until the child exits.
+        let _ = input.flush();
+        input // Input stays open until the child exits.
     });
     // The handshake failure alone ends serving, and its reason survives the drain that the
     // blocked output cuts short.
