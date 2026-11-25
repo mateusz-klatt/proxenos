@@ -2,14 +2,12 @@ version: 2
 project_name: proxenos
 
 # D11: GoReleaser builds Proxenos with its Rust builder (cargo auditable zigbuild)
-# in credential-free jobs. Signing, notarization and release publication run in
-# separate jobs that never invoke Cargo. Snapshots use this config directly to
-# exercise all six targets, archives, Syft SBOMs and checksums with no secrets.
+# in credential-free jobs. Publication and signing are disabled here so a local
+# `goreleaser release` with a personal token cannot create a draft or sign outside
+# the release workflow. Snapshot builds use this config directly to exercise all
+# six targets, archives, target-specific Syft SBOMs and checksums with no secrets.
 release:
-  draft: true
-  prerelease: auto
-  extra_files:
-    - glob: '{{ if isEnvSet "PROXENOS_MACOS_DIST" }}{{ .Env.PROXENOS_MACOS_DIST }}/*{{ end }}'
+  disable: true
 
 builds:
   - id: proxenos-darwin
@@ -83,13 +81,3 @@ checksum:
 sboms:
   - artifacts: archive
     cmd: syft
-
-signs:
-  - artifacts: checksum
-    cmd: cosign
-    signature: '${artifact}.sigstore.json'
-    args:
-      - sign-blob
-      - '--bundle=${signature}'
-      - '${artifact}'
-      - '--yes'

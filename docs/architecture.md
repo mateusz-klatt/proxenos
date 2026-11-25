@@ -278,86 +278,153 @@ Six targets: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (stati
 `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `x86_64-pc-windows-gnu` and
 `aarch64-pc-windows-gnullvm`. GoReleaser v2.20.0 builds them with its Rust builder through Cargo's
 alias `auditablezigbuild` (`cargo auditable zigbuild --release --locked`, without
-`--features test-tools`, using pinned Zig, `cargo-zigbuild` and `cargo-auditable`). `Cargo.toml`
-strips release symbols and enables thin LTO while keeping `panic = "unwind"`, so handler panic
-catching (D4) stays intact. On `aarch64-pc-windows-gnullvm`, `libunwind` is linked explicitly for
-that unwind runtime. `cargo-auditable` embeds each target's linked crate graph inside the binary
-so that Syft catalogs target-specific Rust crates into each archive's SPDX JSON SBOM. Each archive
-holds `proxenos` (or `proxenos.exe`), `LICENSE` and `NOTICE` with fixed `root:root` ownership and
-the commit timestamp.
+`--features test-tools`, using pinned Zig 0.17.1, `cargo-zigbuild` 0.24.1 and `cargo-auditable`
+0.7.7). `Cargo.toml` strips release symbols and enables thin LTO while keeping `panic = "unwind"`,
+so handler panic catching (D4) stays intact. On `aarch64-pc-windows-gnullvm`, `libunwind` is linked
+explicitly for that unwind runtime. `cargo-auditable` embeds each target's linked crate graph inside
+the binary so that Syft 1.54.0 catalogs target-specific Rust crates into each archive's SPDX JSON
+SBOM. Each archive holds `proxenos` (or `proxenos.exe`), `LICENSE` and `NOTICE` with fixed
+`root:root` ownership and the commit timestamp. `.goreleaser.yaml` sets `release: disable: true` and
+defines no `signs:` block so a local `goreleaser release` with a personal token cannot create a
+release or sign outside the workflow.
 
 Compilation and signing are separated across jobs so Cargo build scripts never see signing
-credentials or write tokens. All seven Certum and Apple secrets live in the GitHub `release`
-environment (deployment policy: branch `main` and tags `v*`; required reviewer: the owner). Only
-the four signing jobs (`sign-macos` and `sign-windows` in `release.yml`, and `sign` in each
-signing proof) use `environment: release`. Downloaded release tools (`goreleaser`, `syft`,
-`cosign`) are checked against repository-pinned SHA-256 digests before execution; `ssign` is built
-from a pinned commit in a credential-free job and verified by SHA-256 before execution.
+credentials or write tokens. There is **no `v*` tag-push trigger**: a pushed tag executes the
+workflow YAML from the tagged commit, so an unmerged tagged commit could skip tag checks and request
+signing secrets. Instead, a release starts only via `workflow_dispatch` on branch `main` with a
+non-empty `version` input (e.g. `0.1.0`). Branch `main` is guarded by GitHub ruleset `28030033`
+(pull request, the four required CI checks, no force push, no deletion); tag ruleset `release tags`
+blocks updating and deleting `refs/tags/v*`. All seven Certum and Apple secrets live in the GitHub
+`release` environment, whose deployment policy allows **only branch `main`** and requires review by
+the owner. Only the four signing jobs (`sign-macos` and `sign-windows` in `release.yml`, and `sign`
+in each signing proof) use `environment: release`. Because `sign-macos` and `sign-windows` both use
+`environment: release` and `sign-windows` waits for `verify-macos` after Apple notarization, one
+release requires **two** `release` environment approvals several minutes apart.
 
-In `.github/workflows/release.yml`, a pushed `v*` tag in `mateusz-klatt/proxenos` runs:
+Downloaded release tools (`goreleaser` v2.20.0 for Linux x86-64 and macOS universal `Darwin_all`,
+`syft` v1.54.0 for Linux amd64 and macOS arm64, and `cosign` v3.1.4 for Linux amd64) are fetched
+directly via `curl` without third-party installer actions and verified against repository-pinned
+SHA-256 digests for both the downloaded tarball (before unpacking) and the extracted binary (before
+execution). `ssign` is built from a pinned commit (`Le-Syl21/ssign`, `--locked`) in a
+credential-free job; its SHA-256 is recorded there and re-checked in `sign-windows` as a **transit
+integrity** check across the artifact handoff within the same workflow run, not a pre-established
+reproducible digest.
 
-- **Tag check (`check-tag`, `ubuntu-latest`, `contents: read`)**: verifies exact case-sensitive
-  repository and `refs/tags/v*` ref, checks that the tagged commit is an ancestor of
-  `origin/main`, and checks that `Cargo.toml`'s package version matches the tag before any build
-  or signing runs.
+The pipeline **never pushes a git tag**. Because no tag exists when the release builds run, the build
+jobs set `GORELEASER_CURRENT_TAG=v<version>`, verify a clean working tree explicitly
+(`git status --porcelain`), and run `goreleaser build --clean --parallelism=1 --skip=validate`.
+GoReleaser reads `GORELEASER_CURRENT_TAG` for its release metadata while `--skip=validate` skips
+only the exact-tag `git describe` check without introducing snapshot version suffixes. `publish`
+creates a **draft** GitHub release with `tag_name: v<version>` and `target_commitish` set to the
+dispatched commit SHA; GitHub creates the git tag only when the owner publishes that draft.
+
+In `.github/workflows/release.yml`, a `workflow_dispatch` on `main` in `mateusz-klatt/proxenos` with
+a non-empty `version` input runs:
+
+- **Release check (`check-release`, `ubuntu-latest`, `contents: read`)**: verifies exact
+  case-sensitive repository and `refs/heads/main`, validates SemVer `version` against `Cargo.toml`,
+  and fails early if tag `v<version>` or any published release visible to `contents: read` already
+  exists.
 - **Certum signer (`signer`, `ubuntu-latest`, `contents: read`)**: builds pinned `Le-Syl21/ssign`
-  from source with `--locked` and no credentials, recording and outputting its SHA-256.
+  from source with `--locked` and no credentials, recording and outputting its SHA-256 for transit
+  integrity.
 - **Credential-free builds (`build-macos` on `macos-latest`, `build-linux-windows` on
-  `ubuntu-latest`, `contents: read`)**: verify the pinned `goreleaser` SHA-256, pin
-  `GORELEASER_CURRENT_TAG` to the validated event tag, build the binaries with GoReleaser's Rust
-  builder and no secrets, check Mach-O/ELF/PE architectures and static Linux linking, and upload
-  unsigned binaries as 1-day artifacts.
+  `ubuntu-latest`, `contents: read`)**: verify the pinned `goreleaser` tarball and binary SHA-256
+  digests, pin `GORELEASER_CURRENT_TAG=v<version>`, check tree cleanliness, build the binaries with
+  `goreleaser build --clean --parallelism=1 --skip=validate` and no secrets, check Mach-O/ELF/PE
+  architectures, static Linux linking and `--version`, upload unsigned binaries as 1-day artifacts,
+  and output every binary's SHA-256 digest.
 - **macOS signing and notarization (`sign-macos`, `macos-latest`, `environment: release`,
-  `contents: read`)**: checks exact ref, downloads the unsigned macOS binaries without running
-  Cargo, signs them with native `codesign` (hardened runtime and secure timestamp) from a
-  temporary keychain, submits each to Apple with `xcrun notarytool --wait`, and requires JSON
-  `status == "Accepted"`.
-- **macOS verification (`verify-macos`, `macos-latest`, no permissions, no secrets)**: checks both
-  signed binaries with `codesign` and `spctl` against the pinned Developer ID identity, runs the
-  arm64 binary with `--version`, and outputs both binary SHA-256 digests.
+  `contents: read`)**: checks exact repo and `refs/heads/main`, verifies the unsigned macOS binary
+  digests from `build-macos` before signing without running Cargo, writes decoded `developer-id.p12`
+  and `AuthKey.p8` with mode `0600` at creation time and deletes both files alongside the temporary
+  keychain in an `EXIT` trap, signs both binaries with native `codesign` (hardened runtime and
+  secure timestamp), submits each to Apple with `xcrun notarytool --wait`, requires JSON
+  `status == "Accepted"`, and outputs both signed binary SHA-256 digests.
+- **Pre-packaging macOS verification (`verify-macos`, `macos-latest`, no permissions, no secrets)**:
+  verifies the signed macOS binary digests from `sign-macos`, checks both bare binaries with
+  `codesign` and `spctl` against the pinned Developer ID identity, and runs the arm64 binary with
+  `--version` before `sign-windows` runs.
 - **Windows signing (`sign-windows`, `ubuntu-latest`, `environment: release`, `contents: read`)**:
-  runs only after `verify-macos` passes, checks exact ref, verifies the downloaded `ssign` SHA-256,
-  and signs both Windows executables in separate `ssign` processes with a five-variable
-  environment allowlist, suppressed stdio and a five-minute timeout, without running Cargo.
+  runs only after `verify-macos` passes, checks exact repo and `refs/heads/main`, verifies the
+  `ssign` transit digest and both unsigned Windows binary digests from `build-linux-windows`, signs
+  both Windows executables in separate `ssign` processes with a five-variable environment allowlist,
+  suppressed stdio and a five-minute timeout without running Cargo, and outputs both signed Windows
+  binary SHA-256 digests.
 - **Packaging and SBOMs (`package`, `ubuntu-latest`, `contents: read`, no secrets)**: verifies the
-  pinned `syft` SHA-256 and the Linux and verified macOS binary digests, packs all six archives
-  deterministically (`root:root`, commit timestamp, `LICENSE` and `NOTICE`), generates a Syft SPDX
-  JSON SBOM for each archive asserting `rmcp 3.11.0`, writes the 12-subject `checksums.txt`, and
-  uploads the final Windows ZIP handoff and full release bundle.
-- **Windows verification (`verify-windows`, `windows-latest`, no permissions, no secrets)**:
-  verifies the exact final Windows ZIPs against `checksums.txt`, checks archive members and PE
-  machine types, verifies both timestamped Authenticode signatures with `signtool` and
-  `Get-AuthenticodeSignature` against the pinned Certum certificate thumbprint, and runs the amd64
-  binary with `--version`. This job must pass before publication runs.
+  pinned `syft` tarball and binary digests and all six binary SHA-256 digests (two Linux, two signed
+  macOS, two signed Windows), packs all six archives deterministically (`root:root`, commit
+  timestamp, `LICENSE` and `NOTICE`), generates a Syft SPDX JSON SBOM for each archive asserting
+  `rmcp 3.11.0` and target-specific `windows-sys`, writes the 12-subject `checksums.txt`, and
+  uploads **one** shared `release-bundle` artifact together with `checksums.txt`'s SHA-256.
+- **Final archive verification (`verify-macos-archives` on `macos-latest` and `verify-windows` on
+  `windows-latest`, parallel, no permissions, no secrets)**: both jobs download that same shared
+  `release-bundle` artifact ID, reject any extra files, subdirectories or symlinks, check
+  `checksums.txt`'s SHA-256, verify their platform's final archives against `checksums.txt`, inspect
+  archive members and headers, natively verify signatures (`codesign` and `spctl` against the pinned
+  Developer ID on macOS; `signtool` and `Get-AuthenticodeSignature` against the pinned Certum
+  thumbprint on Windows), run the native binary with `--version`, and output the verified
+  `checksums.txt` SHA-256. Both jobs must pass before publication runs.
 - **Checksum signing, provenance and draft release (`publish`, `ubuntu-latest`, `contents: write`,
-  `id-token: write`, `attestations: write`, no Cargo, no `environment: release`)**: runs only after
-  both `verify-macos` and `verify-windows` pass. It checks `checksums.txt`, verifies the pinned
-  `cosign` SHA-256, signs `checksums.txt` keylessly (`checksums.txt.sigstore.json`), records
-  GitHub build provenance for `checksums.txt`, fails closed if any release (published or draft)
-  already exists for the tag, creates a new **draft** release (`prerelease` set when the tag
-  contains `-`), verifies by numeric release ID that it is still a draft, uploads all 14 assets
-  directly to that draft ID, and re-verifies draft state and asset count. The owner publishes the
-  draft.
+  `id-token: write`, `attestations: write`, no Cargo, no `environment: release`)**: runs isolated
+  Python (`python3 -I`) from outside the downloaded bundle directory, downloads the same shared
+  `release-bundle` artifact ID, rejects any unexpected entry (including subdirectories and symlinks),
+  asserts `checksums.txt`'s SHA-256 equals both `verify-macos-archives` and `verify-windows` outputs
+  and matches all 12 subject files, checks **before** `cosign` signing and provenance attestation
+  that neither tag `v<version>` nor any release (draft or published) exists, verifies the pinned
+  `cosign` SHA-256, signs `checksums.txt` keylessly (`checksums.txt.sigstore.json`), records GitHub
+  build provenance (`actions/attest-build-provenance` with `subject-checksums`) for the **12 archive
+  and SBOM files listed in `checksums.txt`** (not `checksums.txt` itself), creates a new **draft**
+  release (`tag_name: v<version>`, `target_commitish: <dispatched sha>`, `prerelease` when `version`
+  contains `-`), verifies draft state by numeric release ID, uploads all 14 assets to that numeric
+  draft ID, and re-verifies draft state and asset count. The owner publishes the draft.
 
-Pull requests touching the release files and manual `workflow_dispatch` runs of `release.yml`
-exercise the six-target snapshot path across `macos-latest` and `ubuntu-latest` with no secrets
-and read-only permissions, checking pinned tool digests, static ELF linking, Mach-O and PE
-architectures, archive members, target-specific SPDX crate metadata (including `rmcp 3.11.0`) and
-the 12-subject `checksums.txt`. Two manual-only signing-proof workflows
-(`.github/workflows/signing-proof.yml` for Windows/Certum and
+Consumer verification: verify `checksums.txt` with `cosign verify-blob --bundle
+checksums.txt.sigstore.json checksums.txt` (pinning the GitHub Actions OIDC issuer and workflow
+identity), verify downloaded archives and SBOMs against `checksums.txt`, and verify build provenance
+of any of the 12 listed archive or SBOM files with `gh attestation verify <file> --repo
+mateusz-klatt/proxenos`.
+
+Partial-draft recovery: if `publish` fails after creating the draft release (leaving fewer than 14
+assets), subsequent dispatches for that version fail closed because a draft for `v<version>` already
+exists. Recover by finding the draft's exact numeric `<draft-id>` in the failed `publish` log or via
+`gh api repos/mateusz-klatt/proxenos/releases`, confirming `"draft": true` and `"tag_name":
+"v<version>"`, deleting only that draft with `gh api -X DELETE
+repos/mateusz-klatt/proxenos/releases/<draft-id>`, and re-dispatching `release.yml` on `main`.
+
+Pull requests touching the release files and manual `workflow_dispatch` runs of `release.yml` with
+an empty `version` input exercise the six-target snapshot path across `macos-latest` and
+`ubuntu-latest` with no secrets and read-only permissions, checking pinned tool tarball and binary
+digests, static ELF linking, Mach-O and PE architectures, archive members, target-specific SPDX
+crate metadata (including `rmcp 3.11.0`) and the 12-subject `checksums.txt`. Two manual-only
+signing-proof workflows (`.github/workflows/signing-proof.yml` for Windows/Certum and
 `.github/workflows/macos-signing-proof.yml` for macOS) run only on `workflow_dispatch` on `main`,
-separate compilation from signing, enforce exact case-sensitive `refs/heads/main` before signing
-in `environment: release`, verify the signed binaries natively, retain artifacts for one day, and
-never publish. Proxenos never updates itself.
+separate compilation from signing, chain unsigned and signed SHA-256 digests across build, sign and
+verify jobs, enforce exact case-sensitive `refs/heads/main` before signing in `environment:
+release`, verify the signed binaries natively, retain artifacts for one day, and never publish.
+Proxenos never updates itself.
 
 What this cannot do:
 
-- The `release` environment requires review by the owner's account, and the fleet's agents use the
-  owner's `gh` token. An agent holding that token can approve a pending deployment, so deployment
-  approval is an agreement, not an enforcement mechanism. The environment's branch (`main`) and
-  tag (`v*`) deployment policy is enforced by GitHub.
-- The tag, workflow logs, Rekor entries, build provenance attestations and one-day handoff
-  artifacts are public before the draft release is published.
+- Ruleset `28030033` on `main` requires a pull request and the four CI checks, but
+  `required_approving_review_count` is `0`. A session holding the owner's token can open a pull
+  request, wait for green checks, merge it into `main` and dispatch `release.yml`. Saying `main` is
+  protected therefore means protected by pull requests and CI checks, not by an independent
+  approving reviewer.
+- The `release` environment restricts deployments to branch `main` (enforced by GitHub) and names
+  the owner as required reviewer, but the fleet's agents hold the owner's `gh` token and
+  `can_admins_bypass` is enabled on the environment. Deployment approval is therefore an agreement,
+  not an enforcement mechanism against a session holding the owner's token.
+- Because GitHub hides draft releases from tokens with only `contents: read`, `check-release`
+  detects existing tags and published releases before compilation, whereas an existing draft for
+  `v<version>` is detected only in `publish` (`contents: write`) — still before `cosign` signing and
+  provenance attestation, though after compilation and platform signing.
+- Checking `ssign`'s SHA-256 between `signer` and `sign-windows` verifies transit integrity of the
+  artifact built in the same workflow run; it does not compare against a pre-established
+  reproducible digest.
+- Workflow logs, Rekor transparency entries for `checksums.txt`, GitHub build provenance
+  attestations for the 12 listed files and one-day handoff artifacts are public before the draft
+  release is published (the git tag itself is created only when the owner publishes the draft).
 - Restricting `ssign`'s child environment to five variables filters environment variables on a
   shared runner; it is not a process sandbox.
 - Native signature verification checks valid signatures from the pinned identities; it does not
@@ -370,16 +437,22 @@ Measured on 2026-11-25:
   `snapshot-linux-windows` (`ubuntu-latest`) succeeded, building all six targets, verifying static
   ELF output, Mach-O and PE architectures, archive contents, native execution of the Linux x86-64
   and macOS arm64 binaries, and a 12-subject `checksums.txt`.
-- Locally on Linux x86-64 after the round-1 hardening: `actionlint` passed on all three release
-  and signing-proof workflows, `goreleaser check` validated `.goreleaser.yaml`, all five pinned
-  `goreleaser`/`syft`/`cosign` binary SHA-256 digests matched upstream releases, and local
-  GoReleaser snapshots with `cargo-auditable` 0.7.7, `cargo-zigbuild` 0.24.1, Zig 0.17.1 and Syft
-  1.54.0 produced target-specific SPDX SBOMs listing `rmcp 3.11.0` (58 packages for Linux musl
-  without `windows-sys`; 59 packages for Windows including `windows-sys`).
+- Locally on Linux x86-64 after the round-2 redesign and hardening: `actionlint` passed on all three
+  release and signing-proof workflows; `goreleaser check` validated `.goreleaser.yaml` across all
+  build-group settings; all nine pinned tarball and binary SHA-256 digests (`goreleaser` v2.20.0
+  `Linux_x86_64` and `Darwin_all`, `syft` v1.54.0 `linux_amd64` and `darwin_arm64`, and `cosign`
+  v3.1.4 `linux-amd64`) matched upstream releases; tagless `GORELEASER_CURRENT_TAG=v0.0.0 goreleaser
+  build --clean --single-target --skip=validate` succeeded with `version=0.0.0`, `tag=v0.0.0` and
+  `proxenos 0.0.0`; and a 4-target `PROXENOS_BUILD_GROUP=linux-windows` GoReleaser snapshot with
+  `release: disable: true`, `cargo-auditable` 0.7.7, `cargo-zigbuild` 0.24.1, Zig 0.17.1 and Syft
+  1.54.0 produced verified static ELF and PE binaries, target-specific SPDX SBOMs listing
+  `rmcp 3.11.0` (58 packages for Linux musl without `windows-sys`; 59 packages for Windows including
+  `windows-sys`), and an 8-subject `checksums.txt`.
 
-Not measured: the updated CI snapshot with `cargo-auditable` SBOM crate checks on macOS, both
-signing-proof workflows (`signing-proof.yml` and `macos-signing-proof.yml`), a real `v*` tag
-release through `release.yml`, quarantined macOS Gatekeeper startup, and Windows SmartScreen.
+Not measured: the updated CI snapshot with direct verified tool downloads and `cargo-auditable`
+macOS SBOM crate checks, both signing-proof workflows (`signing-proof.yml` and
+`macos-signing-proof.yml`), a real `workflow_dispatch` release on `main` through `release.yml`,
+quarantined macOS Gatekeeper startup, and Windows SmartScreen.
 
 ### D12. Every line is tested, through the binary
 

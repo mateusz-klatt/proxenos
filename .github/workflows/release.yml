@@ -1,20 +1,16 @@
 name: release
 
 # D11 release pipeline:
-# - Pull requests touching release inputs and manual workflow_dispatch runs
-#   exercise all six Rust cross-builds, archives, target-specific Syft SBOMs
-#   and checksums as a snapshot with no secrets and no write permissions.
-# - A pushed v* tag on mateusz-klatt/proxenos verifies Cargo.toml and origin/main
-#   ancestry, builds all binaries in credential-free jobs, signs and notarizes
-#   macOS binaries on macos-latest (environment: release) without Cargo, verifies
-#   them natively, signs Windows binaries on ubuntu-latest (environment: release)
-#   without Cargo, packages all six archives and SBOMs, verifies the exact final
-#   Windows ZIPs natively on windows-latest, and only then signs checksums.txt
-#   with keyless cosign, attests build provenance and uploads to a freshly
-#   verified draft GitHub release.
+# - Pull requests touching release inputs, or workflow_dispatch with an empty
+#   `version` input, run the six-target snapshot cross-builds, archives,
+#   target-specific Syft SBOMs and checksums with no secrets and read-only tokens.
+# - A real release starts ONLY via workflow_dispatch on protected `main` with a
+#   non-empty `version` input (e.g. 0.1.0). There is no tag-push trigger: only
+#   reviewed workflow YAML on `main` can request the `release` environment.
+# - The pipeline never pushes a git tag. `publish` creates a draft GitHub
+#   release for `v<version>` targeting the dispatched commit; GitHub creates the
+#   tag only when the owner publishes the draft.
 on:
-  push:
-    tags: ['v*']
   pull_request:
     branches: [main]
     paths:
@@ -24,31 +20,42 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version without leading v (e.g. 0.1.0). Leave empty for a snapshot build.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && 'certum-signing' || format('release-snapshot-{0}', github.ref) }}
-  cancel-in-progress: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' && 'certum-signing' || format('release-snapshot-{0}', github.ref) }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.version != '') }}
 
 env:
-  # Repository-pinned SHA-256 digests of the extracted release tool binaries.
+  # Repository-pinned SHA-256 digests for downloaded release tools (tarball + binary).
   GORELEASER_VERSION: v2.20.0
+  GORELEASER_TARBALL_SHA256_LINUX_AMD64: d2483159e6007f814132cb56635ad30a70013dbeb813d6033a7e01adf6ae108c
   GORELEASER_SHA256_LINUX_AMD64: d7ea8864f20f2cb1625ca64eb07e5d71fcb75475cb18d0045631098974bd0796
-  GORELEASER_SHA256_DARWIN_ARM64: 9988202381824b763c95422cbcff82b86060dfde891436242f5184974c8cfd04
+  GORELEASER_TARBALL_SHA256_DARWIN_ALL: b4f0702bcb2aad05bd13af5ac69ec94d84270dce59b917e7a8c446c974e29372
+  GORELEASER_SHA256_DARWIN_ALL: a8130ffe0c8d4fdcebc3bd62f51693bc928d2382aa74b82a7fd9fa7de5138b79
+  SYFT_VERSION: v1.54.0
+  SYFT_TARBALL_SHA256_LINUX_AMD64: 54a87372498168b2d033e876fd41fa4e8035b872699e525a57046e1f2f09c860
   SYFT_SHA256_LINUX_AMD64: d46a9a61a6ae3d367f0a03748c5e9c59253e586c4388ab26ddcacebc2efa0d92
+  SYFT_TARBALL_SHA256_DARWIN_ARM64: 7e0bdad94c569fc6d5785c9a657bbae3d4c4e140ccb5eace3d0b5b6bc2b6dbcf
   SYFT_SHA256_DARWIN_ARM64: 835607cdfbdbfc59335b0beadeefc47aa6aab7d3b403c11cfa65627d92a27f61
   COSIGN_VERSION: v3.1.4
   COSIGN_SHA256_LINUX_AMD64: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Snapshot cross-build path (PR / workflow_dispatch, no secrets, read-only)
+  # Snapshot cross-build path (PR or workflow_dispatch with empty version)
   # ---------------------------------------------------------------------------
   snapshot-darwin:
     name: Snapshot (macOS cross-builds)
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.version == '')
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
@@ -70,31 +77,40 @@ jobs:
         with:
           tool: cargo-zigbuild@0.24.1,cargo-auditable@0.7.7
 
-      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-
-      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
-        with:
-          version: ${{ env.GORELEASER_VERSION }}
-          install-only: true
-
-      - name: Verify pinned tool digests and show versions
+      - name: Install verified goreleaser and syft binaries
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
-          printf '%s  %s\n' "$GORELEASER_SHA256_DARWIN_ARM64" "$(command -v goreleaser)" | shasum -a 256 -c -
-          printf '%s  %s\n' "$SYFT_SHA256_DARWIN_ARM64" "$(command -v syft)" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/tools"
+
+          curl -fsSL "https://github.com/goreleaser/goreleaser/releases/download/${GORELEASER_VERSION}/goreleaser_Darwin_all.tar.gz" \
+            -o "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz"
+          printf '%s  %s\n' "$GORELEASER_TARBALL_SHA256_DARWIN_ALL" "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz" -C "$RUNNER_TEMP/tools" goreleaser
+          printf '%s  %s\n' "$GORELEASER_SHA256_DARWIN_ALL" "$RUNNER_TEMP/tools/goreleaser" | shasum -a 256 -c -
+          chmod 0755 "$RUNNER_TEMP/tools/goreleaser"
+
+          syft_ver="${SYFT_VERSION#v}"
+          curl -fsSL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${syft_ver}_darwin_arm64.tar.gz" \
+            -o "$RUNNER_TEMP/syft_darwin_arm64.tar.gz"
+          printf '%s  %s\n' "$SYFT_TARBALL_SHA256_DARWIN_ARM64" "$RUNNER_TEMP/syft_darwin_arm64.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/syft_darwin_arm64.tar.gz" -C "$RUNNER_TEMP/tools" syft
+          printf '%s  %s\n' "$SYFT_SHA256_DARWIN_ARM64" "$RUNNER_TEMP/tools/syft" | shasum -a 256 -c -
+          chmod 0755 "$RUNNER_TEMP/tools/syft"
+
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
           cargo --version --verbose
           zig version
           cargo-zigbuild --version
-          syft version
-          goreleaser --version
+          "$RUNNER_TEMP/tools/syft" version
+          "$RUNNER_TEMP/tools/goreleaser" --version
 
       - name: Build macOS snapshot archives and SBOMs
         shell: bash
         env:
           PROXENOS_BUILD_GROUP: darwin
-        run: goreleaser release --snapshot --clean --parallelism=1 --skip=publish,sign
+        run: goreleaser release --snapshot --clean --parallelism=1
 
       - name: Verify macOS binaries, archive contents and SPDX crate metadata
         shell: bash
@@ -103,7 +119,7 @@ jobs:
           lipo -archs dist/proxenos-darwin_x86_64-apple-darwin/proxenos | grep -Fx 'x86_64'
           lipo -archs dist/proxenos-darwin_aarch64-apple-darwin/proxenos | grep -Fx 'arm64'
           ./dist/proxenos-darwin_aarch64-apple-darwin/proxenos --version | grep -E '^proxenos '
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json
           from pathlib import Path
           import tarfile
@@ -137,7 +153,7 @@ jobs:
   snapshot-linux-windows:
     name: Snapshot (Linux musl & Windows cross-builds)
     needs: snapshot-darwin
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.version == '')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -162,31 +178,40 @@ jobs:
         with:
           tool: cargo-zigbuild@0.24.1,cargo-auditable@0.7.7
 
-      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-
-      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
-        with:
-          version: ${{ env.GORELEASER_VERSION }}
-          install-only: true
-
-      - name: Verify pinned tool digests and show versions
+      - name: Install verified goreleaser and syft binaries
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s  %s\n' "$GORELEASER_SHA256_LINUX_AMD64" "$(command -v goreleaser)" | sha256sum --check --strict
-          printf '%s  %s\n' "$SYFT_SHA256_LINUX_AMD64" "$(command -v syft)" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/tools"
+
+          curl -fsSL "https://github.com/goreleaser/goreleaser/releases/download/${GORELEASER_VERSION}/goreleaser_Linux_x86_64.tar.gz" \
+            -o "$RUNNER_TEMP/goreleaser_Linux_x86_64.tar.gz"
+          printf '%s  %s\n' "$GORELEASER_TARBALL_SHA256_LINUX_AMD64" "$RUNNER_TEMP/goreleaser_Linux_x86_64.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/goreleaser_Linux_x86_64.tar.gz" -C "$RUNNER_TEMP/tools" goreleaser
+          printf '%s  %s\n' "$GORELEASER_SHA256_LINUX_AMD64" "$RUNNER_TEMP/tools/goreleaser" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/tools/goreleaser"
+
+          syft_ver="${SYFT_VERSION#v}"
+          curl -fsSL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${syft_ver}_linux_amd64.tar.gz" \
+            -o "$RUNNER_TEMP/syft_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$SYFT_TARBALL_SHA256_LINUX_AMD64" "$RUNNER_TEMP/syft_linux_amd64.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/syft_linux_amd64.tar.gz" -C "$RUNNER_TEMP/tools" syft
+          printf '%s  %s\n' "$SYFT_SHA256_LINUX_AMD64" "$RUNNER_TEMP/tools/syft" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/tools/syft"
+
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
           cargo --version --verbose
           zig version
           cargo-zigbuild --version
-          syft version
-          goreleaser --version
+          "$RUNNER_TEMP/tools/syft" version
+          "$RUNNER_TEMP/tools/goreleaser" --version
 
       - name: Build Linux musl and Windows snapshot archives, SBOMs and checksums
         shell: bash
         env:
           PROXENOS_BUILD_GROUP: linux-windows
           PROXENOS_MACOS_DIST: ${{ runner.temp }}/macos-dist
-        run: goreleaser release --snapshot --clean --parallelism=1 --skip=publish,sign
+        run: goreleaser release --snapshot --clean --parallelism=1
 
       - name: Verify static Linux binaries, Windows PE architectures, SBOMs and full checksums
         shell: bash
@@ -204,7 +229,7 @@ jobs:
           readelf -h dist/proxenos_x86_64-unknown-linux-musl/proxenos | grep -q 'X86-64'
           readelf -h dist/proxenos_aarch64-unknown-linux-musl/proxenos | grep -q 'AArch64'
           ./dist/proxenos_x86_64-unknown-linux-musl/proxenos --version | grep -E '^proxenos '
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import hashlib
           import json
           import os
@@ -267,53 +292,96 @@ jobs:
           PY
 
   # ---------------------------------------------------------------------------
-  # Tag release path (v* tag on mateusz-klatt/proxenos -> verified draft release)
+  # Release path (workflow_dispatch on protected main with non-empty version)
   # ---------------------------------------------------------------------------
-  check-tag:
-    name: Verify tag matches Cargo.toml and main ancestry
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+  check-release:
+    name: Verify main ref, Cargo.toml version and unused release version
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
     outputs:
-      tag: ${{ steps.version.outputs.tag }}
-      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify exact ref, main ancestry and Cargo.toml version
-        id: version
+      - name: Verify exact main ref, Cargo.toml match, and no existing tag or published release
+        id: check
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
-          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
-          if ! git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
-            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          fi
-          git merge-base --is-ancestor HEAD refs/remotes/origin/main
-          python3 - <<'PY'
+          test "$GITHUB_REF" = "refs/heads/main"
+          python3 -I - <<'PY'
+          import json
           import os
           from pathlib import Path
           import re
           import tomllib
+          import urllib.error
+          import urllib.parse
+          import urllib.request
 
-          tag = os.environ["GITHUB_REF_NAME"]
-          if not tag.startswith("v"):
-              raise SystemExit(f"Tag must start with lowercase 'v', got {tag!r}")
-          version = tag[1:]
-          if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+-]*", version):
-              raise SystemExit(f"Tag version has unexpected characters: {version!r}")
+          repo = "mateusz-klatt/proxenos"
+          version = os.environ["INPUT_VERSION"]
+          token = os.environ["GITHUB_TOKEN"]
+
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+              raise SystemExit(
+                  f"version input must be a SemVer string without leading 'v' (e.g. 0.1.0), got {version!r}"
+              )
           cargo = tomllib.loads(Path("Cargo.toml").read_text())
           cargo_version = cargo["package"]["version"]
           if cargo_version != version:
               raise SystemExit(
-                  f"Cargo.toml package.version ({cargo_version!r}) does not match tag {tag!r} ({version!r})"
+                  f"Cargo.toml package.version ({cargo_version!r}) does not match input version {version!r}"
               )
+
+          tag = f"v{version}"
+          api_base = "https://api.github.com"
+
+          def api_get(url: str) -> tuple[int, dict | list | None]:
+              req = urllib.request.Request(url, method="GET")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return resp.status, json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as err:
+                  if err.code == 404:
+                      return 404, None
+                  raise
+
+          # 1. Fail early if git tag refs/tags/v<version> already exists.
+          status, _ = api_get(f"{api_base}/repos/{repo}/git/ref/tags/{urllib.parse.quote(tag, safe='')}")
+          if status != 404:
+              raise SystemExit(f"Tag {tag} already exists in {repo}")
+
+          # 2. Fail early if any release visible to this token already exists for v<version>.
+          #    Note: GitHub hides drafts from contents:read tokens; publish (contents:write)
+          #    re-checks for both drafts and published releases before cosign/provenance.
+          page = 1
+          while True:
+              status, batch = api_get(f"{api_base}/repos/{repo}/releases?per_page=100&page={page}")
+              assert status == 200 and isinstance(batch, list)
+              if not batch:
+                  break
+              matches = [r for r in batch if r.get("tag_name") == tag]
+              if matches:
+                  raise SystemExit(f"Release(s) already exist for {tag}: {[r.get('id') for r in matches]}")
+              if len(batch) < 100:
+                  break
+              page += 1
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"tag={tag}\n")
               out.write(f"version={version}\n")
@@ -321,8 +389,8 @@ jobs:
 
   signer:
     name: Build pinned Certum signer
-    needs: check-tag
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: check-release
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -348,7 +416,7 @@ jobs:
           cargo +1.99.1 build --release --locked
           digest="$(sha256sum target/release/ssign | awk '{print $1}')"
           echo "sha256=$digest" >> "$GITHUB_OUTPUT"
-          printf 'Pinned `ssign` SHA-256: `%s`\n' "$digest" >> "$GITHUB_STEP_SUMMARY"
+          printf '`ssign` build SHA-256 (for transit integrity): `%s`\n' "$digest" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload
@@ -360,17 +428,20 @@ jobs:
 
   build-macos:
     name: Build unsigned macOS binaries
-    needs: check-tag
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: check-release
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
       contents: read
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      amd64-sha256: ${{ steps.build.outputs.amd64-sha256 }}
+      arm64-sha256: ${{ steps.build.outputs.arm64-sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -383,34 +454,43 @@ jobs:
         with:
           tool: cargo-zigbuild@0.24.1,cargo-auditable@0.7.7
 
-      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
-        with:
-          version: ${{ env.GORELEASER_VERSION }}
-          install-only: true
-
-      - name: Verify pinned goreleaser digest and show versions
+      - name: Install verified goreleaser binary
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
-          printf '%s  %s\n' "$GORELEASER_SHA256_DARWIN_ARM64" "$(command -v goreleaser)" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl -fsSL "https://github.com/goreleaser/goreleaser/releases/download/${GORELEASER_VERSION}/goreleaser_Darwin_all.tar.gz" \
+            -o "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz"
+          printf '%s  %s\n' "$GORELEASER_TARBALL_SHA256_DARWIN_ALL" "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/goreleaser_Darwin_all.tar.gz" -C "$RUNNER_TEMP/tools" goreleaser
+          printf '%s  %s\n' "$GORELEASER_SHA256_DARWIN_ALL" "$RUNNER_TEMP/tools/goreleaser" | shasum -a 256 -c -
+          chmod 0755 "$RUNNER_TEMP/tools/goreleaser"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
           cargo --version --verbose
           zig version
           cargo-zigbuild --version
-          goreleaser --version
+          "$RUNNER_TEMP/tools/goreleaser" --version
 
       - name: Build unsigned macOS binaries without credentials
+        id: build
         shell: bash
         env:
-          GORELEASER_CURRENT_TAG: ${{ needs.check-tag.outputs.tag }}
+          GORELEASER_CURRENT_TAG: ${{ needs.check-release.outputs.tag }}
           PROXENOS_BUILD_GROUP: darwin
-          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+        # No git tag exists before draft publication, so --skip=validate skips
+        # git-describe exact-tag validation while GORELEASER_CURRENT_TAG pins
+        # the release version and git status --porcelain checks tree cleanliness.
         run: |
           set -euo pipefail
-          goreleaser build --clean --parallelism=1
+          test -z "$(git status --porcelain)"
+          goreleaser build --clean --parallelism=1 --skip=validate
           lipo -archs dist/proxenos-darwin_x86_64-apple-darwin/proxenos | grep -Fx 'x86_64'
           lipo -archs dist/proxenos-darwin_aarch64-apple-darwin/proxenos | grep -Fx 'arm64'
           test "$(./dist/proxenos-darwin_aarch64-apple-darwin/proxenos --version)" = "proxenos $RELEASE_VERSION"
+          echo "amd64-sha256=$(shasum -a 256 dist/proxenos-darwin_x86_64-apple-darwin/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "arm64-sha256=$(shasum -a 256 dist/proxenos-darwin_aarch64-apple-darwin/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload
@@ -424,8 +504,8 @@ jobs:
 
   build-linux-windows:
     name: Build static Linux and unsigned Windows binaries
-    needs: check-tag
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: check-release
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -435,9 +515,12 @@ jobs:
       windows-artifact-id: ${{ steps.upload-windows.outputs.artifact-id }}
       linux-amd64-sha256: ${{ steps.verify.outputs.linux-amd64-sha256 }}
       linux-arm64-sha256: ${{ steps.verify.outputs.linux-arm64-sha256 }}
+      windows-amd64-sha256: ${{ steps.verify.outputs.windows-amd64-sha256 }}
+      windows-arm64-sha256: ${{ steps.verify.outputs.windows-arm64-sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -450,33 +533,38 @@ jobs:
         with:
           tool: cargo-zigbuild@0.24.1,cargo-auditable@0.7.7
 
-      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
-        with:
-          version: ${{ env.GORELEASER_VERSION }}
-          install-only: true
-
-      - name: Verify pinned goreleaser digest and show versions
+      - name: Install verified goreleaser binary
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s  %s\n' "$GORELEASER_SHA256_LINUX_AMD64" "$(command -v goreleaser)" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl -fsSL "https://github.com/goreleaser/goreleaser/releases/download/${GORELEASER_VERSION}/goreleaser_Linux_x86_64.tar.gz" \
+            -o "$RUNNER_TEMP/goreleaser_Linux_x86_64.tar.gz"
+          printf '%s  %s\n' "$GORELEASER_TARBALL_SHA256_LINUX_AMD64" "$RUNNER_TEMP/goreleaser_Linux_x86_64.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/goreleaser_Linux_x86_64.tar.gz" -C "$RUNNER_TEMP/tools" goreleaser
+          printf '%s  %s\n' "$GORELEASER_SHA256_LINUX_AMD64" "$RUNNER_TEMP/tools/goreleaser" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/tools/goreleaser"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
           cargo --version --verbose
           zig version
           cargo-zigbuild --version
-          goreleaser --version
+          "$RUNNER_TEMP/tools/goreleaser" --version
 
       - name: Build Linux musl and unsigned Windows binaries without credentials
         shell: bash
         env:
-          GORELEASER_CURRENT_TAG: ${{ needs.check-tag.outputs.tag }}
+          GORELEASER_CURRENT_TAG: ${{ needs.check-release.outputs.tag }}
           PROXENOS_BUILD_GROUP: linux-windows
-        run: goreleaser build --clean --parallelism=1
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          goreleaser build --clean --parallelism=1 --skip=validate
 
-      - name: Verify static Linux binaries and Windows PE headers
+      - name: Verify static Linux binaries, Windows PE headers and output digests
         id: verify
         shell: bash
         env:
-          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
         run: |
           set -euo pipefail
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
@@ -489,7 +577,7 @@ jobs:
           readelf -h dist/proxenos_x86_64-unknown-linux-musl/proxenos | grep -q 'X86-64'
           readelf -h dist/proxenos_aarch64-unknown-linux-musl/proxenos | grep -q 'AArch64'
           test "$(./dist/proxenos_x86_64-unknown-linux-musl/proxenos --version)" = "proxenos $RELEASE_VERSION"
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           from pathlib import Path
           import struct
 
@@ -505,6 +593,8 @@ jobs:
           PY
           echo "linux-amd64-sha256=$(sha256sum dist/proxenos_x86_64-unknown-linux-musl/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
           echo "linux-arm64-sha256=$(sha256sum dist/proxenos_aarch64-unknown-linux-musl/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "windows-amd64-sha256=$(sha256sum dist/proxenos_x86_64-pc-windows-gnu/proxenos.exe | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "windows-arm64-sha256=$(sha256sum dist/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload-linux
@@ -528,8 +618,8 @@ jobs:
 
   sign-macos:
     name: Sign and notarize macOS binaries
-    needs: [check-tag, build-macos]
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [check-release, build-macos]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: macos-latest
     environment: release
     timeout-minutes: 45
@@ -537,24 +627,27 @@ jobs:
       contents: read
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      amd64-sha256: ${{ steps.sign.outputs.amd64-sha256 }}
+      arm64-sha256: ${{ steps.sign.outputs.arm64-sha256 }}
     steps:
-      - name: Verify exact repository and tag ref
+      - name: Verify exact repository and main ref
         shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.check-tag.outputs.tag }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
-          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          test "$GITHUB_REF" = "refs/heads/main"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.build-macos.outputs.artifact-id }}
           path: ${{ runner.temp }}/macos-unsigned
 
-      - name: Sign with Developer ID and notarize via Apple notarytool
+      - name: Verify unsigned digests, sign with Developer ID and notarize via Apple notarytool
+        id: sign
         shell: bash
         env:
+          EXPECTED_AMD64_SHA256: ${{ needs.build-macos.outputs.amd64-sha256 }}
+          EXPECTED_ARM64_SHA256: ${{ needs.build-macos.outputs.arm64-sha256 }}
           MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
           MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
@@ -569,42 +662,46 @@ jobs:
             fi
           done
 
-          cd "$RUNNER_TEMP/macos-unsigned"
-          test "$(find . -type f | LC_ALL=C sort)" = "$(printf '%s\n' ./proxenos-darwin_aarch64-apple-darwin/proxenos ./proxenos-darwin_x86_64-apple-darwin/proxenos)"
+          test "$(find "$RUNNER_TEMP/macos-unsigned" ! -type d | LC_ALL=C sort)" = "$(printf '%s\n' "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_aarch64-apple-darwin/proxenos" "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_x86_64-apple-darwin/proxenos")"
+          printf '%s  %s\n' "$EXPECTED_AMD64_SHA256" "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_x86_64-apple-darwin/proxenos" | shasum -a 256 -c -
+          printf '%s  %s\n' "$EXPECTED_ARM64_SHA256" "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_aarch64-apple-darwin/proxenos" | shasum -a 256 -c -
 
           IDENTITY="Developer ID Application: Mateusz Klatt (26MP7QQP95)"
-          KEYCHAIN="$RUNNER_TEMP/proxenos-signing.keychain-db"
           KEYCHAIN_PASS="$(openssl rand -hex 24)"
-          trap 'security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true' EXIT
+          trap 'security delete-keychain "$RUNNER_TEMP/proxenos-signing.keychain-db" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/AuthKey.p8"' EXIT
 
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import base64
           import os
           from pathlib import Path
 
-          p12 = Path(os.environ["RUNNER_TEMP"], "developer-id.p12")
-          p12.write_bytes(base64.b64decode(os.environ["MACOS_SIGN_P12"]))
-          os.chmod(p12, 0o600)
+          def write_owner_only(path: Path, data: bytes) -> None:
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+              try:
+                  os.fchmod(fd, 0o600)
+                  os.write(fd, data)
+              finally:
+                  os.close(fd)
 
-          key = Path(os.environ["RUNNER_TEMP"], "AuthKey.p8")
-          key.write_bytes(base64.b64decode(os.environ["MACOS_NOTARY_KEY"]))
-          os.chmod(key, 0o600)
+          rt = Path(os.environ["RUNNER_TEMP"])
+          write_owner_only(rt / "developer-id.p12", base64.b64decode(os.environ["MACOS_SIGN_P12"]))
+          write_owner_only(rt / "AuthKey.p8", base64.b64decode(os.environ["MACOS_NOTARY_KEY"]))
           PY
 
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/developer-id.p12" -P "$MACOS_SIGN_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN"
-          security find-identity -v -p codesigning "$KEYCHAIN" | grep -F "$IDENTITY"
+          security create-keychain -p "$KEYCHAIN_PASS" "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security import "$RUNNER_TEMP/developer-id.p12" -P "$MACOS_SIGN_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/proxenos-signing.keychain-db"
+          security find-identity -v -p codesigning "$RUNNER_TEMP/proxenos-signing.keychain-db" | grep -F "$IDENTITY"
 
           for target in proxenos-darwin_x86_64-apple-darwin proxenos-darwin_aarch64-apple-darwin; do
             binary="$RUNNER_TEMP/macos-unsigned/$target/proxenos"
             zip_path="$RUNNER_TEMP/notarize-${target}.zip"
             notary_json="$RUNNER_TEMP/notary-${target}.json"
             chmod +x "$binary"
-            codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" --sign "$IDENTITY" "$binary"
+            codesign --force --options runtime --timestamp --keychain "$RUNNER_TEMP/proxenos-signing.keychain-db" --sign "$IDENTITY" "$binary"
             codesign --verify --strict --verbose=2 "$binary"
             ditto -c -k --keepParent "$binary" "$zip_path"
             xcrun notarytool submit "$zip_path" \
@@ -614,7 +711,7 @@ jobs:
               --wait \
               --timeout 20m \
               --output-format json > "$notary_json"
-            python3 - "$target" "$notary_json" <<'PY'
+            python3 -I - "$target" "$notary_json" <<'PY'
           import json
           import os
           from pathlib import Path
@@ -631,6 +728,9 @@ jobs:
           PY
           done
 
+          echo "amd64-sha256=$(shasum -a 256 "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_x86_64-apple-darwin/proxenos" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "arm64-sha256=$(shasum -a 256 "$RUNNER_TEMP/macos-unsigned/proxenos-darwin_aarch64-apple-darwin/proxenos" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload
         with:
@@ -642,31 +742,31 @@ jobs:
           retention-days: 1
 
   verify-macos:
-    name: Verify signed macOS binaries
-    needs: [check-tag, sign-macos]
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    name: Verify bare signed macOS binaries before Windows signing
+    needs: [check-release, sign-macos]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: macos-latest
     timeout-minutes: 15
     permissions: {}
-    outputs:
-      amd64-sha256: ${{ steps.verify.outputs.amd64-sha256 }}
-      arm64-sha256: ${{ steps.verify.outputs.arm64-sha256 }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.sign-macos.outputs.artifact-id }}
           path: ${{ runner.temp }}/macos-signed
 
-      - name: Verify signatures, notarization and arm64 execution
-        id: verify
+      - name: Verify signed digests, signatures, notarization and arm64 execution
         shell: bash
         env:
-          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+          EXPECTED_AMD64_SHA256: ${{ needs.sign-macos.outputs.amd64-sha256 }}
+          EXPECTED_ARM64_SHA256: ${{ needs.sign-macos.outputs.arm64-sha256 }}
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
           cd "$RUNNER_TEMP/macos-signed"
-          test "$(find . -type f | LC_ALL=C sort)" = "$(printf '%s\n' ./proxenos-darwin_aarch64-apple-darwin/proxenos ./proxenos-darwin_x86_64-apple-darwin/proxenos)"
+          test "$(find . ! -type d | LC_ALL=C sort)" = "$(printf '%s\n' ./proxenos-darwin_aarch64-apple-darwin/proxenos ./proxenos-darwin_x86_64-apple-darwin/proxenos)"
+          printf '%s  %s\n' "$EXPECTED_AMD64_SHA256" "./proxenos-darwin_x86_64-apple-darwin/proxenos" | shasum -a 256 -c -
+          printf '%s  %s\n' "$EXPECTED_ARM64_SHA256" "./proxenos-darwin_aarch64-apple-darwin/proxenos" | shasum -a 256 -c -
           for target in proxenos-darwin_x86_64-apple-darwin proxenos-darwin_aarch64-apple-darwin; do
             binary="./$target/proxenos"
             chmod +x "$binary"
@@ -684,14 +784,12 @@ jobs:
           done
           actual="$(./proxenos-darwin_aarch64-apple-darwin/proxenos --version)"
           test "$actual" = "proxenos $RELEASE_VERSION"
-          printf '\n### macOS arm64 execution\n\n```text\n%s\n```\n' "$actual" >> "$GITHUB_STEP_SUMMARY"
-          echo "amd64-sha256=$(shasum -a 256 ./proxenos-darwin_x86_64-apple-darwin/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          echo "arm64-sha256=$(shasum -a 256 ./proxenos-darwin_aarch64-apple-darwin/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          printf '\n### macOS arm64 execution (pre-packaging)\n\n```text\n%s\n```\n' "$actual" >> "$GITHUB_STEP_SUMMARY"
 
   sign-windows:
     name: Sign Windows binaries with Certum
-    needs: [check-tag, signer, build-linux-windows, verify-macos]
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [check-release, signer, build-linux-windows, verify-macos]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: ubuntu-latest
     environment: release
     timeout-minutes: 15
@@ -699,15 +797,15 @@ jobs:
       contents: read
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      amd64-sha256: ${{ steps.sign.outputs.amd64-sha256 }}
+      arm64-sha256: ${{ steps.sign.outputs.arm64-sha256 }}
     steps:
-      - name: Verify exact repository and tag ref
+      - name: Verify exact repository and main ref
         shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.check-tag.outputs.tag }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
-          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          test "$GITHUB_REF" = "refs/heads/main"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -719,10 +817,13 @@ jobs:
           artifact-ids: ${{ needs.build-linux-windows.outputs.windows-artifact-id }}
           path: ${{ runner.temp }}/windows-unsigned
 
-      - name: Verify pinned signer digest and sign both Windows binaries
+      - name: Verify signer and unsigned binary handoff digests (transit integrity) and sign both Windows binaries
+        id: sign
         shell: bash
         env:
           EXPECTED_SIGNER_SHA256: ${{ needs.signer.outputs.sha256 }}
+          EXPECTED_AMD64_SHA256: ${{ needs.build-linux-windows.outputs.windows-amd64-sha256 }}
+          EXPECTED_ARM64_SHA256: ${{ needs.build-linux-windows.outputs.windows-arm64-sha256 }}
           PROXENOS_WINDOWS_SIGNER: ${{ runner.temp }}/signer/ssign
           XDG_RUNTIME_DIR: ${{ runner.temp }}/certum-signing
           CERTUM_EMAIL: ${{ secrets.CERTUM_EMAIL }}
@@ -730,9 +831,10 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s  %s\n' "$EXPECTED_SIGNER_SHA256" "$PROXENOS_WINDOWS_SIGNER" | sha256sum --check --strict
-          cd "$RUNNER_TEMP/windows-unsigned"
-          test "$(find . -type f | LC_ALL=C sort)" = "$(printf '%s\n' ./proxenos_aarch64-pc-windows-gnullvm/proxenos.exe ./proxenos_x86_64-pc-windows-gnu/proxenos.exe)"
-          python3 - <<'PY'
+          test "$(find "$RUNNER_TEMP/windows-unsigned" ! -type d | LC_ALL=C sort)" = "$(printf '%s\n' "$RUNNER_TEMP/windows-unsigned/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe" "$RUNNER_TEMP/windows-unsigned/proxenos_x86_64-pc-windows-gnu/proxenos.exe")"
+          printf '%s  %s\n' "$EXPECTED_AMD64_SHA256" "$RUNNER_TEMP/windows-unsigned/proxenos_x86_64-pc-windows-gnu/proxenos.exe" | sha256sum --check --strict
+          printf '%s  %s\n' "$EXPECTED_ARM64_SHA256" "$RUNNER_TEMP/windows-unsigned/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe" | sha256sum --check --strict
+          python3 -I - <<'PY'
           import os
           import stat
           import subprocess
@@ -761,6 +863,8 @@ jobs:
               if res.returncode != 0:
                   sys.exit(f"Windows signing failed for {target}")
           PY
+          echo "amd64-sha256=$(sha256sum "$RUNNER_TEMP/windows-unsigned/proxenos_x86_64-pc-windows-gnu/proxenos.exe" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "arm64-sha256=$(sha256sum "$RUNNER_TEMP/windows-unsigned/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload
@@ -774,18 +878,19 @@ jobs:
 
   package:
     name: Package six archives, SBOMs and checksums
-    needs: [check-tag, build-linux-windows, sign-macos, verify-macos, sign-windows]
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [check-release, build-linux-windows, sign-macos, verify-macos, sign-windows]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     outputs:
       bundle-artifact-id: ${{ steps.upload-bundle.outputs.artifact-id }}
-      windows-artifact-id: ${{ steps.upload-windows.outputs.artifact-id }}
+      checksums-sha256: ${{ steps.pack.outputs.checksums-sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -804,30 +909,45 @@ jobs:
           artifact-ids: ${{ needs.sign-windows.outputs.artifact-id }}
           path: ${{ runner.temp }}/in-windows
 
-      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-
-      - name: Verify binary handoff digests, package archives, generate SBOMs and checksums
+      - name: Install verified syft binary
         shell: bash
-        env:
-          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
-          EXPECTED_LINUX_AMD64_SHA256: ${{ needs.build-linux-windows.outputs.linux-amd64-sha256 }}
-          EXPECTED_LINUX_ARM64_SHA256: ${{ needs.build-linux-windows.outputs.linux-arm64-sha256 }}
-          EXPECTED_MACOS_AMD64_SHA256: ${{ needs.verify-macos.outputs.amd64-sha256 }}
-          EXPECTED_MACOS_ARM64_SHA256: ${{ needs.verify-macos.outputs.arm64-sha256 }}
         run: |
           set -euo pipefail
-          printf '%s  %s\n' "$SYFT_SHA256_LINUX_AMD64" "$(command -v syft)" | sha256sum --check --strict
-          syft version
+          mkdir -p "$RUNNER_TEMP/tools"
+          syft_ver="${SYFT_VERSION#v}"
+          curl -fsSL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${syft_ver}_linux_amd64.tar.gz" \
+            -o "$RUNNER_TEMP/syft_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$SYFT_TARBALL_SHA256_LINUX_AMD64" "$RUNNER_TEMP/syft_linux_amd64.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/syft_linux_amd64.tar.gz" -C "$RUNNER_TEMP/tools" syft
+          printf '%s  %s\n' "$SYFT_SHA256_LINUX_AMD64" "$RUNNER_TEMP/tools/syft" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/tools/syft"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/tools/syft" version
 
+      - name: Verify all six binary digests, package archives, generate SBOMs and checksums
+        id: pack
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+          EXPECTED_LINUX_AMD64_SHA256: ${{ needs.build-linux-windows.outputs.linux-amd64-sha256 }}
+          EXPECTED_LINUX_ARM64_SHA256: ${{ needs.build-linux-windows.outputs.linux-arm64-sha256 }}
+          EXPECTED_MACOS_AMD64_SHA256: ${{ needs.sign-macos.outputs.amd64-sha256 }}
+          EXPECTED_MACOS_ARM64_SHA256: ${{ needs.sign-macos.outputs.arm64-sha256 }}
+          EXPECTED_WINDOWS_AMD64_SHA256: ${{ needs.sign-windows.outputs.amd64-sha256 }}
+          EXPECTED_WINDOWS_ARM64_SHA256: ${{ needs.sign-windows.outputs.arm64-sha256 }}
+        run: |
+          set -euo pipefail
           printf '%s  %s\n' "$EXPECTED_LINUX_AMD64_SHA256" "$RUNNER_TEMP/in-linux/proxenos_x86_64-unknown-linux-musl/proxenos" | sha256sum --check --strict
           printf '%s  %s\n' "$EXPECTED_LINUX_ARM64_SHA256" "$RUNNER_TEMP/in-linux/proxenos_aarch64-unknown-linux-musl/proxenos" | sha256sum --check --strict
           printf '%s  %s\n' "$EXPECTED_MACOS_AMD64_SHA256" "$RUNNER_TEMP/in-macos/proxenos-darwin_x86_64-apple-darwin/proxenos" | sha256sum --check --strict
           printf '%s  %s\n' "$EXPECTED_MACOS_ARM64_SHA256" "$RUNNER_TEMP/in-macos/proxenos-darwin_aarch64-apple-darwin/proxenos" | sha256sum --check --strict
+          printf '%s  %s\n' "$EXPECTED_WINDOWS_AMD64_SHA256" "$RUNNER_TEMP/in-windows/proxenos_x86_64-pc-windows-gnu/proxenos.exe" | sha256sum --check --strict
+          printf '%s  %s\n' "$EXPECTED_WINDOWS_ARM64_SHA256" "$RUNNER_TEMP/in-windows/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe" | sha256sum --check --strict
 
           COMMIT_TS="$(git show -s --format=%ct HEAD)"
           export COMMIT_TS
 
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import datetime
           import gzip
           import hashlib
@@ -906,34 +1026,32 @@ jobs:
           for archive_path in archives:
               sbom_path = out / f"{archive_path.name}.sbom.json"
               subprocess.run(
-                  ["syft", str(archive_path), "--output", f"spdx-json={sbom_path}", "--enrich", "all"],
+                  ["syft", str(archive_path), "--output", f"spdx-json={sbom_path}"],
                   env=syft_env,
                   check=True,
               )
               doc = json.loads(sbom_path.read_text())
               pkgs = {(p.get("name"), p.get("versionInfo")) for p in doc.get("packages", [])}
+              pkg_names = {p[0] for p in pkgs}
               assert ("rmcp", "3.11.0") in pkgs, f"{sbom_path.name}: missing rmcp 3.11.0 in SPDX packages"
               assert len(pkgs) >= 10, f"{sbom_path.name}: unexpectedly few SPDX packages ({len(pkgs)})"
+              if "_windows_" in sbom_path.name:
+                  assert "windows-sys" in pkg_names, f"{sbom_path.name}: missing target-specific windows-sys crate"
+              elif "_linux_" in sbom_path.name:
+                  assert "windows-sys" not in pkg_names, f"{sbom_path.name}: unexpected windows-sys crate in Linux SBOM"
               subjects.extend([archive_path, sbom_path])
 
           subjects.sort(key=lambda p: p.name)
           assert len(subjects) == 12
           lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}" for p in subjects]
-          (out / "checksums.txt").write_text("\n".join(lines) + "\n")
+          manifest_bytes = ("\n".join(lines) + "\n").encode("utf-8")
+          (out / "checksums.txt").write_bytes(manifest_bytes)
+          manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out_f:
+              out_f.write(f"checksums-sha256={manifest_sha}\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              summary.write("### Packaged release checksums (12 subjects)\n\n```text\n" + "\n".join(lines) + "\n```\n")
+              summary.write(f"### Packaged release checksums (12 subjects; `checksums.txt` SHA-256 `{manifest_sha}`)\n\n```text\n" + "\n".join(lines) + "\n```\n")
           PY
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        id: upload-windows
-        with:
-          name: windows-handoff-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/release-bundle/proxenos_${{ needs.check-tag.outputs.version }}_windows_amd64.zip
-            ${{ runner.temp }}/release-bundle/proxenos_${{ needs.check-tag.outputs.version }}_windows_arm64.zip
-            ${{ runner.temp }}/release-bundle/checksums.txt
-          if-no-files-found: error
-          retention-days: 1
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload-bundle
@@ -943,13 +1061,129 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  verify-macos-archives:
+    name: Verify final macOS tarballs before publish
+    needs: [check-release, package]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions: {}
+    outputs:
+      checksums-sha256: ${{ steps.extract.outputs.checksums-sha256 }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.package.outputs.bundle-artifact-id }}
+          path: ${{ runner.temp }}/release-bundle
+
+      - name: Verify bundle inventory, archive checksums and extract macOS binaries
+        id: extract
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+          EXPECTED_CHECKSUMS_SHA256: ${{ needs.package.outputs.checksums-sha256 }}
+        run: |
+          set -euo pipefail
+          python3 -I - "$RUNNER_TEMP/release-bundle" "$RUNNER_TEMP/macos-verified" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          version = os.environ["RELEASE_VERSION"]
+          expected_manifest_sha = os.environ["EXPECTED_CHECKSUMS_SHA256"]
+          bundle = Path(sys.argv[1])
+          out_root = Path(sys.argv[2])
+
+          expected_archives = [
+              f"proxenos_{version}_darwin_amd64.tar.gz",
+              f"proxenos_{version}_darwin_arm64.tar.gz",
+              f"proxenos_{version}_linux_amd64.tar.gz",
+              f"proxenos_{version}_linux_arm64.tar.gz",
+              f"proxenos_{version}_windows_amd64.zip",
+              f"proxenos_{version}_windows_arm64.zip",
+          ]
+          expected_files = {"checksums.txt"} | set(expected_archives) | {f"{a}.sbom.json" for a in expected_archives}
+          entries = list(bundle.iterdir())
+          if len(entries) != 13 or any(p.is_symlink() or not p.is_file() for p in entries) or {p.name for p in entries} != expected_files:
+              raise SystemExit(f"Invalid release bundle entries: {[p.name for p in entries]}")
+
+          manifest_bytes = (bundle / "checksums.txt").read_bytes()
+          manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+          if manifest_sha != expected_manifest_sha:
+              raise SystemExit(f"checksums.txt digest mismatch: {manifest_sha} != {expected_manifest_sha}")
+
+          hashes = {}
+          for line in manifest_bytes.decode("utf-8").strip().splitlines():
+              digest, name = line.split()
+              hashes[name] = digest.lower()
+
+          max_member_bytes = 128 * 1024 * 1024
+          for arch in ("amd64", "arm64"):
+              name = f"proxenos_{version}_darwin_{arch}.tar.gz"
+              archive_path = bundle / name
+              archive_sha = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+              if hashes.get(name) != archive_sha:
+                  raise SystemExit(f"{name}: checksum mismatch against checksums.txt")
+              with tarfile.open(archive_path, "r:gz") as tf:
+                  members = tf.getmembers()
+                  names = [m.name for m in members]
+                  if sorted(names) != ["LICENSE", "NOTICE", "proxenos"] or len(names) != 3:
+                      raise SystemExit(f"{name}: unexpected tar members {names}")
+                  for m in members:
+                      if not m.isfile() or m.size > max_member_bytes:
+                          raise SystemExit(f"{name}: invalid or oversized member {m.name}")
+                  f = tf.extractfile(tf.getmember("proxenos"))
+                  assert f is not None
+                  data = f.read(max_member_bytes + 1)
+                  if len(data) > max_member_bytes:
+                      raise SystemExit(f"{name}: binary exceeded bound")
+              dest = out_root / arch
+              dest.mkdir(parents=True, mode=0o700, exist_ok=True)
+              bin_path = dest / "proxenos"
+              bin_path.write_bytes(data)
+              os.chmod(bin_path, 0o755)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out_f:
+              out_f.write(f"checksums-sha256={manifest_sha}\n")
+          PY
+
+      - name: Verify final macOS tarball signatures, notarization and arm64 execution
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          cd "$RUNNER_TEMP/macos-verified"
+          for arch in amd64 arm64; do
+            binary="./$arch/proxenos"
+            printf '\n### Final macOS tarball (%s)\n\n```text\n' "$arch" >> "$GITHUB_STEP_SUMMARY"
+            codesign --verify --strict --verbose=2 "$binary" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+            codesign -dv --verbose=4 "$binary" 2>&1 | tee "$RUNNER_TEMP/macos-signature.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -Fx 'Authority=Developer ID Application: Mateusz Klatt (26MP7QQP95)' "$RUNNER_TEMP/macos-signature.txt"
+            grep -Fx 'TeamIdentifier=26MP7QQP95' "$RUNNER_TEMP/macos-signature.txt"
+            grep -E '^CodeDirectory .*flags=.*\(.*runtime.*\)' "$RUNNER_TEMP/macos-signature.txt"
+            grep -E '^Timestamp=.+$' "$RUNNER_TEMP/macos-signature.txt"
+            spctl -a -vvv -t install "$binary" 2>&1 | tee "$RUNNER_TEMP/macos-assessment.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -Fx "$binary: accepted" "$RUNNER_TEMP/macos-assessment.txt"
+            grep -Fx 'source=Notarized Developer ID' "$RUNNER_TEMP/macos-assessment.txt"
+            printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+          done
+          actual="$(./arm64/proxenos --version)"
+          test "$actual" = "proxenos $RELEASE_VERSION"
+          printf '\n### Final macOS arm64 tarball execution\n\n```text\n%s\n```\n' "$actual" >> "$GITHUB_STEP_SUMMARY"
+
   verify-windows:
-    name: Verify signed Windows archives before publish
-    needs: [check-tag, package]
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    name: Verify final Windows archives before publish
+    needs: [check-release, package]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: windows-latest
     timeout-minutes: 15
     permissions: {}
+    outputs:
+      checksums-sha256: ${{ steps.extract.outputs.checksums-sha256 }}
     env:
       # Owner's Certum open-source code-signing certificate (valid until 2027-11-10).
       # Update this pin in both release.yml and signing-proof.yml when renewed.
@@ -957,42 +1191,66 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.package.outputs.windows-artifact-id }}
-          path: ${{ runner.temp }}/windows-handoff
+          artifact-ids: ${{ needs.package.outputs.bundle-artifact-id }}
+          path: ${{ runner.temp }}/release-bundle
 
-      - name: Verify archive checksums, contents and PE architectures
+      - name: Verify bundle inventory, Windows archive checksums, contents and PE architectures
+        id: extract
         shell: pwsh
         env:
-          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+          EXPECTED_CHECKSUMS_SHA256: ${{ needs.package.outputs.checksums-sha256 }}
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
           Add-Type -AssemblyName System.IO.Compression.FileSystem
 
           $version = $env:RELEASE_VERSION
-          $handoff = Join-Path $env:RUNNER_TEMP 'windows-handoff'
+          $bundle = Join-Path $env:RUNNER_TEMP 'release-bundle'
           $outRoot = Join-Path $env:RUNNER_TEMP 'windows-verified'
           $expectedZips = [ordered]@{
             amd64 = @{ Name = "proxenos_${version}_windows_amd64.zip"; Machine = [uint16]0x8664 }
             arm64 = @{ Name = "proxenos_${version}_windows_arm64.zip"; Machine = [uint16]0xAA64 }
           }
-          $expectedFiles = @('checksums.txt', $expectedZips['amd64'].Name, $expectedZips['arm64'].Name)
+          $expectedArchives = @(
+            "proxenos_${version}_darwin_amd64.tar.gz",
+            "proxenos_${version}_darwin_arm64.tar.gz",
+            "proxenos_${version}_linux_amd64.tar.gz",
+            "proxenos_${version}_linux_arm64.tar.gz",
+            "proxenos_${version}_windows_amd64.zip",
+            "proxenos_${version}_windows_arm64.zip"
+          )
+          $expectedFiles = @('checksums.txt') + $expectedArchives + ($expectedArchives | ForEach-Object { "${_}.sbom.json" })
 
-          $items = @(Get-ChildItem -LiteralPath $handoff -Force)
-          if ($items.Count -ne 3) {
-            throw "Invalid Windows handoff file count: $($items.Count)"
+          $items = @(Get-ChildItem -LiteralPath $bundle -Force)
+          if ($items.Count -ne 13) {
+            throw "Invalid release bundle file count: $($items.Count)"
           }
           foreach ($item in $items) {
             if ($item.PSIsContainer -or $item.LinkType -or ($item.Name -cnotin $expectedFiles)) {
-              throw "Invalid Windows handoff entry: $($item.Name)"
+              throw "Invalid release bundle entry: $($item.Name)"
             }
           }
 
-          $manifestPath = Join-Path $handoff 'checksums.txt'
+          function Get-Sha256Hex([byte[]]$Data) {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+              return ([BitConverter]::ToString($sha.ComputeHash($Data)) -replace '-', '').ToLowerInvariant()
+            } finally {
+              $sha.Dispose()
+            }
+          }
+
+          $manifestPath = Join-Path $bundle 'checksums.txt'
           $manifestBytes = [IO.File]::ReadAllBytes($manifestPath)
           if ($manifestBytes.Length -gt 1048576) {
             throw "checksums.txt exceeds size limit."
           }
+          $manifestSha = Get-Sha256Hex $manifestBytes
+          if ($manifestSha -cne $env:EXPECTED_CHECKSUMS_SHA256) {
+            throw "checksums.txt digest mismatch: $manifestSha != $($env:EXPECTED_CHECKSUMS_SHA256)"
+          }
+
           $hashes = @{}
           foreach ($rawLine in ([Text.Encoding]::UTF8.GetString($manifestBytes).Trim() -split "`r?`n")) {
             $fields = $rawLine.Trim() -split '\s+'
@@ -1005,27 +1263,18 @@ jobs:
             $hashes[$fields[1]] = $fields[0].ToLowerInvariant()
           }
 
-          function Get-Sha256Hex([byte[]]$Data) {
-            $sha = [Security.Cryptography.SHA256]::Create()
-            try {
-              return ([BitConverter]::ToString($sha.ComputeHash($Data)) -replace '-', '').ToLowerInvariant()
-            } finally {
-              $sha.Dispose()
-            }
-          }
-
           $maxZipBytes = 128L * 1024L * 1024L
           $maxMemberBytes = 128L * 1024L * 1024L
           [long]$remaining = 256L * 1024L * 1024L
 
           $summary = [Collections.Generic.List[string]]::new()
-          $summary.Add("### Windows handoff SHA-256 evidence`n")
-          $summary.Add("- ``checksums.txt``: ``$(Get-Sha256Hex $manifestBytes)``")
+          $summary.Add("### Windows verification SHA-256 evidence`n")
+          $summary.Add("- ``checksums.txt``: ``$manifestSha``")
 
           foreach ($arch in 'amd64', 'arm64') {
             $zipName = $expectedZips[$arch].Name
             $expectedMachine = $expectedZips[$arch].Machine
-            $zipPath = Join-Path $handoff $zipName
+            $zipPath = Join-Path $bundle $zipName
             $zipInfo = Get-Item -LiteralPath $zipPath
             if ($zipInfo.Length -gt $maxZipBytes) {
               throw "${zipName}: exceeds size limit."
@@ -1096,12 +1345,13 @@ jobs:
             $summary.Add("- ``${arch}/proxenos.exe``: ``$(Get-Sha256Hex $exeBytes)``")
           }
 
+          "checksums-sha256=$manifestSha" >> $env:GITHUB_OUTPUT
           ($summary -join "`n") + "`n" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Verify both Authenticode signatures and amd64 execution
         shell: pwsh
         env:
-          RELEASE_VERSION: ${{ needs.check-tag.outputs.version }}
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
         run: |
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/signtool.exe" |
             Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
@@ -1127,77 +1377,199 @@ jobs:
 
   publish:
     name: Sign checksums, attest provenance and create draft release
-    needs: [check-tag, verify-macos, verify-windows, package]
-    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [check-release, verify-macos, verify-macos-archives, verify-windows, package]
+    if: github.repository == 'mateusz-klatt/proxenos' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.version != ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      contents: write # create the draft GitHub release and upload verified assets
+      contents: write # check drafts, create the draft GitHub release and upload verified assets
       id-token: write # keyless cosign signing and build provenance attestation
       attestations: write
     steps:
-      - name: Verify exact repository and tag ref
+      - name: Verify exact repository and main ref
         shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.check-tag.outputs.tag }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "mateusz-klatt/proxenos"
-          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          test "$GITHUB_REF" = "refs/heads/main"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.package.outputs.bundle-artifact-id }}
           path: ${{ runner.temp }}/release-bundle
 
-      - name: Verify bundle integrity before signing
-        working-directory: ${{ runner.temp }}/release-bundle
+      - name: Verify bundle inventory and bind to verified checksums.txt digest
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+          MACOS_VERIFIED_CHECKSUMS_SHA256: ${{ needs.verify-macos-archives.outputs.checksums-sha256 }}
+          WINDOWS_VERIFIED_CHECKSUMS_SHA256: ${{ needs.verify-windows.outputs.checksums-sha256 }}
         run: |
           set -euo pipefail
-          test "$(wc -l < checksums.txt | tr -d ' ')" -eq 12
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 13
-          sha256sum --check --strict checksums.txt
+          python3 -I - "$RUNNER_TEMP/release-bundle" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import sys
 
-      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
-        with:
-          cosign-release: ${{ env.COSIGN_VERSION }}
+          version = os.environ["RELEASE_VERSION"]
+          macos_sha = os.environ["MACOS_VERIFIED_CHECKSUMS_SHA256"]
+          windows_sha = os.environ["WINDOWS_VERIFIED_CHECKSUMS_SHA256"]
+          bundle = Path(sys.argv[1])
 
-      - name: Verify pinned cosign digest and sign checksums.txt keylessly
-        working-directory: ${{ runner.temp }}/release-bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf '%s  %s\n' "$COSIGN_SHA256_LINUX_AMD64" "$(command -v cosign)" | sha256sum --check --strict
-          cosign version
-          cosign sign-blob --bundle=checksums.txt.sigstore.json checksums.txt --yes
+          expected_archives = [
+              f"proxenos_{version}_darwin_amd64.tar.gz",
+              f"proxenos_{version}_darwin_arm64.tar.gz",
+              f"proxenos_{version}_linux_amd64.tar.gz",
+              f"proxenos_{version}_linux_arm64.tar.gz",
+              f"proxenos_{version}_windows_amd64.zip",
+              f"proxenos_{version}_windows_arm64.zip",
+          ]
+          expected_subjects = sorted(expected_archives + [f"{a}.sbom.json" for a in expected_archives])
+          expected_files = {"checksums.txt"} | set(expected_subjects)
 
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-checksums: ${{ runner.temp }}/release-bundle/checksums.txt
+          entries = list(bundle.iterdir())
+          if len(entries) != 13 or any(p.is_symlink() or not p.is_file() for p in entries) or {p.name for p in entries} != expected_files:
+              raise SystemExit(f"Unexpected bundle entries (files, symlinks or directories): {[p.name for p in entries]}")
 
-      - name: Create verified draft GitHub release and upload all 14 assets
-        working-directory: ${{ runner.temp }}/release-bundle
+          manifest_bytes = (bundle / "checksums.txt").read_bytes()
+          manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+          if manifest_sha != macos_sha or manifest_sha != windows_sha:
+              raise SystemExit(
+                  f"checksums.txt digest mismatch: bundle={manifest_sha}, macos={macos_sha}, windows={windows_sha}"
+              )
+
+          lines = [line.strip() for line in manifest_bytes.decode("utf-8").splitlines() if line.strip()]
+          if len(lines) != 12:
+              raise SystemExit(f"Expected 12 lines in checksums.txt, got {len(lines)}")
+          seen = []
+          for line in lines:
+              digest, name = line.split()
+              actual = hashlib.sha256((bundle / name).read_bytes()).hexdigest()
+              if actual != digest.lower():
+                  raise SystemExit(f"Checksum mismatch for {name}")
+              seen.append(name)
+          if sorted(seen) != expected_subjects:
+              raise SystemExit(f"checksums.txt subjects do not match expected inventory: {seen}")
+          PY
+
+      - name: Verify no tag or release (draft or published) exists before permanent signing
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.check-tag.outputs.tag }}
-          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json
           import os
-          from pathlib import Path
           import urllib.error
           import urllib.parse
           import urllib.request
 
           repo = "mateusz-klatt/proxenos"
           tag = os.environ["RELEASE_TAG"]
-          commit = os.environ["RELEASE_COMMIT"]
           token = os.environ["GITHUB_TOKEN"]
           api_base = "https://api.github.com"
+
+          def api_get(url: str) -> tuple[int, dict | list | None]:
+              req = urllib.request.Request(url, method="GET")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return resp.status, json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as err:
+                  if err.code == 404:
+                      return 404, None
+                  raise
+
+          status, _ = api_get(f"{api_base}/repos/{repo}/git/ref/tags/{urllib.parse.quote(tag, safe='')}")
+          if status != 404:
+              raise SystemExit(f"Refusing to sign or publish: tag {tag} already exists")
+
+          page = 1
+          existing = []
+          while True:
+              status, batch = api_get(f"{api_base}/repos/{repo}/releases?per_page=100&page={page}")
+              assert status == 200 and isinstance(batch, list)
+              if not batch:
+                  break
+              existing.extend(r for r in batch if r.get("tag_name") == tag)
+              if len(batch) < 100:
+                  break
+              page += 1
+
+          for rel in existing:
+              if not rel.get("draft", False):
+                  raise SystemExit(f"Refusing to sign or publish: published release id={rel.get('id')} already exists for {tag}")
+          if existing:
+              ids = [r.get("id") for r in existing]
+              raise SystemExit(f"Refusing to sign or publish: draft release(s) {ids} already exist for {tag}")
+          PY
+
+      - name: Install verified cosign binary and sign checksums.txt keylessly
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+            -o "$RUNNER_TEMP/tools/cosign"
+          printf '%s  %s\n' "$COSIGN_SHA256_LINUX_AMD64" "$RUNNER_TEMP/tools/cosign" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/tools/cosign"
+          "$RUNNER_TEMP/tools/cosign" version
+          "$RUNNER_TEMP/tools/cosign" sign-blob \
+            --bundle="$RUNNER_TEMP/release-bundle/checksums.txt.sigstore.json" \
+            "$RUNNER_TEMP/release-bundle/checksums.txt" \
+            --yes
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-bundle/checksums.txt
+
+      - name: Create verified draft GitHub release and upload all 14 assets
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 -I - "$RUNNER_TEMP/release-bundle" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          repo = "mateusz-klatt/proxenos"
+          tag = os.environ["RELEASE_TAG"]
+          version = os.environ["RELEASE_VERSION"]
+          commit = os.environ["RELEASE_COMMIT"]
+          token = os.environ["GITHUB_TOKEN"]
+          bundle = Path(sys.argv[1])
+          api_base = "https://api.github.com"
+
+          expected_archives = [
+              f"proxenos_{version}_darwin_amd64.tar.gz",
+              f"proxenos_{version}_darwin_arm64.tar.gz",
+              f"proxenos_{version}_linux_amd64.tar.gz",
+              f"proxenos_{version}_linux_arm64.tar.gz",
+              f"proxenos_{version}_windows_amd64.zip",
+              f"proxenos_{version}_windows_arm64.zip",
+          ]
+          expected_names = sorted(
+              expected_archives
+              + [f"{a}.sbom.json" for a in expected_archives]
+              + ["checksums.txt", "checksums.txt.sigstore.json"]
+          )
+          entries = list(bundle.iterdir())
+          if len(entries) != 14 or any(p.is_symlink() or not p.is_file() for p in entries) or sorted(p.name for p in entries) != expected_names:
+              raise SystemExit(f"Unexpected release bundle contents before upload: {[p.name for p in entries]}")
 
           def api_request(method: str, url: str, data: bytes | None = None, content_type: str = "application/json") -> dict | list:
               req = urllib.request.Request(url, data=data, method=method)
@@ -1209,8 +1581,14 @@ jobs:
               with urllib.request.urlopen(req) as resp:
                   return json.loads(resp.read().decode("utf-8"))
 
-          # 1. Fail closed if any release for this tag already exists (never upload
-          #    to a published release, and never mutate an existing draft).
+          # 1. Re-check immediately before creating the draft that no tag or release exists.
+          try:
+              api_request("GET", f"{api_base}/repos/{repo}/git/ref/tags/{urllib.parse.quote(tag, safe='')}")
+              raise SystemExit(f"Refusing to upload: tag {tag} now exists")
+          except urllib.error.HTTPError as err:
+              if err.code != 404:
+                  raise
+
           page = 1
           existing = []
           while True:
@@ -1221,7 +1599,6 @@ jobs:
               if len(batch) < 100:
                   break
               page += 1
-
           for rel in existing:
               if not rel.get("draft", False):
                   raise SystemExit(f"Refusing to upload: published release id={rel.get('id')} already exists for {tag}")
@@ -1229,8 +1606,9 @@ jobs:
               ids = [r.get("id") for r in existing]
               raise SystemExit(f"Refusing to upload: draft release(s) {ids} already exist for {tag}")
 
-          # 2. Create a new draft release for this tag.
-          is_prerelease = "-" in tag
+          # 2. Create a draft release for tag_name v<version> targeting the dispatched commit.
+          #    GitHub creates the tag only when the owner publishes this draft.
+          is_prerelease = "-" in version
           payload = json.dumps({
               "tag_name": tag,
               "target_commitish": commit,
@@ -1244,19 +1622,15 @@ jobs:
           if created.get("draft") is not True or created.get("tag_name") != tag:
               raise SystemExit(f"Created release {release_id} is not a draft for {tag}")
 
-          # 3. Re-verify the release by numeric ID before uploading any asset.
+          # 3. Verify the draft by numeric ID before uploading any asset.
           checked = api_request("GET", f"{api_base}/repos/{repo}/releases/{release_id}")
           if checked.get("draft") is not True or checked.get("tag_name") != tag or len(checked.get("assets", [])) != 0:
               raise SystemExit(f"Release {release_id} failed pre-upload draft verification")
 
-          # 4. Upload all 14 files directly to the verified draft release ID.
-          files = sorted(p for p in Path(".").iterdir() if p.is_file())
-          if len(files) != 14:
-              raise SystemExit(f"Expected 14 release assets, found {len(files)}: {[p.name for p in files]}")
-
-          for path in files:
-              upload_url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={urllib.parse.quote(path.name)}"
-              api_request("POST", upload_url, data=path.read_bytes(), content_type="application/octet-stream")
+          # 4. Upload all 14 verified files directly to the numeric draft release ID.
+          for name in expected_names:
+              upload_url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={urllib.parse.quote(name)}"
+              api_request("POST", upload_url, data=(bundle / name).read_bytes(), content_type="application/octet-stream")
 
           # 5. Confirm the release is still a draft with all 14 assets attached.
           final = api_request("GET", f"{api_base}/repos/{repo}/releases/{release_id}")
@@ -1265,6 +1639,6 @@ jobs:
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
               summary.write(
-                  f"Created verified draft release `{tag}` (id `{release_id}`, prerelease `{final.get('prerelease')}`, 14 assets).\n"
+                  f"Created verified draft release `{tag}` (id `{release_id}`, target `{commit}`, prerelease `{final.get('prerelease')}`, 14 assets).\n"
               )
           PY
