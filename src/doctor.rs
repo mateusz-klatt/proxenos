@@ -186,7 +186,7 @@ fn read_registration(settings_path: &Path) -> Result<RegisteredCommand, String> 
     let command_path = PathBuf::from(command);
     if !command_path.is_file() {
         return Err(format!(
-            "Registered executable does not exist: {}.",
+            "Registered executable does not exist: {}. Run `proxenos integrate claude-code` again to update the registration.",
             command_path.display()
         ));
     }
@@ -211,20 +211,48 @@ fn check_registration() -> (Check, Option<RegisteredCommand>) {
     };
     match read_registration(&settings_path) {
         Ok(reg) => {
-            let check = Check::new(
-                "claude-code.registration",
-                Status::Ok,
-                format!(
-                    "Claude Code registration points to {}.",
-                    reg.command.display()
-                ),
-                Some(json!({
-                    "settings_path": reg.settings_path.display().to_string(),
-                    "marketplace_dir": reg.marketplace_dir.display().to_string(),
-                    "command": reg.command.display().to_string(),
-                    "args": reg.args,
-                })),
-            );
+            let path_mismatch =
+                state::find_on_path(Path::new("proxenos"), |_| true).and_then(|on_path| {
+                    let reg_real = fs::canonicalize(&reg.command)
+                        .ok()
+                        .map(state::normalize_path)?;
+                    let path_real = fs::canonicalize(&on_path).ok().map(state::normalize_path)?;
+                    (reg_real != path_real).then_some((on_path, path_real))
+                });
+            let check = if let Some((on_path, path_real)) = path_mismatch {
+                Check::new(
+                    "claude-code.registration",
+                    Status::Warn,
+                    format!(
+                        "Claude Code registration points to {}, but `proxenos` on PATH resolves to {}. Run `proxenos integrate claude-code` again to update the registration.",
+                        reg.command.display(),
+                        path_real.display()
+                    ),
+                    Some(json!({
+                        "settings_path": reg.settings_path.display().to_string(),
+                        "marketplace_dir": reg.marketplace_dir.display().to_string(),
+                        "command": reg.command.display().to_string(),
+                        "args": reg.args,
+                        "path_command": on_path.display().to_string(),
+                        "path_resolved": path_real.display().to_string(),
+                    })),
+                )
+            } else {
+                Check::new(
+                    "claude-code.registration",
+                    Status::Ok,
+                    format!(
+                        "Claude Code registration points to {}.",
+                        reg.command.display()
+                    ),
+                    Some(json!({
+                        "settings_path": reg.settings_path.display().to_string(),
+                        "marketplace_dir": reg.marketplace_dir.display().to_string(),
+                        "command": reg.command.display().to_string(),
+                        "args": reg.args,
+                    })),
+                )
+            };
             (check, Some(reg))
         }
         Err(reason) => (
@@ -469,7 +497,10 @@ async fn run_handshake(command: &Path, args: &[String]) -> Result<HandshakeInfo,
     outcome
 }
 
-async fn check_handshake(registration: Option<&RegisteredCommand>) -> Check {
+async fn check_handshake(
+    registration: Option<&RegisteredCommand>,
+    any_provider_found: bool,
+) -> Check {
     let Some(reg) = registration else {
         return Check::new(
             "claude-code.handshake",
@@ -489,12 +520,16 @@ async fn check_handshake(registration: Option<&RegisteredCommand>) -> Check {
                 "tools": info.tools,
             }));
             if info.tools.is_empty() {
-                Check::new(
-                    "claude-code.handshake",
-                    Status::Warn,
-                    "MCP handshake succeeded, but tools/list returned 0 tools.",
-                    details,
-                )
+                let message = if any_provider_found {
+                    "MCP handshake succeeded, but tools/list returned 0 tools.".to_owned()
+                } else {
+                    let clis: Vec<&str> = providers::ALL.iter().map(|p| p.cli).collect();
+                    format!(
+                        "MCP handshake succeeded, but tools/list returned 0 tools: no provider CLI found on PATH (looked for: {}).",
+                        clis.join(", ")
+                    )
+                };
+                Check::new("claude-code.handshake", Status::Warn, message, details)
             } else {
                 Check::new(
                     "claude-code.handshake",
@@ -535,12 +570,14 @@ pub fn run(json_output: bool) -> (bool, String) {
         }
 
         let mut cli_checks = Vec::with_capacity(handles.len());
+        let mut any_provider_found = false;
         for (provider, handle) in handles {
             let status = handle.await.expect("provider check finished");
+            any_provider_found |= !matches!(status, CliStatus::NotFound(_));
             cli_checks.push(provider_check(provider, status));
         }
 
-        let handshake_check = check_handshake(registration.as_ref()).await;
+        let handshake_check = check_handshake(registration.as_ref(), any_provider_found).await;
         drop(activity);
         let _ = tokio::time::timeout(Duration::from_secs(2), finished.recv()).await;
         (cli_checks, handshake_check)

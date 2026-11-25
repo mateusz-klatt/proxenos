@@ -54,10 +54,16 @@ pub struct ClientRecord {
     pub binary_path: String,
     pub settings_path: String,
     pub settings_created: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settings_is_symlink: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_symlink_target: Option<String>,
     pub created_extra_known_marketplaces: bool,
     pub created_enabled_plugins: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_written_sha256: Option<String>,
     pub entries: RecordedEntries,
     pub files: Vec<String>,
     pub created_dirs: Vec<String>,
@@ -87,6 +93,35 @@ fn backup_path(state_dir: &Path) -> PathBuf {
 struct FileData {
     bytes: Vec<u8>,
     mode: Option<u32>,
+}
+
+struct ResolvedSettingsPath {
+    target: PathBuf,
+    symlink_target: Option<String>,
+}
+
+fn resolve_settings_target(path: &Path) -> Result<ResolvedSettingsPath, IntegrateError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let resolved = fs::canonicalize(path)
+                .map(state::normalize_path)
+                .map_err(|err| {
+                    IntegrateError::Message(format!(
+                        "Refusing to modify Claude Code settings symlink {}: target cannot be resolved ({err}).",
+                        path.display()
+                    ))
+                })?;
+            let target_str = state::path_string(&resolved).map_err(io_err(&resolved))?;
+            Ok(ResolvedSettingsPath {
+                target: resolved,
+                symlink_target: Some(target_str),
+            })
+        }
+        Ok(_) | Err(_) => Ok(ResolvedSettingsPath {
+            target: path.to_path_buf(),
+            symlink_target: None,
+        }),
+    }
 }
 
 fn read_optional(path: &Path) -> Result<Option<FileData>, IntegrateError> {
@@ -182,14 +217,27 @@ fn check_entry_ownership(
     }
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
 fn write_json_atomic(
     path: &Path,
     value: &Value,
     preserve_mode: Option<u32>,
-) -> Result<(), IntegrateError> {
+) -> Result<Vec<u8>, IntegrateError> {
     let mut text = serde_json::to_string_pretty(value).expect("JSON value serializes");
     text.push('\n');
-    state::write_atomic(path, text.as_bytes(), preserve_mode).map_err(io_err(path))
+    let bytes = text.into_bytes();
+    state::write_atomic(path, &bytes, preserve_mode).map_err(io_err(path))?;
+    Ok(bytes)
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), IntegrateError> {
@@ -227,7 +275,9 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
         )));
     }
 
-    let (mut settings_map, orig_bytes, orig_mode) = match read_optional(&settings_path)? {
+    let resolved_settings = resolve_settings_target(&settings_path)?;
+    let (mut settings_map, orig_bytes, orig_mode) = match read_optional(&resolved_settings.target)?
+    {
         Some(data) => (
             parse_settings(&settings_path, &data.bytes)?,
             Some(data.bytes),
@@ -287,20 +337,19 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
     state::ensure_private_dir_tree(&state_dir, &plugin_meta_dir, &mut created_dirs)
         .map_err(io_err(&plugin_meta_dir))?;
 
-    let backup = match (
-        existing.as_ref().and_then(|r| r.backup_path.clone()),
-        orig_bytes.as_deref(),
-    ) {
-        (Some(path), _) => Some(path),
-        (None, Some(bytes)) => {
-            let backups_dir = integrate_dir.join("backups");
-            state::ensure_private_dir_tree(&state_dir, &backups_dir, &mut created_dirs)
-                .map_err(io_err(&backups_dir))?;
-            let bfile = backup_path(&state_dir);
-            state::write_atomic(&bfile, bytes, None).map_err(io_err(&bfile))?;
-            Some(state::path_string(&bfile).map_err(io_err(&bfile))?)
-        }
-        (None, None) => None,
+    let bfile = backup_path(&state_dir);
+    let backup = if bfile.exists() {
+        Some(state::path_string(&bfile).map_err(io_err(&bfile))?)
+    } else if existing.is_none()
+        && let Some(bytes) = orig_bytes.as_deref()
+    {
+        let backups_dir = integrate_dir.join("backups");
+        state::ensure_private_dir_tree(&state_dir, &backups_dir, &mut created_dirs)
+            .map_err(io_err(&backups_dir))?;
+        state::write_atomic(&bfile, bytes, None).map_err(io_err(&bfile))?;
+        Some(state::path_string(&bfile).map_err(io_err(&bfile))?)
+    } else {
+        None
     };
 
     let marketplace_json_path = marketplace_meta_dir.join("marketplace.json");
@@ -364,7 +413,7 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
         .and_then(|map| map.get(ENABLED_PLUGIN_KEY))
         != Some(&desired_enabled);
 
-    if orig_bytes.is_none() || needs_ekm || needs_ep {
+    let settings_written_sha256 = if orig_bytes.is_none() || needs_ekm || needs_ep {
         settings_map
             .entry("extraKnownMarketplaces".to_owned())
             .or_insert_with(|| Value::Object(Map::new()))
@@ -377,8 +426,17 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
             .as_object_mut()
             .expect("enabledPlugins validated as object")
             .insert(ENABLED_PLUGIN_KEY.to_owned(), desired_enabled.clone());
-        write_json_atomic(&settings_path, &Value::Object(settings_map), orig_mode)?;
-    }
+        let written = write_json_atomic(
+            &resolved_settings.target,
+            &Value::Object(settings_map),
+            orig_mode,
+        )?;
+        Some(sha256_hex(&written))
+    } else {
+        existing
+            .as_ref()
+            .and_then(|record| record.settings_written_sha256.clone())
+    };
 
     let files = vec![
         state::path_string(&marketplace_json_path).map_err(io_err(&marketplace_json_path))?,
@@ -400,9 +458,12 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
         binary_path: binary_str.clone(),
         settings_path: settings_str.clone(),
         settings_created,
+        settings_is_symlink: resolved_settings.symlink_target.is_some(),
+        settings_symlink_target: resolved_settings.symlink_target,
         created_extra_known_marketplaces: created_ekm,
         created_enabled_plugins: created_ep,
         backup_path: backup,
+        settings_written_sha256,
         entries: RecordedEntries {
             extra_known_marketplace: desired_marketplace,
             enabled_plugin: desired_enabled,
@@ -461,36 +522,61 @@ pub fn remove_claude_code() -> Result<String, IntegrateError> {
     };
 
     let settings_path = Path::new(&record.settings_path);
+    let resolved_settings = resolve_settings_target(settings_path)?;
     let mut refused = Vec::new();
-    if let Some(data) = read_optional(settings_path)? {
-        let mut settings_map = parse_settings(settings_path, &data.bytes)?;
-        let _ = section_object(&settings_map, "extraKnownMarketplaces", settings_path)?;
-        let _ = section_object(&settings_map, "enabledPlugins", settings_path)?;
+    if let Some(data) = read_optional(&resolved_settings.target)? {
+        let unchanged = record
+            .settings_written_sha256
+            .as_deref()
+            .is_some_and(|expected| expected == sha256_hex(&data.bytes));
+        let restore_bytes = if unchanged {
+            match &record.backup_path {
+                Some(path) => read_optional(Path::new(path))?.map(|file| file.bytes),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(original_bytes) = restore_bytes {
+            state::write_atomic(&resolved_settings.target, &original_bytes, data.mode)
+                .map_err(io_err(&resolved_settings.target))?;
+        } else {
+            let mut settings_map = parse_settings(settings_path, &data.bytes)?;
+            let _ = section_object(&settings_map, "extraKnownMarketplaces", settings_path)?;
+            let _ = section_object(&settings_map, "enabledPlugins", settings_path)?;
 
-        let removed_ekm = remove_managed_entry(
-            &mut settings_map,
-            "extraKnownMarketplaces",
-            MARKETPLACE_NAME,
-            &record.entries.extra_known_marketplace,
-            record.created_extra_known_marketplaces,
-            settings_path,
-            &mut refused,
-        );
-        let removed_ep = remove_managed_entry(
-            &mut settings_map,
-            "enabledPlugins",
-            ENABLED_PLUGIN_KEY,
-            &record.entries.enabled_plugin,
-            record.created_enabled_plugins,
-            settings_path,
-            &mut refused,
-        );
+            let removed_ekm = remove_managed_entry(
+                &mut settings_map,
+                "extraKnownMarketplaces",
+                MARKETPLACE_NAME,
+                &record.entries.extra_known_marketplace,
+                record.created_extra_known_marketplaces,
+                settings_path,
+                &mut refused,
+            );
+            let removed_ep = remove_managed_entry(
+                &mut settings_map,
+                "enabledPlugins",
+                ENABLED_PLUGIN_KEY,
+                &record.entries.enabled_plugin,
+                record.created_enabled_plugins,
+                settings_path,
+                &mut refused,
+            );
 
-        if removed_ekm || removed_ep {
-            if record.settings_created && settings_map.is_empty() {
-                remove_if_exists(settings_path)?;
-            } else {
-                write_json_atomic(settings_path, &Value::Object(settings_map), data.mode)?;
+            if removed_ekm || removed_ep {
+                if record.settings_created
+                    && resolved_settings.symlink_target.is_none()
+                    && settings_map.is_empty()
+                {
+                    remove_if_exists(settings_path)?;
+                } else {
+                    write_json_atomic(
+                        &resolved_settings.target,
+                        &Value::Object(settings_map),
+                        data.mode,
+                    )?;
+                }
             }
         }
     }

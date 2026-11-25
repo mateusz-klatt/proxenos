@@ -39,14 +39,68 @@ pub fn claude_settings_path() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".claude").join("settings.json"))
 }
 
-/// Resolves the canonical absolute path of the running Proxenos executable.
+/// Resolves the absolute path of the running Proxenos executable without following symlinks.
+///
+/// On Linux `current_exe()` reads `/proc/self/exe`, which has already resolved symlinks, so
+/// `argv[0]` is preferred when it identifies the same executable: a path with a separator is
+/// made absolute against the current directory, and a bare name is matched against `PATH`.
 pub fn current_executable() -> io::Result<PathBuf> {
-    let exe = env::current_exe()?;
-    Ok(normalize_canonical(fs::canonicalize(exe)?))
+    let exe = normalize_path(std::path::absolute(env::current_exe()?)?);
+    let exe_canonical = fs::canonicalize(&exe)?;
+    let invoked = env::args_os()
+        .next()
+        .and_then(|arg0| resolve_arg0(Path::new(&arg0), &exe_canonical));
+    Ok(invoked.unwrap_or(exe))
+}
+
+fn resolve_arg0(arg0: &Path, expected_canonical: &Path) -> Option<PathBuf> {
+    let has_separator = arg0.parent().is_some_and(|p| !p.as_os_str().is_empty());
+    if has_separator {
+        let abs = normalize_path(std::path::absolute(arg0).ok()?);
+        return matches_canonical(&abs, expected_canonical).then_some(abs);
+    }
+    find_on_path(arg0, |candidate| {
+        matches_canonical(candidate, expected_canonical)
+    })
+}
+
+fn matches_canonical(candidate: &Path, expected_canonical: &Path) -> bool {
+    fs::canonicalize(candidate).is_ok_and(|resolved| resolved == expected_canonical)
+}
+
+/// Searches absolute `PATH` entries for `name` (also trying `.exe` on Windows) matching
+/// `predicate`, returning the `PATH` entry itself without resolving symlinks.
+pub fn find_on_path(name: &Path, mut predicate: impl FnMut(&Path) -> bool) -> Option<PathBuf> {
+    let raw = env::var_os("PATH")?;
+    let names = path_candidate_names(name);
+    for dir in env::split_paths(&raw).filter(|dir| dir.is_absolute()) {
+        for filename in &names {
+            let candidate = normalize_path(dir.join(filename));
+            if candidate.is_file() && predicate(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(windows)]
-fn normalize_canonical(path: PathBuf) -> PathBuf {
+fn path_candidate_names(name: &Path) -> Vec<std::ffi::OsString> {
+    let mut names = vec![
+        name.as_os_str().to_owned(),
+        name.with_extension("exe").into_os_string(),
+    ];
+    names.dedup();
+    names
+}
+
+#[cfg(not(windows))]
+fn path_candidate_names(name: &Path) -> Vec<std::ffi::OsString> {
+    vec![name.as_os_str().to_owned()]
+}
+
+#[cfg(windows)]
+pub fn normalize_path(path: PathBuf) -> PathBuf {
     let stripped = path
         .to_str()
         .and_then(|s| s.strip_prefix(r"\\?\"))
@@ -56,7 +110,7 @@ fn normalize_canonical(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn normalize_canonical(path: PathBuf) -> PathBuf {
+pub fn normalize_path(path: PathBuf) -> PathBuf {
     path
 }
 
@@ -138,8 +192,12 @@ pub fn write_atomic(path: &Path, content: &[u8], preserve_mode: Option<u32>) -> 
             fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
         }
         file.write_all(content)?;
+        file.sync_all()?;
         drop(file);
-        fs::rename(&temp, path)
+        fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        Ok(())
     };
     let result = write_and_rename();
     if result.is_err() {

@@ -1,6 +1,7 @@
 //! Behavioural tests for `proxenos integrate claude-code [--remove]` and `proxenos doctor` (D10).
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -123,18 +124,42 @@ impl Drop for Sandbox {
     }
 }
 
-fn canonical_path_string(path: &Path) -> String {
-    let canonical = fs::canonicalize(path).unwrap();
+fn strip_windows_verbatim(path: PathBuf) -> String {
     #[cfg(windows)]
     {
-        let raw = canonical.to_string_lossy();
+        let raw = path.to_string_lossy();
         if let Some(rest) = raw.strip_prefix(r"\\?\")
             && rest.as_bytes().get(1) == Some(&b':')
         {
             return rest.to_owned();
         }
     }
-    canonical.to_str().unwrap().to_owned()
+    path.to_str().unwrap().to_owned()
+}
+
+fn absolute_path_string(path: &Path) -> String {
+    strip_windows_verbatim(std::path::absolute(path).unwrap())
+}
+
+fn canonical_path_string(path: &Path) -> String {
+    strip_windows_verbatim(fs::canonicalize(path).unwrap())
+}
+
+/// Creates a file symlink. Returns `Ok(false)` on Windows when the OS denies
+/// `SeCreateSymbolicLinkPrivilege` (error 1314) on an unprivileged host.
+fn try_file_symlink(target: &Path, link: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).map(|()| true)
+    }
+    #[cfg(windows)]
+    {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => Ok(true),
+            Err(err) if err.raw_os_error() == Some(1314) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 fn read_json(path: &Path) -> Value {
@@ -169,7 +194,7 @@ fn fresh_integrate_creates_marketplace_settings_and_manifest() {
     );
     assert!(out.stderr.is_empty());
 
-    let expected_bin = canonical_path_string(proxenos_bin());
+    let expected_bin = absolute_path_string(proxenos_bin());
     let expected_marketplace = sb.marketplace_dir().to_str().unwrap().to_owned();
 
     let marketplace = read_json(
@@ -315,6 +340,41 @@ fn idempotent_rerun_keeps_registration_and_original_backup() {
     );
     assert_eq!(fs::read_to_string(sb.settings_path()).unwrap(), after_first);
     assert_eq!(fs::read_to_string(sb.backup_path()).unwrap(), original);
+
+    // Editing an unrelated key and re-running keeps the original backup.
+    let mut edited = read_json(&sb.settings_path());
+    edited["theme"] = json!("light");
+    fs::write(
+        sb.settings_path(),
+        format!("{}\n", serde_json::to_string_pretty(&edited).unwrap()),
+    )
+    .unwrap();
+    assert!(sb.run(&["integrate", "claude-code"]).status.success());
+    assert_eq!(fs::read_to_string(sb.backup_path()).unwrap(), original);
+
+    // Even if a backup file already exists from a previous integrate that was never removed
+    // (manifest missing and keys cleared), a fresh integrate must keep that first backup.
+    fs::remove_file(sb.manifest_path()).unwrap();
+    fs::remove_dir_all(sb.marketplace_dir()).unwrap();
+    let modified_unrelated = "{\n  \"theme\": \"light\"\n}\n";
+    fs::write(sb.settings_path(), modified_unrelated).unwrap();
+    assert!(sb.run(&["integrate", "claude-code"]).status.success());
+    assert_eq!(fs::read_to_string(sb.backup_path()).unwrap(), original);
+
+    // After a full --remove the backup is deleted, so a subsequent integrate takes a fresh one.
+    assert!(
+        sb.run(&["integrate", "claude-code", "--remove"])
+            .status
+            .success()
+    );
+    assert!(!sb.backup_path().exists());
+    let fresh_settings = "{\n  \"theme\": \"solarized\"\n}\n";
+    fs::write(sb.settings_path(), fresh_settings).unwrap();
+    assert!(sb.run(&["integrate", "claude-code"]).status.success());
+    assert_eq!(
+        fs::read_to_string(sb.backup_path()).unwrap(),
+        fresh_settings
+    );
 }
 
 #[test]
@@ -335,7 +395,7 @@ fn binary_path_change_updates_mcp_json_and_manifest() {
         .join(".mcp.json");
     assert_eq!(
         read_json(&mcp_path)["mcpServers"]["proxenos"]["command"],
-        canonical_path_string(&bin_a)
+        absolute_path_string(&bin_a)
     );
 
     let second = sb
@@ -351,11 +411,11 @@ fn binary_path_change_updates_mcp_json_and_manifest() {
     assert!(stdout.contains("Updated Proxenos"), "{stdout}");
     assert_eq!(
         read_json(&mcp_path)["mcpServers"]["proxenos"]["command"],
-        canonical_path_string(&bin_b)
+        absolute_path_string(&bin_b)
     );
     assert_eq!(
         read_json(&sb.manifest_path())["clients"]["claude-code"]["binary_path"],
-        canonical_path_string(&bin_b)
+        absolute_path_string(&bin_b)
     );
 }
 
@@ -725,13 +785,28 @@ fn unrelated_settings_keys_and_order_are_preserved_across_integrate_and_remove()
         original_val["enabledPlugins"]["iris@iris"]
     );
 
+    // Add a key after integrate so --remove must take the semantic edit path (not restore the
+    // backup) while preserving both sibling keys inside the managed sections and overall key order.
+    let mut with_later_edit = after_integrate.clone();
+    with_later_edit["addedAfter"] = json!("kept");
+    fs::write(
+        sb.settings_path(),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&with_later_edit).unwrap()
+        ),
+    )
+    .unwrap();
+
     assert!(
         sb.run(&["integrate", "claude-code", "--remove"])
             .status
             .success()
     );
     let after_remove = read_json(&sb.settings_path());
-    assert_eq!(after_remove, original_val);
+    let mut expected_after_remove = original_val.clone();
+    expected_after_remove["addedAfter"] = json!("kept");
+    assert_eq!(after_remove, expected_after_remove);
     let removed_keys: Vec<&str> = after_remove
         .as_object()
         .unwrap()
@@ -746,9 +821,60 @@ fn unrelated_settings_keys_and_order_are_preserved_across_integrate_and_remove()
             "extraKnownMarketplaces",
             "middle",
             "enabledPlugins",
-            "omega"
+            "omega",
+            "addedAfter"
         ]
     );
+}
+
+#[test]
+fn compact_settings_restores_original_bytes_when_unchanged_and_edits_semantically_when_modified() {
+    // Variant 1: compact single-line JSON unchanged between integrate and --remove -> exact byte
+    // restoration from backup.
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.settings_path().parent().unwrap()).unwrap();
+    let compact = r#"{"zeta":1,"alpha":[true,"café"]}"#;
+    fs::write(sb.settings_path(), compact).unwrap();
+
+    assert!(sb.run(&["integrate", "claude-code"]).status.success());
+    let manifest = read_json(&sb.manifest_path());
+    assert!(
+        manifest["clients"]["claude-code"]["settings_written_sha256"]
+            .as_str()
+            .is_some_and(|hex| hex.len() == 64)
+    );
+    assert!(
+        sb.run(&["integrate", "claude-code", "--remove"])
+            .status
+            .success()
+    );
+    assert_eq!(fs::read_to_string(sb.settings_path()).unwrap(), compact);
+
+    // Variant 2: user edits an unrelated key after integrate -> semantic edit preserves user edit.
+    let sb2 = Sandbox::new();
+    fs::create_dir_all(sb2.settings_path().parent().unwrap()).unwrap();
+    fs::write(sb2.settings_path(), compact).unwrap();
+
+    assert!(sb2.run(&["integrate", "claude-code"]).status.success());
+    let mut edited = read_json(&sb2.settings_path());
+    edited["userAdded"] = json!("kept");
+    fs::write(
+        sb2.settings_path(),
+        serde_json::to_string_pretty(&edited).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        sb2.run(&["integrate", "claude-code", "--remove"])
+            .status
+            .success()
+    );
+    let after = read_json(&sb2.settings_path());
+    assert_eq!(after["zeta"], 1);
+    assert_eq!(after["alpha"], json!([true, "café"]));
+    assert_eq!(after["userAdded"], "kept");
+    assert!(after.get("extraKnownMarketplaces").is_none());
+    assert!(after.get("enabledPlugins").is_none());
 }
 
 #[test]
@@ -787,7 +913,7 @@ fn paths_with_spaces_and_non_ascii_work_end_to_end() {
     );
     assert_eq!(
         mcp["mcpServers"]["proxenos"]["command"],
-        canonical_path_string(&bin)
+        absolute_path_string(&bin)
     );
 
     let doc_out = run_with_env(&["doctor", "--json"]);
@@ -963,11 +1089,13 @@ fn doctor_fails_when_registered_binary_is_missing_or_unlaunchable() {
         find_check(&missing_report, "claude-code.registration")["status"],
         "fail"
     );
+    let missing_msg = find_check(&missing_report, "claude-code.registration")["message"]
+        .as_str()
+        .unwrap();
     assert!(
-        find_check(&missing_report, "claude-code.registration")["message"]
-            .as_str()
-            .unwrap()
-            .contains("does not exist")
+        missing_msg.contains("does not exist")
+            && missing_msg.contains("proxenos integrate claude-code"),
+        "{missing_report}"
     );
     assert_eq!(
         find_check(&missing_report, "claude-code.handshake")["status"],
@@ -1055,6 +1183,251 @@ fn doctor_json_shape_and_real_binary_handshake_and_usage_errors() {
         assert!(out.stdout.is_empty());
         assert!(!out.stderr.is_empty());
     }
+}
+
+#[test]
+fn settings_symlink_is_preserved_across_integrate_and_remove_and_dangling_link_is_refused() {
+    let sb = Sandbox::new();
+    let dotfiles = sb.root.join("dotfiles");
+    fs::create_dir_all(&dotfiles).unwrap();
+    let target = dotfiles.join("claude-settings.json");
+    let original = "{\n  \"theme\": \"dark\",\n  \"nested\": {\n    \"keep\": true\n  }\n}\n";
+    fs::write(&target, original).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    fs::create_dir_all(sb.settings_path().parent().unwrap()).unwrap();
+    if !try_file_symlink(&target, &sb.settings_path()).unwrap() {
+        return;
+    }
+
+    let out = sb.run(&["integrate", "claude-code"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(sb.settings_path())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "settings.json symlink was replaced by a regular file"
+    );
+    let target_after = read_json(&target);
+    assert_eq!(target_after["theme"], "dark");
+    assert_eq!(target_after["nested"]["keep"], true);
+    assert_eq!(
+        target_after["extraKnownMarketplaces"]["proxenos"]["source"]["path"],
+        sb.marketplace_dir().to_str().unwrap()
+    );
+    assert_eq!(target_after["enabledPlugins"]["proxenos@proxenos"], true);
+    assert_eq!(fs::read_to_string(sb.backup_path()).unwrap(), original);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    let manifest = read_json(&sb.manifest_path());
+    let rec = &manifest["clients"]["claude-code"];
+    assert_eq!(rec["settings_is_symlink"], true);
+    assert_eq!(
+        rec["settings_symlink_target"],
+        canonical_path_string(&target)
+    );
+
+    let rm = sb.run(&["integrate", "claude-code", "--remove"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(sb.settings_path())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "settings.json symlink was broken by --remove"
+    );
+    let target_restored = read_json(&target);
+    assert_eq!(
+        target_restored,
+        serde_json::from_str::<Value>(original).unwrap()
+    );
+    assert!(!sb.backup_path().exists());
+
+    // Dangling symlink must be refused with nothing changed.
+    let sb_dangling = Sandbox::new();
+    let missing_target = sb_dangling.root.join("dotfiles").join("missing.json");
+    fs::create_dir_all(sb_dangling.settings_path().parent().unwrap()).unwrap();
+    assert!(try_file_symlink(&missing_target, &sb_dangling.settings_path()).unwrap());
+
+    let refused = sb_dangling.run(&["integrate", "claude-code"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("symlink") && stderr.contains("cannot be resolved"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        fs::symlink_metadata(sb_dangling.settings_path())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!sb_dangling.marketplace_dir().exists());
+    assert!(!sb_dangling.manifest_path().exists());
+}
+
+#[test]
+fn symlinked_binary_keeps_link_path_and_doctor_warns_on_path_mismatch() {
+    let sb = Sandbox::new();
+    let target_bin = sb.hard_link_binary("cellar/0.1.0/bin");
+    let link_dir = sb.root.join("brew-bin");
+    let path_link_dir = sb.root.join("path-bin");
+    fs::create_dir_all(&link_dir).unwrap();
+    fs::create_dir_all(&path_link_dir).unwrap();
+    let link_bin = link_dir.join(format!("proxenos{}", std::env::consts::EXE_SUFFIX));
+    let path_link_bin = path_link_dir.join(format!("proxenos{}", std::env::consts::EXE_SUFFIX));
+    let mcp_path = sb
+        .marketplace_dir()
+        .join("plugins")
+        .join("proxenos")
+        .join(".mcp.json");
+
+    if try_file_symlink(&target_bin, &link_bin).unwrap() {
+        assert!(try_file_symlink(&target_bin, &path_link_bin).unwrap());
+
+        // 1. Invoked directly via symlink path -> records symlink path, not versioned target.
+        let by_path = sb
+            .command_for(&link_bin, &["integrate", "claude-code"])
+            .output()
+            .unwrap();
+        assert!(
+            by_path.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&by_path.stderr)
+        );
+        let expected_link = absolute_path_string(&link_bin);
+        assert_eq!(
+            read_json(&mcp_path)["mcpServers"]["proxenos"]["command"],
+            expected_link
+        );
+        assert_eq!(
+            read_json(&sb.manifest_path())["clients"]["claude-code"]["binary_path"],
+            expected_link
+        );
+
+        // Doctor with matching symlink on PATH reports registration ok.
+        let mut ok_doc = sb.command_for(&link_bin, &["doctor", "--json"]);
+        ok_doc.env("PATH", &link_dir);
+        let ok_out = ok_doc.output().unwrap();
+        assert!(
+            ok_out.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&ok_out.stdout),
+            String::from_utf8_lossy(&ok_out.stderr)
+        );
+        let ok_report: Value = serde_json::from_slice(&ok_out.stdout).unwrap();
+        assert_eq!(
+            find_check(&ok_report, "claude-code.registration")["status"],
+            "ok",
+            "{ok_report}"
+        );
+
+        // 2. Invoked by bare name `proxenos` resolved via PATH -> records PATH symlink path.
+        let mut by_name = sb.command_for(Path::new("proxenos"), &["integrate", "claude-code"]);
+        by_name.env("PATH", &path_link_dir);
+        let by_name_out = by_name.output().unwrap();
+        assert!(
+            by_name_out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&by_name_out.stderr)
+        );
+        let expected_path_link = absolute_path_string(&path_link_bin);
+        assert_eq!(
+            read_json(&mcp_path)["mcpServers"]["proxenos"]["command"],
+            expected_path_link
+        );
+        assert_eq!(
+            read_json(&sb.manifest_path())["clients"]["claude-code"]["binary_path"],
+            expected_path_link
+        );
+    } else {
+        // Unprivileged Windows fallback without symlink privilege: still test bare-name PATH lookup.
+        let path_bin = sb.hard_link_binary("path-bin");
+        let mut by_name = sb.command_for(Path::new("proxenos"), &["integrate", "claude-code"]);
+        by_name.env("PATH", &path_link_dir);
+        let by_name_out = by_name.output().unwrap();
+        assert!(
+            by_name_out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&by_name_out.stderr)
+        );
+        assert_eq!(
+            read_json(&mcp_path)["mcpServers"]["proxenos"]["command"],
+            absolute_path_string(&path_bin)
+        );
+    }
+
+    // 3. Bare argv[0] when PATH has no matching entry falls back to current_exe().
+    #[cfg(unix)]
+    let fallback_out = {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = sb.command_for(&target_bin, &["integrate", "claude-code"]);
+        cmd.arg0("proxenos");
+        cmd.output().unwrap()
+    };
+    #[cfg(windows)]
+    let fallback_out = {
+        let mut cmd = sb.command_for(Path::new("proxenos.exe"), &["integrate", "claude-code"]);
+        cmd.current_dir(target_bin.parent().unwrap());
+        cmd.output().unwrap()
+    };
+    assert!(
+        fallback_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&fallback_out.stderr)
+    );
+    assert_eq!(
+        read_json(&mcp_path)["mcpServers"]["proxenos"]["command"],
+        canonical_path_string(&target_bin)
+    );
+
+    // 4. Doctor warns (exits 0) when `proxenos` on PATH resolves to a different binary.
+    let other_bin = sb.hard_link_binary("cellar/0.2.0/bin");
+    let mut mismatch_cmd = sb.command(&["doctor", "--json"]);
+    mismatch_cmd.env("PATH", other_bin.parent().unwrap());
+    let mismatch_out = mismatch_cmd.output().unwrap();
+    assert!(
+        mismatch_out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&mismatch_out.stdout),
+        String::from_utf8_lossy(&mismatch_out.stderr)
+    );
+    let mismatch_report: Value = serde_json::from_slice(&mismatch_out.stdout).unwrap();
+    assert_eq!(mismatch_report["ok"], true, "{mismatch_report}");
+    let reg = find_check(&mismatch_report, "claude-code.registration");
+    assert_eq!(reg["status"], "warn", "{mismatch_report}");
+    let msg = reg["message"].as_str().unwrap();
+    assert!(
+        msg.contains("on PATH resolves to") && msg.contains("proxenos integrate claude-code"),
+        "{mismatch_report}"
+    );
+    assert_eq!(
+        reg["details"]["path_resolved"],
+        canonical_path_string(&other_bin),
+        "{mismatch_report}"
+    );
+    assert_eq!(
+        find_check(&mismatch_report, "claude-code.handshake")["details"]["server_name"],
+        "proxenos",
+        "{mismatch_report}"
+    );
 }
 
 #[cfg(unix)]
@@ -1232,6 +1605,8 @@ mod with_stubs {
         };
 
         // 1. Notification before response, then empty tools list -> warn (exit 0).
+        // Trailing "stdin" keeps the stub's stdin pipe open until doctor drops it after reading
+        // responses, preventing a fast-exit EPIPE race while doctor writes follow-up frames.
         let note = json!({"jsonrpc":"2.0","method":"notifications/progress"}).to_string();
         let init_ok = json!({
             "jsonrpc": "2.0",
@@ -1247,65 +1622,117 @@ mod with_stubs {
         set_stub_args(json!([
             format!("out:{note}"),
             format!("out:{init_ok}"),
-            format!("out:{list_empty}")
+            format!("out:{list_empty}"),
+            "stdin"
         ]));
         let empty_out = sb.run(&["doctor", "--json"]);
-        assert!(empty_out.status.success());
         let empty_report: Value = serde_json::from_slice(&empty_out.stdout).unwrap();
+        assert!(
+            empty_out.status.success(),
+            "report: {empty_report}\nstderr: {}",
+            String::from_utf8_lossy(&empty_out.stderr)
+        );
         assert_eq!(
             find_check(&empty_report, "claude-code.handshake")["status"],
-            "warn"
+            "warn",
+            "{empty_report}"
+        );
+        let empty_msg = find_check(&empty_report, "claude-code.handshake")["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            empty_msg.contains("no provider CLI found on PATH")
+                && empty_msg.contains("codex")
+                && empty_msg.contains("agy"),
+            "{empty_report}"
         );
 
-        // 2. Closed stdout before answering.
-        set_stub_args(json!(["exit:0"]));
+        // 1b. Same 0-tools stub response when a provider CLI *is* on PATH -> warns without
+        // claiming no provider CLI was found. Hard-linking the proxenos binary under the name
+        // `codex` gives a self-contained `--version` responder without setting PROXENOS_STUB_DIR
+        // (which would put the MCP stub into replay mode).
+        let stub_dir = sb.root.join("one-provider");
+        fs::create_dir_all(&stub_dir).unwrap();
+        fs::hard_link(
+            proxenos_bin(),
+            stub_dir.join(format!("codex{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .unwrap();
+        let mut with_cli = sb.command(&["doctor", "--json"]);
+        with_cli.env("PATH", &stub_dir);
+        let with_cli_out = with_cli.output().unwrap();
+        let with_cli_report: Value = serde_json::from_slice(&with_cli_out.stdout).unwrap();
+        assert!(with_cli_out.status.success(), "{with_cli_report}");
+        let with_cli_msg = find_check(&with_cli_report, "claude-code.handshake")["message"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            find_check(&with_cli_report, "claude-code.handshake")["status"],
+            "warn",
+            "{with_cli_report}"
+        );
+        assert!(
+            with_cli_msg.contains("0 tools") && !with_cli_msg.contains("no provider CLI"),
+            "{with_cli_report}"
+        );
+
+        // 2. Closed stdout before answering (while stdin stays open).
+        set_stub_args(json!(["close-output", "stdin"]));
         let eof_out = sb.run(&["doctor", "--json"]);
-        assert_eq!(eof_out.status.code(), Some(1));
         let eof_report: Value = serde_json::from_slice(&eof_out.stdout).unwrap();
+        assert_eq!(eof_out.status.code(), Some(1), "{eof_report}");
         assert!(
             find_check(&eof_report, "claude-code.handshake")["message"]
                 .as_str()
                 .unwrap()
-                .contains("closed stdout")
+                .contains("closed stdout"),
+            "{eof_report}"
         );
 
         // 3. Invalid JSON on stdout.
-        set_stub_args(json!(["out:not-json"]));
+        set_stub_args(json!(["out:not-json", "stdin"]));
         let bad_json_out = sb.run(&["doctor", "--json"]);
-        assert_eq!(bad_json_out.status.code(), Some(1));
         let bad_json_report: Value = serde_json::from_slice(&bad_json_out.stdout).unwrap();
+        assert_eq!(bad_json_out.status.code(), Some(1), "{bad_json_report}");
         assert!(
             find_check(&bad_json_report, "claude-code.handshake")["message"]
                 .as_str()
                 .unwrap()
-                .contains("invalid JSON")
+                .contains("invalid JSON"),
+            "{bad_json_report}"
         );
 
         // 4. JSON-RPC error response.
         let rpc_err =
             json!({"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"bad"}}).to_string();
-        set_stub_args(json!([format!("out:{rpc_err}")]));
+        set_stub_args(json!([format!("out:{rpc_err}"), "stdin"]));
         let err_out = sb.run(&["doctor", "--json"]);
-        assert_eq!(err_out.status.code(), Some(1));
         let err_report: Value = serde_json::from_slice(&err_out.stdout).unwrap();
+        assert_eq!(err_out.status.code(), Some(1), "{err_report}");
         assert!(
             find_check(&err_report, "claude-code.handshake")["message"]
                 .as_str()
                 .unwrap()
-                .contains("returned error")
+                .contains("returned error"),
+            "{err_report}"
         );
 
         // 5. Missing `tools` array in tools/list response.
         let bad_list = json!({"jsonrpc":"2.0","id":2,"result":{}}).to_string();
-        set_stub_args(json!([format!("out:{init_ok}"), format!("out:{bad_list}")]));
+        set_stub_args(json!([
+            format!("out:{init_ok}"),
+            format!("out:{bad_list}"),
+            "stdin"
+        ]));
         let bad_list_out = sb.run(&["doctor", "--json"]);
-        assert_eq!(bad_list_out.status.code(), Some(1));
         let bad_list_report: Value = serde_json::from_slice(&bad_list_out.stdout).unwrap();
+        assert_eq!(bad_list_out.status.code(), Some(1), "{bad_list_report}");
         assert!(
             find_check(&bad_list_report, "claude-code.handshake")["message"]
                 .as_str()
                 .unwrap()
-                .contains("tools array")
+                .contains("tools array"),
+            "{bad_list_report}"
         );
 
         // 6. Hung server hits deadline and is killed and reaped.
@@ -1323,13 +1750,14 @@ mod with_stubs {
             "doctor waited past handshake deadline: {:?}",
             started.elapsed()
         );
-        assert_eq!(timed_out.status.code(), Some(1));
         let timed_report: Value = serde_json::from_slice(&timed_out.stdout).unwrap();
+        assert_eq!(timed_out.status.code(), Some(1), "{timed_report}");
         assert!(
             find_check(&timed_report, "claude-code.handshake")["message"]
                 .as_str()
                 .unwrap()
-                .contains("deadline")
+                .contains("deadline"),
+            "{timed_report}"
         );
         // If the child held the lock, verify it was killed and the lock is now free.
         if lock_file.exists() {

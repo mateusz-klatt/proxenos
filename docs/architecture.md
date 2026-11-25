@@ -377,55 +377,73 @@ implement the Claude Code registration and health check:
   `$HOME/.local/state/proxenos` when `XDG_STATE_HOME` is unset or non-absolute) on Unix, and
   `%LOCALAPPDATA%\proxenos` on Windows. Directories created by Proxenos use mode `0700` on Unix and
   files owned by Proxenos use mode `0600`. All writes go through a unique temporary file in the same
-  directory followed by an atomic rename.
+  directory, call `File::sync_all()` before an atomic rename, and on Unix sync the parent directory
+  after the rename.
 - **Claude Code marketplace layout.** `proxenos integrate claude-code` writes a local marketplace
   under `<state_dir>/claude-marketplace`:
   - `.claude-plugin/marketplace.json` naming marketplace `proxenos`, owner `Proxenos`, and plugin
     `proxenos` at `./plugins/proxenos`.
   - `plugins/proxenos/.claude-plugin/plugin.json` carrying name, description, crate version and
     author `Proxenos`.
-  - `plugins/proxenos/.mcp.json` defining `mcpServers.proxenos` with `command` set to the
-    canonical absolute path of the running `proxenos` binary and `args` set to
-    `["mcp", "--client", "claude"]`.
+  - `plugins/proxenos/.mcp.json` defining `mcpServers.proxenos` with `command` set to the invoked
+    absolute path of the running `proxenos` binary (preserving package-manager symlinks via
+    `argv[0]` or a matching `PATH` entry, falling back to `current_exe()` without resolving links or
+    adding a Windows `\\?\` prefix) and `args` set to `["mcp", "--client", "claude"]`.
 - **Claude Code settings.** In `<HOME>/.claude/settings.json` (`%USERPROFILE%\.claude\settings.json`
   on Windows), Proxenos writes `extraKnownMarketplaces.proxenos` (with
   `source: { source: "directory", path: "<marketplace_dir>" }`) and
   `enabledPlugins."proxenos@proxenos": true`, preserving all unrelated keys and key ordering (via
   `serde_json`'s pure-Rust `preserve_order` feature) and preserving an existing file's Unix
-  permissions. If `settings.json` already existed, a verbatim backup is saved to
-  `<state_dir>/integrate/backups/claude-code-settings.json` (mode `0600` on Unix) before the first
-  edit.
+  permissions. When `settings.json` is a symlink, Proxenos resolves the final target and writes
+  atomically in the target's directory so the symlink stays a symlink; dangling or looping symlinks
+  are refused without modifying anything. If `settings.json` (or its symlink target) already
+  existed, a verbatim backup is saved to `<state_dir>/integrate/backups/claude-code-settings.json`
+  (mode `0600` on Unix) before the first edit; an existing original backup file is never overwritten
+  while an integration has not been removed.
 - **Manifest and ownership rules.** `<state_dir>/integrate/manifest.json` (`schema_version: 1`)
   records per-client ownership under `clients."claude-code"`: `marketplace_dir`, `binary_path`,
-  `settings_path`, whether Proxenos created `settings.json` and the two container objects, the
-  optional `backup_path`, the exact JSON values written under `entries`, the generated `files`, and
-  the `created_dirs` list in creation order.
+  `settings_path`, whether Proxenos created `settings.json` and the two container objects, whether
+  `settings.json` was a symlink (`settings_is_symlink` and `settings_symlink_target`), the optional
+  `backup_path`, the exact JSON values written under `entries`, the generated `files`, and the
+  `created_dirs` list in creation order.
   - Re-running `integrate claude-code` is idempotent and updates `.mcp.json` and `binary_path` when
     the binary moves, keeping the original backup and creation flags.
   - If `extraKnownMarketplaces.proxenos` or `enabledPlugins."proxenos@proxenos"` already exists
     without a matching manifest record, or if `<state_dir>/claude-marketplace` already exists and is
     not recorded as ours, `integrate` refuses with exit code 1 and changes nothing. It also refuses
     to overwrite an entry the user edited after `integrate`.
-  - `integrate claude-code --remove` removes only entries in `settings.json` that still match the
-    manifest's recorded values (never restoring the backup over newer user edits), removes only
-    files recorded in the manifest and its backup, deletes `settings.json` only if Proxenos created
-    it and no keys remain, deletes recorded directories in reverse order only when empty, and is
-    idempotent when already removed. If the user modified a managed entry in `settings.json`,
-    `--remove` refuses to delete that entry, reports it on stderr, and exits 1.
+  - `integrate claude-code --remove` restores the original backup bytes verbatim when `settings.json`
+    is still byte-for-byte identical to what `integrate` wrote (matching `settings_written_sha256`
+    in the manifest) and a backup exists; otherwise it edits semantically, removing only entries
+    that still match the manifest's recorded values so newer user edits are preserved. `integrate`
+    normalises the file's formatting when writing; `--remove` restores the original bytes when
+    nothing has changed since. It removes only files recorded in the manifest and its backup,
+    deletes `settings.json` only if Proxenos created it, it is not a symlink, and no keys remain,
+    deletes recorded directories in reverse order only when empty, and is idempotent when already
+    removed. If the user modified a managed entry in `settings.json`, `--remove` refuses to delete
+    that entry, reports it on stderr, and exits 1.
 - **`proxenos doctor [--json]`.** Reads back the Claude Code registration (`settings.json` through
-  `marketplace.json`, `plugin.json` and `.mcp.json`) and checks that the registered executable
-  exists; checks that `<state_dir>` has private (`0700`-compatible) permissions on Unix (or exists
-  on Windows); inspects each provider CLI using D7 discovery and reports its version; and runs an
-  MCP stdio handshake (`initialize`, `notifications/initialized`, `tools/list`) against the
-  registered command and args under a bounded deadline (10 seconds by default), killing and reaping
-  the child if it fails or times out. Output is text by default or schema-versioned JSON with
-  `--json`, with each check reported as `ok`, `warn`, or `fail`; exit status is 0 when no check
-  fails and 1 otherwise.
+  `marketplace.json`, `plugin.json` and `.mcp.json`), fails if the registered executable does not
+  exist, and warns if `proxenos` on `PATH` resolves to a different binary (each hinting to re-run
+  `proxenos integrate claude-code`); checks that `<state_dir>` has private (`0700`-compatible)
+  permissions on Unix (or exists on Windows); inspects each provider CLI using D7 discovery and
+  reports its version; and runs an MCP stdio handshake (`initialize`, `notifications/initialized`,
+  `tools/list`) against the registered command and args under a bounded deadline (10 seconds by
+  default), killing and reaping the child if it fails or times out. Output is text by default or
+  schema-versioned JSON with `--json`, with each check reported as `ok`, `warn`, or `fail`; exit
+  status is 0 when no check fails and 1 otherwise.
 
 What this cannot do:
 
 - Claude Code reads `settings.json` and local marketplace plugins only when it starts; running
   `integrate` or `--remove` does not reload a Claude Code session that is already open.
+- Claude Code can rewrite `settings.json` during a session, so Proxenos's read-modify-rename can
+  lose a change Claude Code made concurrently; Proxenos does not lock `settings.json`, because Claude
+  Code would not honour our lock.
+- Preserving the invoked symlink path keeps package-manager shims working across upgrades only when
+  `proxenos integrate claude-code` was run through that stable symlink; invoking a versioned binary
+  directly still pins that versioned path until `integrate` is run again (which `doctor` warns about
+  when `proxenos` on `PATH` diverges).
 - `doctor`'s handshake proves that the registered binary starts and speaks MCP with the configured
   arguments; it does not prove that Claude Code itself loaded the plugin or that Claude Code's own
   hook/plugin discovery will accept it.
