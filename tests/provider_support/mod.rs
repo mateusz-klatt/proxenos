@@ -51,6 +51,7 @@ impl Fleet {
             .env("TEMP", &self.root)
             .env("TMPDIR", &self.root)
             .env("TMP", &self.root);
+        command.env_remove("XDG_STATE_HOME");
         for key in ["HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA"] {
             command.env(key, &self.root);
         }

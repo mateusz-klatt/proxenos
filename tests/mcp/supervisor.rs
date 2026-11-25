@@ -417,6 +417,141 @@ fn a_child_ignoring_sigterm_is_killed_after_three_seconds() {
 
 #[cfg(unix)]
 #[test]
+fn a_memory_limit_ending_runs_one_stop_even_past_deadline() {
+    let directory = Directory::new();
+    let ready = directory.0.join("ready");
+    let mut server = server();
+
+    // Measure baseline RSS so the limit sits well above startup and SIGTERM-handler setup.
+    let baseline =
+        finished(&server.call(1, "test_run", launch(json!(["alloc:1048576", "sleep:150"]))));
+    let base_bytes = baseline["peak_memory_bytes"]
+        .as_u64()
+        .expect("baseline peak memory");
+    let limit = base_bytes + (16 << 20);
+
+    // Install SIGTERM handler and confirm readiness via `hold:` before allocating past `limit`,
+    // so SIGTERM can never arrive before `ignore-term` has run.
+    let mut args = launch(json!([
+        "ignore-term",
+        format!("hold:{}", ready.display()),
+        format!("until-released:{}", ready.display()),
+        format!("alloc:{}", 64_u64 << 20),
+        "sleep:60000"
+    ]));
+    args["memory_limit_bytes"] = json!(limit);
+    args["deadline_ms"] = json!(2000);
+
+    server.start_call(2, "test_run", args);
+    let held = lock_file(&ready);
+    assert!(!is_free(&held));
+    let started = Instant::now();
+    fs::write(ready.with_extension("release"), []).unwrap();
+    let result = finished(&server.response(2));
+    let elapsed = started.elapsed();
+    assert_eq!(result["ending"], "memory_limit", "{result}");
+    assert_eq!(result["signal"], libc::SIGKILL, "{result}");
+    assert!(is_free(&held));
+    assert!(
+        elapsed >= Duration::from_millis(2900) && elapsed < Duration::from_millis(5500),
+        "memory_limit stop took {elapsed:?}: {result}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_exiting_on_sigterm_stops_well_below_the_grace() {
+    // Part A: cancellation stops a child and an obedient grandchild in the same group in < 1 s.
+    let directory = Directory::new();
+    let grandchild = directory.0.join("fast-grandchild");
+    let mut cancel_server = server();
+    cancel_server.start_call(
+        1,
+        "test_run",
+        launch(json!([
+            format!("delayed-grandchild:{}:0", grandchild.display()),
+            "sleep:60000"
+        ])),
+    );
+    let gc_lock = lock_file(&grandchild);
+    wait_for("grandchild did not enter await-term", || {
+        grandchild.with_extension("term").exists()
+    });
+    assert!(!is_free(&gc_lock));
+    let stopped = Instant::now();
+    cancel_server.close_input();
+    let cancelled = finished(&cancel_server.response(1));
+    let cancel_elapsed = stopped.elapsed();
+    assert_eq!(cancelled["ending"], "cancelled", "{cancelled}");
+    assert_eq!(cancelled["signal"], libc::SIGTERM, "{cancelled}");
+    assert!(is_free(&gc_lock));
+    assert!(
+        cancel_elapsed < Duration::from_secs(1),
+        "SIGTERM cancellation waited too long: {cancel_elapsed:?}"
+    );
+    assert!(cancel_server.finish().0.success());
+
+    // Part B: timeout stops a child and an obedient grandchild well below the 3 s grace.
+    let gc_timeout = directory.0.join("timeout-grandchild");
+    let mut timeout_server = server();
+    let mut args = launch(json!([
+        format!("delayed-grandchild:{}:0", gc_timeout.display()),
+        "sleep:60000"
+    ]));
+    args["deadline_ms"] = json!(500);
+    let started = Instant::now();
+    let timed_out = finished(&timeout_server.call(1, "test_run", args));
+    let timeout_elapsed = started.elapsed();
+    assert_eq!(timed_out["ending"], "timed_out", "{timed_out}");
+    assert_eq!(timed_out["signal"], libc::SIGTERM, "{timed_out}");
+    assert!(
+        timeout_elapsed < Duration::from_millis(1500),
+        "SIGTERM timeout stop waited too long: {timeout_elapsed:?} ({timed_out})"
+    );
+    assert!(
+        timed_out["elapsed_ms"].as_u64().unwrap() < 1500,
+        "SIGTERM timeout stop waited too long: {timed_out}"
+    );
+    assert!(timeout_server.finish().0.success());
+
+    // Part C: a grandchild that finishes 500 ms after SIGTERM (after the leader exits cleanly)
+    // delays completion until the grandchild exits, then still ends well before the 3 s grace.
+    let slow_gc = directory.0.join("slow-grandchild");
+    let leader_term = directory.0.join("slow-leader.term");
+    let mut delayed_server = server();
+    delayed_server.start_call(
+        1,
+        "test_run",
+        launch(json!([
+            "ignore-term",
+            format!("delayed-grandchild:{}:500", slow_gc.display()),
+            format!("await-term:{}", leader_term.display()),
+            "exit:0"
+        ])),
+    );
+    let slow_lock = lock_file(&slow_gc);
+    wait_for(
+        "leader and delayed grandchild did not enter await-term",
+        || leader_term.exists() && slow_gc.with_extension("term").exists(),
+    );
+    assert!(!is_free(&slow_lock));
+    let delayed_stopped = Instant::now();
+    delayed_server.close_input();
+    let delayed = finished(&delayed_server.response(1));
+    let delayed_elapsed = delayed_stopped.elapsed();
+    assert_eq!(delayed["ending"], "cancelled", "{delayed}");
+    assert_eq!(delayed["code"], 0, "{delayed}");
+    assert!(is_free(&slow_lock));
+    assert!(
+        delayed_elapsed >= Duration::from_millis(450)
+            && delayed_elapsed < Duration::from_millis(2000),
+        "delayed grandchild stop took {delayed_elapsed:?}: {delayed}"
+    );
+    assert!(delayed_server.finish().0.success());
+}
+
+#[cfg(unix)]
+#[test]
 fn an_escaped_descendant_cannot_keep_the_readers_open() {
     let directory = Directory::new();
     let lock = directory.0.join("escaped");

@@ -1,5 +1,6 @@
 //! Proxenos: MCP delegation between coding-agent CLIs.
 
+mod background;
 mod client;
 mod delegation;
 mod discovery;
@@ -7,6 +8,7 @@ mod envelope;
 mod mcp;
 mod platform;
 mod providers;
+mod sessions;
 mod supervise;
 mod tools;
 

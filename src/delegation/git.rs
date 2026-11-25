@@ -67,6 +67,7 @@ pub(super) async fn snapshot(
             .map(|(k, v)| (k.into(), v.into()))
             .to_vec(),
             deadline: deadline.map_or(limit, |call| call.min(limit)),
+            memory_limit_bytes: None,
             capture_limit: LIMIT,
             temporary_files: Vec::new(),
         }

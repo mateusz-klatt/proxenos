@@ -1,24 +1,27 @@
-//! One foreground call, from preflight through reaping, interpretation and D19 continuity.
+//! Foreground and background delegations, from preflight through reaping, accounting and D19 continuity.
 
 mod git;
 
 use std::ffi::OsString;
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::background::MAX_CONCURRENT;
 use crate::discovery::{Executable, exit_description};
 use crate::envelope::{CAPTURE_LIMIT, Envelope, Failure, FailureKind};
 use crate::mcp::{Activity, ToolOutcome};
-use crate::providers::{Provider, Report, Turn};
+use crate::providers::{DEFAULT_TIMEOUT_MS, Provider, RememberedStart, Report, Turn};
+use crate::sessions::{self, SaveOutcome, SessionLookup};
 use crate::supervise::cleanup::DirectoryLease;
 use crate::supervise::{self, Ending, Finished, Launch};
-use crate::tools::Registry;
+use crate::tools::{Registry, StartEntry};
 
 const DEPTH: &[&str] = &[
     "PROXENOS_DEPTH",
@@ -33,7 +36,7 @@ const DEPTH: &[&str] = &[
 
 impl Registry {
     pub async fn delegate(
-        &self,
+        self: Arc<Self>,
         p: &'static Provider,
         reply: bool,
         args: Map<String, Value>,
@@ -41,8 +44,81 @@ impl Registry {
         activity: Activity,
     ) -> ToolOutcome {
         let mut result = Envelope::new(p, &args);
+        let (turn, call_deadline) = match self
+            .prepare_turn(p, reply, &args, &cancel, activity.clone(), result.started())
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                result.fail(error);
+                return result.outcome();
+            }
+        };
+        if !turn.wait {
+            let bg_cancel = activity.shutdown_token();
+            let task = match await_bounded(
+                async {
+                    self.background
+                        .try_start(p.name, bg_cancel.clone(), activity.clone())
+                        .ok_or_else(busy_failure)
+                },
+                call_deadline,
+                &cancel,
+                "Starting the background delegation",
+            )
+            .await
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    result.fail(error);
+                    return result.outcome();
+                }
+            };
+            let handle = task.handle().to_owned();
+            let registry = Arc::clone(&self);
+            tokio::spawn(async move {
+                let outcome = registry
+                    .execute(
+                        p,
+                        reply,
+                        turn,
+                        call_deadline,
+                        &bg_cancel,
+                        activity,
+                        &mut result,
+                    )
+                    .await;
+                if let Err(error) = outcome {
+                    result.fail(error);
+                }
+                let (state, value) = result.finalize();
+                task.finish(state, value);
+            });
+            return ToolOutcome {
+                is_error: false,
+                text: json!({
+                    "schema_version": 1,
+                    "handle": handle,
+                    "state": "running",
+                    "provider": p.name,
+                })
+                .to_string(),
+            };
+        }
+        let Some(_slot) = self.background.try_acquire_slot() else {
+            result.fail(busy_failure());
+            return result.outcome();
+        };
         let outcome = self
-            .run(p, reply, &args, &cancel, activity, &mut result)
+            .execute(
+                p,
+                reply,
+                turn,
+                call_deadline,
+                &cancel,
+                activity,
+                &mut result,
+            )
             .await;
         if let Err(error) = outcome {
             result.fail(error);
@@ -50,15 +126,15 @@ impl Registry {
         result.outcome()
     }
 
-    async fn run(
+    async fn prepare_turn(
         &self,
         p: &'static Provider,
         reply: bool,
         args: &Map<String, Value>,
         cancel: &CancellationToken,
         activity: Activity,
-        result: &mut Envelope,
-    ) -> Result<(), Failure> {
+        started: Instant,
+    ) -> Result<(Turn, Instant), Failure> {
         if DEPTH.iter().any(|key| {
             std::env::var(key).is_ok_and(|s| s.trim().parse::<u64>().is_ok_and(|n| n > 0))
         }) {
@@ -67,29 +143,112 @@ impl Registry {
                 "A delegated CLI cannot start another Proxenos delegation.",
             ));
         }
-        let start = if reply {
-            match args
+        let load_deadline = started
+            + Duration::from_millis(
+                args.get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .filter(|&ms| (1..=86_400_000).contains(&ms))
+                    .unwrap_or(DEFAULT_TIMEOUT_MS),
+            );
+        let start = if reply
+            && let Some(id) = args
                 .get("thread_id")
                 .and_then(Value::as_str)
-                .and_then(|id| self.starts.lock().unwrap().get(p.name, id).cloned())
-            {
-                Some(None) => {
+                .filter(|s| !s.trim().is_empty() && !s.contains('\0'))
+        {
+            let key_lock = self.session_locks.for_key(p.name, id);
+            let lookup = await_bounded(
+                async {
+                    let _key_guard = key_lock.lock().await;
+                    let prior_unverified =
+                        match self.starts.lock().unwrap().get(p.name, id).cloned() {
+                            Some(StartEntry::Known(remembered)) => {
+                                return Ok(SessionLookup::Found(remembered));
+                            }
+                            Some(StartEntry::Ambiguous) => return Ok(SessionLookup::Ambiguous),
+                            Some(StartEntry::Unverified(expected)) => Some(expected),
+                            None => None,
+                        };
+                    let id_owned = id.to_owned();
+                    let load_activity = activity.clone();
+                    let found = tokio::task::spawn_blocking(move || {
+                        let found = sessions::load(p, &id_owned);
+                        drop(load_activity);
+                        found
+                    })
+                    .await
+                    .expect("session loader finished");
+                    let mut starts = self.starts.lock().unwrap();
+                    let entry = starts
+                        .get(p.name, id)
+                        .cloned()
+                        .or_else(|| prior_unverified.map(StartEntry::Unverified));
+                    Ok(match (entry, found) {
+                        (Some(StartEntry::Unverified(expected)), SessionLookup::Found(disk))
+                            if sessions::matches_persisted(&disk, &expected) =>
+                        {
+                            starts.promote(p.name, id, &expected);
+                            SessionLookup::Found(expected)
+                        }
+                        (Some(StartEntry::Ambiguous), _)
+                        | (Some(StartEntry::Unverified(_)), SessionLookup::Found(_))
+                        | (_, SessionLookup::Ambiguous) => {
+                            starts.set(p.name, id.to_owned(), StartEntry::Ambiguous);
+                            SessionLookup::Ambiguous
+                        }
+                        (Some(StartEntry::Unverified(_)), SessionLookup::Missing) => {
+                            SessionLookup::Corrupt(
+                                "session settings for this thread have not been persisted".into(),
+                            )
+                        }
+                        (_, SessionLookup::Corrupt(reason)) => SessionLookup::Corrupt(reason),
+                        (None | Some(StartEntry::Known(_)), SessionLookup::Found(disk)) => {
+                            starts.set(p.name, id.to_owned(), StartEntry::Known(disk.clone()));
+                            SessionLookup::Found(disk)
+                        }
+                        (None | Some(StartEntry::Known(_)), SessionLookup::Missing) => {
+                            SessionLookup::Missing
+                        }
+                    })
+                },
+                load_deadline,
+                cancel,
+                "Loading session settings",
+            )
+            .await?;
+            match lookup {
+                SessionLookup::Missing => None,
+                SessionLookup::Found(remembered) => Some(remembered),
+                SessionLookup::Ambiguous => return Err(ambiguous_thread_failure()),
+                SessionLookup::Corrupt(reason) => {
                     return Err(Failure::new(
                         FailureKind::InvalidRequest,
-                        "Multiple starts reported this thread_id with conflicting settings. Start a new session instead.",
+                        format!("Cannot use session settings file: {reason}"),
                     ));
                 }
-                Some(Some(settings)) => Some(settings),
-                None => None,
             }
         } else {
             None
         };
-        let mut turn = p
+        let turn = p
             .turn(args, reply, start)
             .map_err(|message| Failure::new(FailureKind::InvalidRequest, message))?;
-        let call_deadline = result.started() + Duration::from_millis(turn.timeout_ms);
-        prepare(p, &turn, call_deadline, cancel, activity.clone()).await?;
+        let call_deadline = started + Duration::from_millis(turn.timeout_ms);
+        prepare(p, &turn, call_deadline, cancel, activity).await?;
+        Ok((turn, call_deadline))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute(
+        &self,
+        p: &'static Provider,
+        reply: bool,
+        mut turn: Turn,
+        call_deadline: Instant,
+        cancel: &CancellationToken,
+        activity: Activity,
+        result: &mut Envelope,
+    ) -> Result<(), Failure> {
         let exe = match self
             .discovery
             .resolve(p.name, cancel, call_deadline, activity.clone())
@@ -152,6 +311,13 @@ impl Registry {
                 result.report.diagnostic = Some(String::from_utf8_lossy(diagnostic).into_owned());
             }
             match finished.ending {
+                #[cfg(unix)]
+                Ending::MemoryLimit => {
+                    break Err(Failure::new(
+                        FailureKind::MemoryLimit,
+                        "The provider exceeded the delegation's memory limit.",
+                    ));
+                }
                 Ending::TimedOut => {
                     break Err(Failure::new(
                         FailureKind::Timeout,
@@ -162,6 +328,13 @@ impl Registry {
                     break Err(Failure::new(
                         FailureKind::Cancellation,
                         "The provider call was cancelled.",
+                    ));
+                }
+                #[cfg(windows)]
+                Ending::Exited if is_memory_limit(finished) => {
+                    break Err(Failure::new(
+                        FailureKind::MemoryLimit,
+                        "The provider exceeded the delegation's memory limit.",
                     ));
                 }
                 Ending::Exited => (),
@@ -206,19 +379,123 @@ impl Registry {
                 && result.report.failure.is_none()
                 && let Some(id) = &result.report.thread_id
             {
-                self.starts
-                    .lock()
-                    .unwrap()
-                    .record(p.name, id.clone(), turn.settings.clone());
+                let remembered = RememberedStart {
+                    settings: turn.settings.clone(),
+                    reported_model: result.report.model.clone(),
+                };
+                // Mark the confirmed start Unverified (or Ambiguous on conflict) synchronously
+                // before attempting persistence. Only a confirmed Saved/Unconfigured write under
+                // `key_lock` (or a matching disk load on reply) can promote Unverified to Known,
+                // so timeouts, cancellations, errors, and panics fail closed without caller-side
+                // reconciliation.
+                self.starts.lock().unwrap().record_unverified(
+                    p.name,
+                    id.clone(),
+                    remembered.clone(),
+                );
+                let key_lock = self.session_locks.for_key(p.name, id);
+                let saved = await_bounded(
+                    async {
+                        // Hold an owned key guard and a shutdown Activity handle inside the
+                        // blocking worker so disk persistence and promotion finish before any
+                        // later reply or start takes the key lock, even after caller timeout or
+                        // cancellation.
+                        let key_guard = key_lock.lock_owned().await;
+                        let starts = Arc::clone(&self.starts);
+                        let saved_id = id.clone();
+                        let save_activity = activity.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let desired = (!starts.lock().unwrap().conflicts_with(
+                                p.name,
+                                &saved_id,
+                                &remembered,
+                            ))
+                            .then(|| remembered.clone());
+                            let outcome = sessions::save(p, &saved_id, desired);
+                            let reconciled = match outcome {
+                                Ok(SaveOutcome::Ambiguous) => {
+                                    starts.lock().unwrap().set(
+                                        p.name,
+                                        saved_id,
+                                        StartEntry::Ambiguous,
+                                    );
+                                    Ok(())
+                                }
+                                Ok(SaveOutcome::Saved | SaveOutcome::Unconfigured) => {
+                                    starts
+                                        .lock()
+                                        .unwrap()
+                                        .promote(p.name, &saved_id, &remembered);
+                                    Ok(())
+                                }
+                                Err(error) => {
+                                    Err(Failure::new(FailureKind::Unknown, error.to_string()))
+                                }
+                            };
+                            drop(key_guard);
+                            drop(save_activity);
+                            reconciled
+                        })
+                        .await
+                        .expect("session saver finished")
+                    },
+                    call_deadline,
+                    cancel,
+                    "Saving session settings",
+                )
+                .await;
+                if let Err(failure) = saved {
+                    result.session_save_failure(&failure);
+                    write_diagnostic(format!(
+                        "could not save session settings: {}",
+                        failure.message
+                    ))
+                    .await;
+                }
             }
             break Ok(());
         };
-        if let Some(snapshot) = git::snapshot(&turn.settings.cwd, cancel, None, activity).await {
+        if let Some(snapshot) =
+            git::snapshot(&turn.settings.cwd, cancel, None, activity.clone()).await
+        {
             result.snapshot("after", snapshot);
         }
         result.excerpt(&self.answers).await;
+        drop(activity);
         outcome
     }
+}
+
+fn is_memory_limit(finished: &Finished) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(finished.ending, Ending::MemoryLimit)
+    }
+    #[cfg(windows)]
+    {
+        finished.accounting.memory_limit_exceeded && finished.code != Some(0)
+    }
+}
+
+async fn write_diagnostic(message: String) {
+    let write = tokio::task::spawn_blocking(move || {
+        let _ = writeln!(std::io::stderr().lock(), "proxenos: {message}");
+    });
+    let _ = tokio::time::timeout(Duration::from_millis(500), write).await;
+}
+
+fn ambiguous_thread_failure() -> Failure {
+    Failure::new(
+        FailureKind::InvalidRequest,
+        "Multiple starts reported this thread_id with conflicting settings. Start a new session instead.",
+    )
+}
+
+fn busy_failure() -> Failure {
+    Failure::new(
+        FailureKind::Busy,
+        format!("At most {MAX_CONCURRENT} delegations may run at once."),
+    )
 }
 
 async fn await_bounded<T>(
@@ -372,11 +649,16 @@ async fn launch(
         env_set: env_set(),
         env_remove: env_remove(),
         deadline,
+        memory_limit_bytes: turn.memory_limit_bytes,
         capture_limit: CAPTURE_LIMIT,
         temporary_files: vec![scratch.for_child()],
     };
     let mut done = supervise::run(launch, cancel, activity.clone()).await?;
-    let read = if done.spawned && done.error.is_none() && matches!(done.ending, Ending::Exited) {
+    let read = if done.spawned
+        && done.error.is_none()
+        && !is_memory_limit(&done)
+        && matches!(done.ending, Ending::Exited)
+    {
         read_output(output, deadline, cancel, activity).await
     } else {
         Ok((Vec::new(), 0))

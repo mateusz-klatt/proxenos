@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{CommandLine, Failure, Provider, Report, Turn};
+use super::{CommandLine, Failure, Provider, Report, Turn, is_valid_model};
 use crate::envelope::FailureKind;
 use crate::supervise::Finished;
 
@@ -192,6 +192,9 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
     }
     if id_matches {
         report.content = text("response").map(String::from);
+        report.model = text("model")
+            .filter(|s| is_valid_model(s))
+            .map(|s| s.trim().to_owned());
     }
     if !success {
         let reason = text("error").unwrap_or(stderr.trim());

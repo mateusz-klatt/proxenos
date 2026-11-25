@@ -1,15 +1,16 @@
 //! Routes the client's installed providers and the optional protocol test tools.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::background::{self, Background};
 use crate::client::Client;
 use crate::discovery::Discovery;
 use crate::mcp::{Activity, Service, ToolOutcome, ToolSpec, UnknownTool};
-use crate::providers::{self, Settings};
+use crate::providers::{self, RememberedStart};
 
 const MAX_STARTS: usize = 1024;
 
@@ -25,10 +26,21 @@ fn start_limit() -> usize {
     MAX_STARTS
 }
 
-/// Bounded in-memory D19 session map. `Some(settings)` remembers a unique confirmed start;
-/// `None` marks a conflicting duplicate ID. Oldest entries are evicted past `limit`.
+/// State of a cached D19 start entry in [`StartStore`].
+///
+/// Only [`StartEntry::Known`] is dispatchable from memory; it is reached solely after a
+/// confirmed `SaveOutcome::Saved` (or `Unconfigured`) or a matching disk load.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StartEntry {
+    Known(RememberedStart),
+    Unverified(RememberedStart),
+    Ambiguous,
+}
+
+/// Bounded in-memory D19 cache in front of the durable session files. Oldest entries are evicted
+/// past `limit`.
 pub struct StartStore {
-    entries: HashMap<(&'static str, String), Option<Settings>>,
+    entries: HashMap<(&'static str, String), StartEntry>,
     order: VecDeque<(&'static str, String)>,
     limit: usize,
 }
@@ -42,24 +54,84 @@ impl StartStore {
         }
     }
 
-    pub fn get(&self, provider: &'static str, id: &str) -> Option<&Option<Settings>> {
+    pub fn get(&self, provider: &'static str, id: &str) -> Option<&StartEntry> {
         self.entries.get(&(provider, id.into()))
     }
 
-    pub fn record(&mut self, provider: &'static str, id: String, settings: Settings) {
-        let key = (provider, id);
-        if let Some(slot) = self.entries.get_mut(&key) {
-            if slot.as_ref() != Some(&settings) {
-                *slot = None;
-            }
-            return;
-        }
+    fn insert(&mut self, key: (&'static str, String), value: StartEntry) {
         if self.entries.len() == self.limit {
             let oldest = self.order.pop_front().expect("bounded store is non-empty");
             self.entries.remove(&oldest);
         }
         self.order.push_back(key.clone());
-        self.entries.insert(key, Some(settings));
+        self.entries.insert(key, value);
+    }
+
+    pub fn set(&mut self, provider: &'static str, id: String, value: StartEntry) {
+        let key = (provider, id);
+        if let Some(slot) = self.entries.get_mut(&key) {
+            *slot = value;
+            return;
+        }
+        self.insert(key, value);
+    }
+
+    pub fn conflicts_with(
+        &self,
+        provider: &'static str,
+        id: &str,
+        remembered: &RememberedStart,
+    ) -> bool {
+        matches!(self.get(provider, id), Some(StartEntry::Ambiguous))
+            || matches!(
+                self.get(provider, id),
+                Some(StartEntry::Known(existing) | StartEntry::Unverified(existing))
+                    if existing != remembered
+            )
+    }
+
+    pub fn record_unverified(
+        &mut self,
+        provider: &'static str,
+        id: String,
+        remembered: RememberedStart,
+    ) {
+        let next = if self.conflicts_with(provider, &id, &remembered) {
+            StartEntry::Ambiguous
+        } else {
+            StartEntry::Unverified(remembered)
+        };
+        self.set(provider, id, next);
+    }
+
+    pub fn promote(&mut self, provider: &'static str, id: &str, remembered: &RememberedStart) {
+        if let Some(slot) = self.entries.get_mut(&(provider, id.into()))
+            && matches!(slot, StartEntry::Unverified(existing) if existing == remembered)
+        {
+            *slot = StartEntry::Known(remembered.clone());
+        }
+    }
+}
+
+type SessionKey = (&'static str, String);
+type KeyLock = tokio::sync::Mutex<()>;
+
+/// Serialises D19 session saves and reply lookups per `(provider, thread_id)` inside the process.
+#[derive(Default)]
+pub struct SessionLocks {
+    locks: Mutex<HashMap<SessionKey, Weak<KeyLock>>>,
+}
+
+impl SessionLocks {
+    pub fn for_key(&self, provider: &'static str, id: &str) -> Arc<KeyLock> {
+        let mut map = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
+        map.retain(|_, weak| weak.strong_count() > 0);
+        let key = (provider, id.to_owned());
+        map.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            map.insert(key, Arc::downgrade(&lock));
+            lock
+        })
     }
 }
 
@@ -67,7 +139,9 @@ pub struct Registry {
     client: Client,
     pub discovery: Discovery,
     pub answers: crate::envelope::AnswerArchive,
-    pub starts: Mutex<StartStore>,
+    pub starts: Arc<Mutex<StartStore>>,
+    pub session_locks: SessionLocks,
+    pub background: Arc<Background>,
 }
 
 impl Registry {
@@ -75,8 +149,10 @@ impl Registry {
         Self {
             client,
             discovery: Discovery::new(client),
-            starts: Mutex::new(StartStore::new()),
             answers: Default::default(),
+            starts: Arc::new(Mutex::new(StartStore::new())),
+            session_locks: SessionLocks::default(),
+            background: Background::new(),
         }
     }
 }
@@ -91,6 +167,7 @@ impl Service for Registry {
         {
             tools.extend([provider.tool(false), provider.tool(true)]);
         }
+        tools.extend(background::tool_specs());
         tools
     }
 
@@ -101,6 +178,12 @@ impl Service for Registry {
         cancel: CancellationToken,
         activity: Activity,
     ) -> Result<ToolOutcome, UnknownTool> {
+        if name == "await" {
+            return Ok(self.background.call_await(&arguments, &cancel).await);
+        }
+        if name == "cancel" {
+            return Ok(self.background.call_cancel(&arguments));
+        }
         let bare = name.strip_suffix("-reply").unwrap_or(&name);
         if let Some(provider) = providers::ALL
             .iter()
@@ -110,7 +193,7 @@ impl Service for Registry {
                 .delegate(provider, bare != name, arguments, cancel, activity)
                 .await);
         }
-        extra_call(&name, &arguments, &cancel, activity)
+        extra_call(&name, &arguments, &cancel, activity, &self.background)
             .await
             .ok_or(UnknownTool)
     }
@@ -132,8 +215,9 @@ async fn extra_call(
     arguments: &Map<String, Value>,
     cancel: &CancellationToken,
     activity: Activity,
+    background: &Arc<Background>,
 ) -> Option<ToolOutcome> {
-    test_tools::call(name, arguments, cancel, activity).await
+    test_tools::call(name, arguments, cancel, activity, background).await
 }
 
 #[cfg(not(feature = "test-tools"))]
@@ -142,17 +226,20 @@ async fn extra_call(
     _arguments: &Map<String, Value>,
     _cancel: &CancellationToken,
     _activity: Activity,
+    _background: &Arc<Background>,
 ) -> Option<ToolOutcome> {
     None
 }
 
 #[cfg(feature = "test-tools")]
 mod test_tools {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use serde_json::{Map, Value, json};
     use tokio_util::sync::CancellationToken;
 
+    use crate::background::Background;
     use crate::mcp::{Activity, ToolOutcome, ToolSpec};
     use crate::supervise::{self, Finished, Launch};
 
@@ -182,6 +269,7 @@ mod test_tools {
                         "env": { "type": "object", "additionalProperties": { "type": "string" } },
                         "env_remove": { "type": "array", "items": { "type": "string" } },
                         "deadline_ms": { "type": "integer", "minimum": 0 },
+                        "memory_limit_bytes": { "type": "integer", "minimum": 1 },
                         "capture_limit": { "type": "integer", "minimum": 0 },
                         "temp_file": { "type": "string", "description": "Create a new temporary file for the child at this path." },
                         "sharing_retry_ms": { "type": "integer", "minimum": 0, "description": "Windows sharing-violation retry budget for the temporary file, in milliseconds (default 1000)." },
@@ -264,6 +352,7 @@ mod test_tools {
                 .collect(),
             deadline: started
                 + Duration::from_millis(millis(arguments, "deadline_ms").unwrap_or(0)),
+            memory_limit_bytes: millis(arguments, "memory_limit_bytes"),
             capture_limit: usize::try_from(millis(arguments, "capture_limit").unwrap_or(0))
                 .unwrap_or(usize::MAX),
             temporary_files,
@@ -303,6 +392,7 @@ mod test_tools {
                     "stderr_total": finished.stderr.total,
                     "elapsed_ms": finished.elapsed.as_millis(),
                     "last_output_ms": finished.last_output.map(|at| at.as_millis()),
+                    "peak_memory_bytes": finished.accounting.peak_memory_bytes,
                 })
                 .to_string(),
                 is_error: false,
@@ -319,6 +409,7 @@ mod test_tools {
         arguments: &Map<String, Value>,
         cancel: &CancellationToken,
         activity: Activity,
+        background: &Arc<Background>,
     ) -> Option<ToolOutcome> {
         let outcome = match name {
             "test_echo" => ToolOutcome {
@@ -329,6 +420,21 @@ mod test_tools {
                 text: "failed on purpose".to_owned(),
                 is_error: true,
             },
+            "test_panic" if arguments.get("background") == Some(&Value::Bool(true)) => {
+                let bg_cancel = activity.shutdown_token();
+                let task = background
+                    .try_start("test", bg_cancel, activity)
+                    .expect("slot available for background test_panic");
+                let handle = task.handle().to_owned();
+                tokio::spawn(async move {
+                    let _guard = task;
+                    panic!("test_panic background was called");
+                });
+                ToolOutcome {
+                    text: json!({ "handle": handle }).to_string(),
+                    is_error: false,
+                }
+            }
             "test_panic" => panic!("test_panic was called"),
             "test_run" => run_outcome(run(arguments, cancel, activity).await),
             "test_wait" => {

@@ -9,6 +9,7 @@ use std::pin::pin;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +20,19 @@ use crate::platform;
 /// How long a descendant may hold the pipes after the child exits or its group is stopped.
 const DRAIN: Duration = Duration::from_secs(2);
 
+/// Resource usage and limit status observed for one supervised launch (D18).
+#[derive(Clone, Debug, Serialize)]
+pub struct Accounting {
+    pub method: &'static str,
+    pub caveats: &'static [&'static str],
+    pub memory_limit_bytes: Option<u64>,
+    pub peak_memory_bytes: Option<u64>,
+    pub cpu_time_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples: Option<u64>,
+    pub memory_limit_exceeded: bool,
+}
+
 pub struct Launch {
     pub program: PathBuf,
     pub args: Vec<OsString>,
@@ -27,6 +41,8 @@ pub struct Launch {
     pub env_remove: Vec<OsString>,
     /// Absolute deadline checked immediately before native spawn and enforced while running.
     pub deadline: Instant,
+    /// Optional memory limit in bytes (D18). None by default.
+    pub memory_limit_bytes: Option<u64>,
     /// How many bytes to keep from each stream.
     pub capture_limit: usize,
     /// Files created exclusively for this launch. Their ownership passes to the supervisor.
@@ -38,6 +54,8 @@ pub enum Ending {
     Exited,
     TimedOut,
     Cancelled,
+    #[cfg(unix)]
+    MemoryLimit,
 }
 
 pub(crate) enum StartError {
@@ -58,6 +76,8 @@ impl Ending {
             Self::Exited => "exited",
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
+            #[cfg(unix)]
+            Self::MemoryLimit => "memory_limit",
         }
     }
 }
@@ -102,6 +122,8 @@ pub struct Finished {
     pub last_output: Option<Duration>,
     /// Error raised while supervising a child that had already started.
     pub error: Option<io::Error>,
+    /// Resource usage and optional limit observations (D18).
+    pub accounting: Accounting,
 }
 
 /// The worker publishes the status as soon as it reaps the leader. Give file cleanup the
@@ -140,6 +162,7 @@ pub async fn run(
 
     // The platform makes this check immediately before native spawn, after preparing the job
     // or acquiring the Unix spawn lock. A successful spawn transfers its files to the reaper.
+    let memory_limit_bytes = launch.memory_limit_bytes;
     let queued = cancel.child_token();
     let _cancel_abandoned_launch = queued.clone().drop_guard();
     let (publish, launched) = oneshot::channel();
@@ -147,6 +170,7 @@ pub async fn run(
         let child = platform::spawn(
             command,
             &mut launch.temporary_files,
+            memory_limit_bytes,
             activity.clone(),
             || {
                 if queued.is_cancelled() {
@@ -178,6 +202,7 @@ pub async fn run(
                     elapsed: started.elapsed(),
                     last_output: None,
                     error: None,
+                    accounting: platform::empty_accounting(memory_limit_bytes),
                 }),
             };
         }
@@ -196,6 +221,17 @@ pub async fn run(
         };
         let watch = async {
             let remaining = launch.deadline.saturating_duration_since(Instant::now());
+            #[cfg(unix)]
+            let ending = tokio::select! {
+                biased;
+                result = child.wait_for_exit() => match result? {
+                    Ending::Exited => return Ok(Ending::Exited),
+                    ending => ending,
+                },
+                () = cancel.cancelled() => Ending::Cancelled,
+                () = tokio::time::sleep(remaining) => Ending::TimedOut,
+            };
+            #[cfg(windows)]
             let ending = tokio::select! {
                 biased;
                 result = child.wait_for_exit() => return result.map(|()| Ending::Exited),
@@ -213,8 +249,8 @@ pub async fn run(
         }
     };
     // Close the group or job even when a reader or the stop failed. Preserve the first error
-    // alongside the dispatch evidence that was already observed.
-    let status = child.finish().await;
+    // alongside the dispatch evidence and accounting that were already observed.
+    let (status, accounting) = child.finish().await;
     let code = status.as_ref().ok().and_then(ExitStatus::code);
     let signal = status.as_ref().ok().and_then(platform::exit_signal);
     let ending_kind = ending.as_ref().copied().unwrap_or(Ending::Exited);
@@ -229,5 +265,6 @@ pub async fn run(
         stdout,
         stderr,
         error,
+        accounting,
     })
 }
