@@ -50,6 +50,8 @@ pub struct Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientRecord {
     pub client: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
     pub marketplace_dir: String,
     pub binary_path: String,
     pub settings_path: String,
@@ -120,6 +122,23 @@ fn resolve_settings_target(path: &Path) -> Result<ResolvedSettingsPath, Integrat
         target: path.to_path_buf(),
         symlink_target: None,
     })
+}
+
+fn check_settings_target_unchanged(
+    record: &ClientRecord,
+    resolved: &ResolvedSettingsPath,
+    settings_path: &Path,
+) -> Result<(), IntegrateError> {
+    if fs::symlink_metadata(settings_path).is_ok()
+        && (record.settings_is_symlink != resolved.symlink_target.is_some()
+            || record.settings_symlink_target != resolved.symlink_target)
+    {
+        return Err(IntegrateError::Message(format!(
+            "Refusing to modify {}: symlink target changed since integrate.",
+            settings_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn read_optional(path: &Path) -> Result<Option<FileData>, IntegrateError> {
@@ -274,6 +293,9 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
     }
 
     let resolved_settings = resolve_settings_target(&settings_path)?;
+    if let Some(record) = &existing {
+        check_settings_target_unchanged(record, &resolved_settings, &settings_path)?;
+    }
     let (mut settings_map, orig_bytes, orig_mode) = match read_optional(&resolved_settings.target)?
     {
         Some(data) => (
@@ -336,8 +358,11 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
         .map_err(io_err(&plugin_meta_dir))?;
 
     let bfile = backup_path(&state_dir);
-    let backup = if bfile.exists() {
-        Some(state::path_string(&bfile).map_err(io_err(&bfile))?)
+    let (backup, took_backup) = if bfile.exists() {
+        (
+            Some(state::path_string(&bfile).map_err(io_err(&bfile))?),
+            false,
+        )
     } else if existing.is_none()
         && let Some(bytes) = orig_bytes.as_deref()
     {
@@ -345,14 +370,85 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
         state::ensure_private_dir_tree(&state_dir, &backups_dir, &mut created_dirs)
             .map_err(io_err(&backups_dir))?;
         state::write_atomic(&bfile, bytes, None).map_err(io_err(&bfile))?;
-        Some(state::path_string(&bfile).map_err(io_err(&bfile))?)
+        (
+            Some(state::path_string(&bfile).map_err(io_err(&bfile))?),
+            true,
+        )
     } else {
-        None
+        (None, false)
     };
 
     let marketplace_json_path = marketplace_meta_dir.join("marketplace.json");
     let plugin_json_path = plugin_meta_dir.join("plugin.json");
     let mcp_json_path = plugin_dir.join(".mcp.json");
+
+    let had_ekm = settings_map.contains_key("extraKnownMarketplaces");
+    let had_ep = settings_map.contains_key("enabledPlugins");
+    let created_ekm = existing
+        .as_ref()
+        .map_or(!had_ekm, |record| record.created_extra_known_marketplaces);
+    let created_ep = existing
+        .as_ref()
+        .map_or(!had_ep, |record| record.created_enabled_plugins);
+    let settings_created = existing
+        .as_ref()
+        .map_or(orig_bytes.is_none(), |record| record.settings_created);
+
+    let needs_ekm = settings_map
+        .get("extraKnownMarketplaces")
+        .and_then(Value::as_object)
+        .and_then(|map| map.get(MARKETPLACE_NAME))
+        != Some(&desired_marketplace);
+    let needs_ep = settings_map
+        .get("enabledPlugins")
+        .and_then(Value::as_object)
+        .and_then(|map| map.get(ENABLED_PLUGIN_KEY))
+        != Some(&desired_enabled);
+    let will_write_settings = orig_bytes.is_none() || needs_ekm || needs_ep;
+
+    let files = vec![
+        state::path_string(&marketplace_json_path).map_err(io_err(&marketplace_json_path))?,
+        state::path_string(&plugin_json_path).map_err(io_err(&plugin_json_path))?,
+        state::path_string(&mcp_json_path).map_err(io_err(&mcp_json_path))?,
+    ];
+
+    let preserved_sha256 = existing
+        .as_ref()
+        .and_then(|record| record.settings_written_sha256.clone());
+
+    let mut record = ClientRecord {
+        client: CLIENT_CLAUDE_CODE.to_owned(),
+        pending: true,
+        marketplace_dir: marketplace_str.clone(),
+        binary_path: binary_str.clone(),
+        settings_path: settings_str.clone(),
+        settings_created,
+        settings_is_symlink: resolved_settings.symlink_target.is_some(),
+        settings_symlink_target: resolved_settings.symlink_target,
+        created_extra_known_marketplaces: created_ekm,
+        created_enabled_plugins: created_ep,
+        backup_path: backup,
+        settings_written_sha256: if will_write_settings {
+            None
+        } else {
+            preserved_sha256.clone()
+        },
+        entries: RecordedEntries {
+            extra_known_marketplace: desired_marketplace.clone(),
+            enabled_plugin: desired_enabled.clone(),
+        },
+        files,
+        created_dirs,
+    };
+
+    // Persist an intent manifest before modifying plugin files or settings.json so an interrupted
+    // write never strands entries as foreign or hides them from `--remove`.
+    manifest.schema_version = MANIFEST_SCHEMA_VERSION;
+    manifest
+        .clients
+        .insert(CLIENT_CLAUDE_CODE.to_owned(), record.clone());
+    let pending_value = serde_json::to_value(&manifest).expect("manifest serializes");
+    write_json_atomic(&manifest_file, &pending_value, None)?;
 
     let marketplace_json = json!({
         "name": MARKETPLACE_NAME,
@@ -388,89 +484,48 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
     write_json_atomic(&plugin_json_path, &plugin_json, None)?;
     write_json_atomic(&mcp_json_path, &mcp_json, None)?;
 
-    let had_ekm = settings_map.contains_key("extraKnownMarketplaces");
-    let had_ep = settings_map.contains_key("enabledPlugins");
-    let created_ekm = existing
-        .as_ref()
-        .map_or(!had_ekm, |record| record.created_extra_known_marketplaces);
-    let created_ep = existing
-        .as_ref()
-        .map_or(!had_ep, |record| record.created_enabled_plugins);
-    let settings_created = existing
-        .as_ref()
-        .map_or(orig_bytes.is_none(), |record| record.settings_created);
-
-    let needs_ekm = settings_map
-        .get("extraKnownMarketplaces")
-        .and_then(Value::as_object)
-        .and_then(|map| map.get(MARKETPLACE_NAME))
-        != Some(&desired_marketplace);
-    let needs_ep = settings_map
-        .get("enabledPlugins")
-        .and_then(Value::as_object)
-        .and_then(|map| map.get(ENABLED_PLUGIN_KEY))
-        != Some(&desired_enabled);
-
-    let settings_written_sha256 = if orig_bytes.is_none() || needs_ekm || needs_ep {
+    // Byte-exact restore is only eligible when the bytes match what the backup-taking integrate
+    // wrote; any later rewrite clears the digest so `--remove` edits semantically instead.
+    let settings_written_sha256 = if will_write_settings {
         settings_map
             .entry("extraKnownMarketplaces".to_owned())
             .or_insert_with(|| Value::Object(Map::new()))
             .as_object_mut()
             .expect("extraKnownMarketplaces validated as object")
-            .insert(MARKETPLACE_NAME.to_owned(), desired_marketplace.clone());
+            .insert(MARKETPLACE_NAME.to_owned(), desired_marketplace);
         settings_map
             .entry("enabledPlugins".to_owned())
             .or_insert_with(|| Value::Object(Map::new()))
             .as_object_mut()
             .expect("enabledPlugins validated as object")
-            .insert(ENABLED_PLUGIN_KEY.to_owned(), desired_enabled.clone());
+            .insert(ENABLED_PLUGIN_KEY.to_owned(), desired_enabled);
         let written = write_json_atomic(
             &resolved_settings.target,
             &Value::Object(settings_map),
             orig_mode,
         )?;
-        Some(sha256_hex(&written))
+        took_backup.then(|| sha256_hex(&written))
     } else {
-        existing
-            .as_ref()
-            .and_then(|record| record.settings_written_sha256.clone())
+        preserved_sha256
     };
-
-    let files = vec![
-        state::path_string(&marketplace_json_path).map_err(io_err(&marketplace_json_path))?,
-        state::path_string(&plugin_json_path).map_err(io_err(&plugin_json_path))?,
-        state::path_string(&mcp_json_path).map_err(io_err(&mcp_json_path))?,
-    ];
 
     let status_line = match &existing {
         None => "Integrated Proxenos with Claude Code.",
-        Some(previous) if previous.binary_path != binary_str => {
+        Some(previous) if previous.pending || previous.binary_path != binary_str => {
             "Updated Proxenos Claude Code integration."
         }
         Some(_) => "Proxenos Claude Code integration is up to date.",
     };
 
-    let record = ClientRecord {
-        client: CLIENT_CLAUDE_CODE.to_owned(),
-        marketplace_dir: marketplace_str.clone(),
-        binary_path: binary_str.clone(),
-        settings_path: settings_str.clone(),
-        settings_created,
-        settings_is_symlink: resolved_settings.symlink_target.is_some(),
-        settings_symlink_target: resolved_settings.symlink_target,
-        created_extra_known_marketplaces: created_ekm,
-        created_enabled_plugins: created_ep,
-        backup_path: backup,
-        settings_written_sha256,
-        entries: RecordedEntries {
-            extra_known_marketplace: desired_marketplace,
-            enabled_plugin: desired_enabled,
-        },
-        files,
-        created_dirs,
-    };
+    #[cfg(feature = "test-tools")]
+    if std::env::var_os("PROXENOS_TEST_FAIL_FINAL_MANIFEST").is_some() {
+        return Err(IntegrateError::Message(
+            "Injected failure before committing final integration manifest.".to_owned(),
+        ));
+    }
 
-    manifest.schema_version = MANIFEST_SCHEMA_VERSION;
+    record.pending = false;
+    record.settings_written_sha256 = settings_written_sha256;
     manifest
         .clients
         .insert(CLIENT_CLAUDE_CODE.to_owned(), record);
@@ -521,17 +576,15 @@ pub fn remove_claude_code() -> Result<String, IntegrateError> {
 
     let settings_path = Path::new(&record.settings_path);
     let resolved_settings = resolve_settings_target(settings_path)?;
+    check_settings_target_unchanged(&record, &resolved_settings, settings_path)?;
     let mut refused = Vec::new();
     if let Some(data) = read_optional(&resolved_settings.target)? {
-        let unchanged = record
-            .settings_written_sha256
-            .as_deref()
-            .is_some_and(|expected| expected == sha256_hex(&data.bytes));
-        let restore_bytes = if unchanged {
-            match &record.backup_path {
-                Some(path) => read_optional(Path::new(path))?.map(|file| file.bytes),
-                None => None,
-            }
+        let restore_bytes = if let (Some(expected), Some(backup_path)) = (
+            record.settings_written_sha256.as_deref(),
+            record.backup_path.as_deref(),
+        ) && expected == sha256_hex(&data.bytes)
+        {
+            read_optional(Path::new(backup_path))?.map(|file| file.bytes)
         } else {
             None
         };

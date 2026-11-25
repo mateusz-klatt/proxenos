@@ -1315,6 +1315,23 @@ fn settings_symlink_is_preserved_across_integrate_and_remove_and_dangling_link_i
 
 #[test]
 fn symlinked_binary_keeps_link_path_and_doctor_warns_on_path_mismatch() {
+    #[cfg(windows)]
+    if let Some(child_path) = std::env::var_os("PROXENOS_TEST_WIN_BARE_FALLBACK_PATH") {
+        let out = Command::new("proxenos.exe")
+            .args(["integrate", "claude-code"])
+            .env_remove("PROXENOS_TEST_WIN_BARE_FALLBACK_PATH")
+            .env("PATH", child_path)
+            .output()
+            .expect("bare proxenos.exe launches via helper PATH");
+        assert!(
+            out.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
     let sb = Sandbox::new();
     let target_bin = sb.hard_link_binary("cellar/0.1.0/bin");
     let link_dir = sb.root.join("brew-bin");
@@ -1426,19 +1443,27 @@ fn symlinked_binary_keeps_link_path_and_doctor_warns_on_path_mismatch() {
     };
     #[cfg(windows)]
     let (fallback_out, expected_fallback) = {
-        // On Windows, Rust's Command does not search the child's current_dir; with child PATH set
-        // to an absent directory, CreateProcessW resolves bare `proxenos.exe` from Cargo's test
-        // environment (proxenos_bin()) and passes bare argv[0] = "proxenos.exe" while the child's
-        // own PATH has no match, exercising the current_exe() fallback.
-        let out = sb
-            .command_for(Path::new("proxenos.exe"), &["integrate", "claude-code"])
-            .output()
-            .unwrap();
-        (out, absolute_path_string(proxenos_bin()))
+        // Re-exec this test binary with its own PATH set to target_bin's directory so the
+        // intermediate process resolves bare `proxenos.exe` from its own PATH (independent of
+        // Cargo's environment), while spawning the child with an absent PATH to exercise the
+        // current_exe() fallback.
+        let mut helper = sb.command_for(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--exact",
+                "symlinked_binary_keeps_link_path_and_doctor_warns_on_path_mismatch",
+                "--nocapture",
+            ],
+        );
+        helper
+            .env("PATH", target_bin.parent().unwrap())
+            .env("PROXENOS_TEST_WIN_BARE_FALLBACK_PATH", &sb.absent_path);
+        (helper.output().unwrap(), absolute_path_string(&target_bin))
     };
     assert!(
         fallback_out.status.success(),
-        "stderr: {}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&fallback_out.stdout),
         String::from_utf8_lossy(&fallback_out.stderr)
     );
     assert_eq!(
@@ -1476,6 +1501,180 @@ fn symlinked_binary_keeps_link_path_and_doctor_warns_on_path_mismatch() {
         "proxenos",
         "{mismatch_report}"
     );
+}
+
+#[test]
+fn healing_rerun_clears_byte_restore_and_preserves_later_user_edits() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.settings_path().parent().unwrap()).unwrap();
+    fs::write(sb.settings_path(), "{\n  \"theme\": \"dark\"\n}\n").unwrap();
+
+    assert!(sb.run(&["integrate", "claude-code"]).status.success());
+
+    // User edits an unrelated key, adds a new key, and deletes one managed entry.
+    let mut settings = read_json(&sb.settings_path());
+    settings["theme"] = json!("light");
+    settings["userAdded"] = json!("keep-me");
+    settings["enabledPlugins"]
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("proxenos@proxenos");
+    fs::write(
+        sb.settings_path(),
+        format!("{}\n", serde_json::to_string_pretty(&settings).unwrap()),
+    )
+    .unwrap();
+
+    // Rerun heals the missing managed entry and drops byte-exact restore eligibility.
+    let heal = sb.run(&["integrate", "claude-code"]);
+    assert!(
+        heal.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&heal.stderr)
+    );
+    let manifest = read_json(&sb.manifest_path());
+    assert!(
+        manifest["clients"]["claude-code"]
+            .get("settings_written_sha256")
+            .is_none(),
+        "healing rerun must clear byte-restore digest: {manifest}"
+    );
+
+    // --remove must edit semantically so both user edits survive (not overwrite with stale backup).
+    let rm = sb.run(&["integrate", "claude-code", "--remove"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    let after = read_json(&sb.settings_path());
+    assert_eq!(after["theme"], "light", "{after}");
+    assert_eq!(after["userAdded"], "keep-me", "{after}");
+    assert!(after.get("extraKnownMarketplaces").is_none(), "{after}");
+    assert!(after.get("enabledPlugins").is_none(), "{after}");
+}
+
+#[test]
+fn retargeted_settings_symlink_is_refused_on_rerun_and_remove() {
+    let sb = Sandbox::new();
+    let dotfiles = sb.root.join("dotfiles");
+    fs::create_dir_all(&dotfiles).unwrap();
+    let target_a = dotfiles.join("a.json");
+    let target_b = dotfiles.join("b.json");
+    let orig_a = "{\n  \"origin\": \"A\"\n}\n";
+    let orig_b = "{\n  \"origin\": \"B\"\n}\n";
+    fs::write(&target_a, orig_a).unwrap();
+    fs::write(&target_b, orig_b).unwrap();
+    fs::create_dir_all(sb.settings_path().parent().unwrap()).unwrap();
+    if !try_file_symlink(&target_a, &sb.settings_path()).unwrap() {
+        // Unprivileged Windows fallback: replace regular settings.json with a directory junction
+        // after integrate so rerun and --remove still exercise check_settings_target_unchanged.
+        #[cfg(windows)]
+        {
+            fs::write(sb.settings_path(), orig_a).unwrap();
+            assert!(sb.run(&["integrate", "claude-code"]).status.success());
+            fs::remove_file(sb.settings_path()).unwrap();
+            let status = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(sb.settings_path())
+                .arg(&dotfiles)
+                .status()
+                .expect("cmd mklink /J runs");
+            assert!(status.success(), "mklink /J failed: {status}");
+            let rerun = sb.run(&["integrate", "claude-code"]);
+            assert_eq!(rerun.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&rerun.stderr).contains("symlink target changed"));
+            let rm = sb.run(&["integrate", "claude-code", "--remove"]);
+            assert_eq!(rm.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&rm.stderr).contains("symlink target changed"));
+        }
+        return;
+    }
+
+    assert!(sb.run(&["integrate", "claude-code"]).status.success());
+    let a_after_integrate = fs::read_to_string(&target_a).unwrap();
+
+    // Retarget the symlink from A to B.
+    fs::remove_file(sb.settings_path()).unwrap();
+    assert!(try_file_symlink(&target_b, &sb.settings_path()).unwrap());
+
+    // Rerun must refuse and leave both A and B untouched.
+    let rerun = sb.run(&["integrate", "claude-code"]);
+    assert_eq!(rerun.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&rerun.stderr).contains("symlink target changed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    assert_eq!(fs::read_to_string(&target_b).unwrap(), orig_b);
+    assert_eq!(fs::read_to_string(&target_a).unwrap(), a_after_integrate);
+
+    // --remove must also refuse and never overwrite B with A's backup.
+    let rm = sb.run(&["integrate", "claude-code", "--remove"]);
+    assert_eq!(rm.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&rm.stderr).contains("symlink target changed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(fs::read_to_string(&target_b).unwrap(), orig_b);
+    assert_eq!(fs::read_to_string(&target_a).unwrap(), a_after_integrate);
+    assert!(sb.manifest_path().exists());
+}
+
+#[test]
+fn non_executable_file_on_path_is_ignored_by_doctor() {
+    let sb = Sandbox::new();
+    assert!(sb.run(&["integrate", "claude-code"]).status.success());
+
+    let decoy_dir = sb.root.join("decoy-path");
+    fs::create_dir_all(&decoy_dir).unwrap();
+    // On Unix: mode 0644 (non-executable). On Windows: no PATHEXT extension.
+    let decoy = decoy_dir.join("proxenos");
+    fs::write(&decoy, "not an executable").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&decoy, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let mut cmd = sb.command(&["doctor", "--json"]);
+    cmd.env("PATH", &decoy_dir);
+    let out = cmd.output().unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(out.status.success(), "{report}");
+    assert_eq!(
+        find_check(&report, "claude-code.registration")["status"],
+        "ok",
+        "{report}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_parent_directory_propagates_fsync_open_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sb = Sandbox::new();
+    let claude_dir = sb.home.join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    // 0300 allows creating temp files and renaming inside the directory, but denies O_RDONLY
+    // open for the post-rename directory fsync.
+    fs::set_permissions(&claude_dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+    let out = sb.run(&["integrate", "claude-code"]);
+    // Restore permissions before assertions so Sandbox::drop always cleans up.
+    fs::set_permissions(&claude_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("settings.json"), "stderr: {stderr}");
 }
 
 #[cfg(unix)]
@@ -1566,7 +1765,7 @@ mod with_stubs {
             String::from_utf8_lossy(&out.stderr)
         );
         let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(report["ok"], true);
+        assert_eq!(report["ok"], true, "{report}");
         for check in report["checks"].as_array().unwrap() {
             assert_eq!(check["status"], "ok", "check failed: {check}");
         }
@@ -1622,11 +1821,19 @@ mod with_stubs {
         let mut cmd = sb.command(&["doctor", "--json"]);
         cmd.env("PATH", &bin_dir).env("PROXENOS_STUB_DIR", &sb.root);
         let out = cmd.output().unwrap();
-        assert_eq!(out.status.code(), Some(1));
         let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(report["ok"], false);
-        assert_eq!(find_check(&report, "cli.codex")["status"], "fail");
-        assert_eq!(find_check(&report, "cli.antigravity")["status"], "warn");
+        assert_eq!(out.status.code(), Some(1), "{report}");
+        assert_eq!(report["ok"], false, "{report}");
+        assert_eq!(
+            find_check(&report, "cli.codex")["status"],
+            "fail",
+            "{report}"
+        );
+        assert_eq!(
+            find_check(&report, "cli.antigravity")["status"],
+            "warn",
+            "{report}"
+        );
     }
 
     #[test]
@@ -1783,7 +1990,27 @@ mod with_stubs {
             "{bad_list_report}"
         );
 
-        // 6. Hung server hits deadline and is killed and reaped.
+        // 6a. An already-expired deadline stops before spawning the handshake child.
+        let never_file = sb.root.join("never.lock");
+        set_stub_args(json!([format!("hold:{}", never_file.display())]));
+        let mut zero_cmd = sb.command(&["doctor", "--json"]);
+        zero_cmd.env("PROXENOS_TEST_HANDSHAKE_TIMEOUT_MS", "0");
+        let zero_out = zero_cmd.output().unwrap();
+        let zero_report: Value = serde_json::from_slice(&zero_out.stdout).unwrap();
+        assert_eq!(zero_out.status.code(), Some(1), "{zero_report}");
+        assert!(
+            find_check(&zero_report, "claude-code.handshake")["message"]
+                .as_str()
+                .unwrap()
+                .contains("deadline"),
+            "{zero_report}"
+        );
+        assert!(
+            !never_file.exists(),
+            "expired handshake deadline must skip spawn: {zero_report}"
+        );
+
+        // 6b. Hung server hits deadline and is killed and reaped.
         let lock_file = sb.root.join("hung.lock");
         set_stub_args(json!([
             format!("hold:{}", lock_file.display()),
@@ -1813,6 +2040,105 @@ mod with_stubs {
             file.try_lock()
                 .expect("hung handshake child was killed and released its lock");
         }
+
+        // 6c. Handshake spawns under D6 platform isolation so descendants (grandchild ignoring
+        // SIGTERM on Unix / inside Job Object on Windows) are killed too.
+        let gc_lock = sb.root.join("grandchild.lock");
+        set_stub_args(json!([
+            format!("grandchild:{}", gc_lock.display()),
+            "sleep:60000"
+        ]));
+        let gc_started = Instant::now();
+        let gc_out = sb.run(&["doctor", "--json"]);
+        assert!(
+            gc_started.elapsed() < Duration::from_secs(10),
+            "doctor waited on grandchild: {:?}",
+            gc_started.elapsed()
+        );
+        let gc_report: Value = serde_json::from_slice(&gc_out.stdout).unwrap();
+        assert_eq!(gc_out.status.code(), Some(1), "{gc_report}");
+        assert!(
+            sb.root.join("grandchild.lock.ready").exists(),
+            "grandchild never started: {gc_report}"
+        );
+        let gc_file = fs::File::options().write(true).open(&gc_lock).unwrap();
+        let lock_deadline = Instant::now() + Duration::from_secs(2);
+        while gc_file.try_lock().is_err() {
+            assert!(
+                Instant::now() < lock_deadline,
+                "grandchild survived handshake cleanup: {gc_report}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // 7. Response line larger than 1 MiB fails handshake cleanly.
+        set_stub_args(json!(["flood:1100000", "stdin"]));
+        let flood_out = sb.run(&["doctor", "--json"]);
+        let flood_report: Value = serde_json::from_slice(&flood_out.stdout).unwrap();
+        assert_eq!(flood_out.status.code(), Some(1), "{flood_report}");
+        assert!(
+            find_check(&flood_report, "claude-code.handshake")["message"]
+                .as_str()
+                .unwrap()
+                .contains("exceeded 1048576 bytes"),
+            "{flood_report}"
+        );
+    }
+
+    #[test]
+    fn failed_final_manifest_commit_is_removable_and_recoverable() {
+        // Variant A: final manifest commit fails -> --remove still recognizes pending manifest and
+        // cleans up settings, plugin files, backup, manifest, and empty dirs.
+        let sb = Sandbox::new();
+        fs::create_dir_all(sb.settings_path().parent().unwrap()).unwrap();
+        fs::write(sb.settings_path(), "{\n  \"keep\": 1\n}\n").unwrap();
+
+        let mut fail_cmd = sb.command(&["integrate", "claude-code"]);
+        fail_cmd.env("PROXENOS_TEST_FAIL_FINAL_MANIFEST", "1");
+        let failed = fail_cmd.output().unwrap();
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(
+            read_json(&sb.manifest_path())["clients"]["claude-code"]["pending"],
+            true
+        );
+
+        let rm = sb.run(&["integrate", "claude-code", "--remove"]);
+        assert!(
+            rm.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&rm.stderr)
+        );
+        let after_rm = read_json(&sb.settings_path());
+        assert_eq!(after_rm, json!({ "keep": 1 }));
+        assert!(!sb.marketplace_dir().exists());
+        assert!(!sb.manifest_path().exists());
+        assert!(!sb.backup_path().exists());
+
+        // Variant B: final manifest commit fails -> subsequent integrate recognizes pending
+        // manifest as ours (not foreign) and commits pending = false.
+        let sb2 = Sandbox::new();
+        let mut fail_cmd2 = sb2.command(&["integrate", "claude-code"]);
+        fail_cmd2.env("PROXENOS_TEST_FAIL_FINAL_MANIFEST", "1");
+        assert_eq!(fail_cmd2.output().unwrap().status.code(), Some(1));
+        assert_eq!(
+            read_json(&sb2.manifest_path())["clients"]["claude-code"]["pending"],
+            true
+        );
+
+        let recover = sb2.run(&["integrate", "claude-code"]);
+        assert!(
+            recover.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&recover.stderr)
+        );
+        let manifest2 = read_json(&sb2.manifest_path());
+        assert!(
+            manifest2["clients"]["claude-code"].get("pending").is_none(),
+            "pending flag should be cleared after recovery: {manifest2}"
+        );
+        let doc = sb2.run(&["doctor", "--json"]);
+        let report: Value = serde_json::from_slice(&doc.stdout).unwrap();
+        assert!(doc.status.success(), "{report}");
     }
 
     #[cfg(windows)]

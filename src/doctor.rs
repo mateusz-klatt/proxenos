@@ -2,25 +2,29 @@
 
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::ChildStdout;
 use tokio_util::sync::CancellationToken;
 
 use crate::discovery::{self, CliStatus};
 use crate::integrate::{ENABLED_PLUGIN_KEY, MARKETPLACE_NAME, MCP_SERVER_NAME, PLUGIN_NAME};
 use crate::mcp::Activity;
+use crate::platform;
 use crate::providers::{self, Provider};
 use crate::state;
+use crate::supervise::{Ending, StartError};
 
 const REPORT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_CLEAN_EXIT_GRACE: Duration = Duration::from_secs(2);
+const MAX_HANDSHAKE_LINE_BYTES: usize = 1 << 20;
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -86,12 +90,6 @@ enum HandshakeError {
     TimedOut(Duration),
 }
 
-impl From<io::Error> for HandshakeError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
 impl fmt::Display for HandshakeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -117,7 +115,6 @@ fn handshake_timeout() -> Duration {
     if let Some(ms) = std::env::var("PROXENOS_TEST_HANDSHAKE_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|&n| n > 0)
     {
         return Duration::from_millis(ms);
     }
@@ -388,19 +385,42 @@ fn provider_check(provider: &Provider, status: CliStatus) -> Check {
     }
 }
 
+async fn read_bounded_line(
+    reader: &mut BufReader<ChildStdout>,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, HandshakeError> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(HandshakeError::Io)?;
+        if available.is_empty() {
+            return Ok((!bytes.is_empty()).then_some(bytes));
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let take = newline.map_or(available.len(), |pos| pos + 1);
+        if bytes.len() + take > limit {
+            return Err(HandshakeError::Protocol(format!(
+                "MCP server response line exceeded {limit} bytes."
+            )));
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(Some(bytes));
+        }
+    }
+}
+
 async fn read_response(
     reader: &mut BufReader<ChildStdout>,
     expected_id: i64,
 ) -> Result<Value, HandshakeError> {
-    let mut line = String::new();
     loop {
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
+        let Some(line) = read_bounded_line(reader, MAX_HANDSHAKE_LINE_BYTES).await? else {
             return Err(HandshakeError::Protocol(
                 "MCP server closed stdout before answering.".to_owned(),
             ));
-        }
-        let frame: Value = serde_json::from_str(&line).map_err(|err| {
+        };
+        let frame: Value = serde_json::from_slice(&line).map_err(|err| {
             HandshakeError::Protocol(format!("MCP server returned invalid JSON: {err}"))
         })?;
         if frame.get("id") == Some(&json!(expected_id)) {
@@ -414,18 +434,62 @@ async fn read_response(
     }
 }
 
-async fn run_handshake(command: &Path, args: &[String]) -> Result<HandshakeInfo, HandshakeError> {
+async fn write_stdin(writer: &mut Option<io::PipeWriter>, payload: String) -> io::Result<()> {
+    let mut pipe = writer.take().expect("stdin is open");
+    let (pipe, result) = tokio::task::spawn_blocking(move || {
+        let result = pipe
+            .write_all(payload.as_bytes())
+            .and_then(|()| pipe.flush());
+        (pipe, result)
+    })
+    .await
+    .expect("handshake stdin writer finished");
+    *writer = Some(pipe);
+    result
+}
+
+async fn run_handshake(
+    command: &Path,
+    args: &[String],
+    activity: Activity,
+) -> Result<HandshakeInfo, HandshakeError> {
     let limit = handshake_timeout();
-    let mut child = Command::new(command)
-        .args(args)
-        .stdin(Stdio::piped())
+    let deadline = Instant::now() + limit;
+    let tokio_deadline = tokio::time::Instant::from_std(deadline);
+
+    let (stdin_reader, stdin_writer) = io::pipe().map_err(HandshakeError::Io)?;
+    let mut cmd = Command::new(command);
+    cmd.args(args)
+        .stdin(stdin_reader)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin is piped");
+        .stderr(Stdio::piped());
+
+    // Spawn via D6's platform layer under the same deadline so the child runs in its own Unix
+    // session/process group or Windows kill-on-close job and descendants are stopped too.
+    let launched = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        platform::spawn(cmd, &mut files, activity, || {
+            (Instant::now() < deadline)
+                .then_some(())
+                .ok_or(StartError::Skipped(Ending::TimedOut))
+        })
+    });
+    let spawned = tokio::time::timeout_at(tokio_deadline, launched)
+        .await
+        .map(|res| res.expect("handshake spawn worker finished"));
+    let mut child = match spawned {
+        Ok(Ok(child)) => child,
+        Ok(Err(StartError::Io(err))) => return Err(HandshakeError::Io(err)),
+        Ok(Err(StartError::Skipped(_))) | Err(_) => return Err(HandshakeError::TimedOut(limit)),
+    };
+
     let stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let drain_stderr = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+    });
     let mut reader = BufReader::new(stdout);
+    let mut stdin = Some(stdin_writer);
 
     let exchange = async {
         let init_req = json!({
@@ -441,8 +505,9 @@ async fn run_handshake(command: &Path, args: &[String]) -> Result<HandshakeInfo,
                 }
             }
         });
-        stdin.write_all(format!("{init_req}\n").as_bytes()).await?;
-        stdin.flush().await?;
+        write_stdin(&mut stdin, format!("{init_req}\n"))
+            .await
+            .map_err(HandshakeError::Io)?;
         let init = read_response(&mut reader, 1).await?;
 
         let initialized = json!({
@@ -455,10 +520,9 @@ async fn run_handshake(command: &Path, args: &[String]) -> Result<HandshakeInfo,
             "method": "tools/list",
             "params": {}
         });
-        stdin
-            .write_all(format!("{initialized}\n{list_req}\n").as_bytes())
-            .await?;
-        stdin.flush().await?;
+        write_stdin(&mut stdin, format!("{initialized}\n{list_req}\n"))
+            .await
+            .map_err(HandshakeError::Io)?;
         let listed = read_response(&mut reader, 2).await?;
 
         let Some(entries) = listed["result"]["tools"].as_array() else {
@@ -478,21 +542,20 @@ async fn run_handshake(command: &Path, args: &[String]) -> Result<HandshakeInfo,
         })
     };
 
-    let outcome = match tokio::time::timeout(limit, exchange).await {
+    let outcome = match tokio::time::timeout_at(tokio_deadline, exchange).await {
         Ok(result) => result,
         Err(_) => Err(HandshakeError::TimedOut(limit)),
     };
 
+    // Close pipes so a healthy server exits cleanly before finish() kills the group/job and reaps
+    // within its own 2-second bound.
     drop(stdin);
     drop(reader);
-    let clean = outcome.is_ok()
-        && tokio::time::timeout(Duration::from_secs(2), child.wait())
-            .await
-            .is_ok();
-    if !clean {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    if outcome.is_ok() {
+        let _ = tokio::time::timeout(HANDSHAKE_CLEAN_EXIT_GRACE, child.wait_for_exit()).await;
     }
+    let _ = child.finish().await;
+    drain_stderr.abort();
 
     outcome
 }
@@ -500,6 +563,7 @@ async fn run_handshake(command: &Path, args: &[String]) -> Result<HandshakeInfo,
 async fn check_handshake(
     registration: Option<&RegisteredCommand>,
     any_provider_found: bool,
+    activity: Activity,
 ) -> Check {
     let Some(reg) = registration else {
         return Check::new(
@@ -510,7 +574,7 @@ async fn check_handshake(
         );
     };
     let command_str = reg.command.display().to_string();
-    match run_handshake(&reg.command, &reg.args).await {
+    match run_handshake(&reg.command, &reg.args, activity).await {
         Ok(info) => {
             let details = Some(json!({
                 "command": command_str,
@@ -577,7 +641,8 @@ pub fn run(json_output: bool) -> (bool, String) {
             cli_checks.push(provider_check(provider, status));
         }
 
-        let handshake_check = check_handshake(registration.as_ref(), any_provider_found).await;
+        let handshake_check =
+            check_handshake(registration.as_ref(), any_provider_found, activity.clone()).await;
         drop(activity);
         let _ = tokio::time::timeout(Duration::from_secs(2), finished.recv()).await;
         (cli_checks, handshake_check)

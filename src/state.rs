@@ -68,15 +68,16 @@ fn matches_canonical(candidate: &Path, expected_canonical: &Path) -> bool {
     fs::canonicalize(candidate).is_ok_and(|resolved| resolved == expected_canonical)
 }
 
-/// Searches absolute `PATH` entries for `name` (also trying `.exe` on Windows) matching
-/// `predicate`, returning the `PATH` entry itself without resolving symlinks.
+/// Searches absolute `PATH` entries for an executable named `name` (using `PATHEXT` on Windows
+/// and executable mode bits on Unix) matching `predicate`, returning the `PATH` entry itself
+/// without resolving symlinks.
 pub fn find_on_path(name: &Path, mut predicate: impl FnMut(&Path) -> bool) -> Option<PathBuf> {
     let raw = env::var_os("PATH")?;
     let names = path_candidate_names(name);
     for dir in env::split_paths(&raw).filter(|dir| dir.is_absolute()) {
         for filename in &names {
             let candidate = normalize_path(dir.join(filename));
-            if candidate.is_file() && predicate(&candidate) {
+            if is_executable_file(&candidate) && predicate(&candidate) {
                 return Some(candidate);
             }
         }
@@ -84,12 +85,41 @@ pub fn find_on_path(name: &Path, mut predicate: impl FnMut(&Path) -> bool) -> Op
     None
 }
 
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && (meta.permissions().mode() & 0o111) != 0)
+}
+
+#[cfg(windows)]
+fn pathext_extensions() -> Vec<String> {
+    let env_val = env::var("PATHEXT").ok().filter(|s| !s.trim().is_empty());
+    let raw = env_val.as_deref().unwrap_or(".COM;.EXE;.BAT;.CMD");
+    raw.split(';')
+        .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .collect()
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    let exts = pathext_extensions();
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)))
+}
+
 #[cfg(windows)]
 fn path_candidate_names(name: &Path) -> Vec<std::ffi::OsString> {
-    let mut names = vec![
-        name.as_os_str().to_owned(),
-        name.with_extension("exe").into_os_string(),
-    ];
+    let mut names = vec![name.as_os_str().to_owned()];
+    for ext in pathext_extensions() {
+        let mut with_ext = name.as_os_str().to_owned();
+        with_ext.push(".");
+        with_ext.push(ext);
+        names.push(with_ext);
+    }
     names.dedup();
     names
 }
@@ -101,12 +131,16 @@ fn path_candidate_names(name: &Path) -> Vec<std::ffi::OsString> {
 
 #[cfg(windows)]
 pub fn normalize_path(path: PathBuf) -> PathBuf {
-    let stripped = path
-        .to_str()
-        .and_then(|s| s.strip_prefix(r"\\?\"))
-        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
-        .map(PathBuf::from);
-    stripped.unwrap_or(path)
+    let Some(rest) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) else {
+        return path;
+    };
+    if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    if rest.as_bytes().get(1) == Some(&b':') {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 #[cfg(not(windows))]
@@ -196,7 +230,7 @@ pub fn write_atomic(path: &Path, content: &[u8], preserve_mode: Option<u32>) -> 
         drop(file);
         fs::rename(&temp, path)?;
         #[cfg(unix)]
-        let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        fs::File::open(parent)?.sync_all()?;
         Ok(())
     };
     let result = write_and_rename();
@@ -204,4 +238,29 @@ pub fn write_atomic(path: &Path, content: &[u8], preserve_mode: Option<u32>) -> 
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_path_handles_drive_unc_and_other_prefixes() {
+        assert_eq!(
+            normalize_path(PathBuf::from(r"\\?\C:\Users\alice\proxenos.exe")),
+            PathBuf::from(r"C:\Users\alice\proxenos.exe")
+        );
+        assert_eq!(
+            normalize_path(PathBuf::from(r"\\?\UNC\server\share\proxenos.exe")),
+            PathBuf::from(r"\\server\share\proxenos.exe")
+        );
+        assert_eq!(
+            normalize_path(PathBuf::from(r"\\?\Volume{1}\proxenos.exe")),
+            PathBuf::from(r"\\?\Volume{1}\proxenos.exe")
+        );
+        assert_eq!(
+            normalize_path(PathBuf::from(r"C:\plain\proxenos.exe")),
+            PathBuf::from(r"C:\plain\proxenos.exe")
+        );
+    }
 }
