@@ -1,12 +1,13 @@
-//! What supervising a child needs from the operating system (D6). The only place, apart from
-//! the test stub, where `unsafe` is allowed.
+//! Operating system support for D6.
 
+#[cfg(unix)]
+mod session;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::{Group, exit_signal, leave_terminal, prepare};
+pub use unix::{exit_signal, spawn};
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{Group, exit_signal, prepare};
+pub use windows::{exit_signal, spawn};

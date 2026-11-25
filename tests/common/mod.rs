@@ -40,7 +40,7 @@ pub struct Server {
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     stderr: Arc<Mutex<String>>,
-    stderr_reader: Option<thread::JoinHandle<()>>,
+    stderr_done: Option<Receiver<()>>,
 }
 
 impl Server {
@@ -77,12 +77,14 @@ impl Server {
         let stderr = child.stderr.take().expect("stderr is piped");
         let captured = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&captured);
-        let stderr_reader = thread::spawn(move || {
+        let (drained, stderr_done) = channel();
+        thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 let mut text = sink.lock().expect("stderr lock");
                 text.push_str(&line);
                 text.push('\n');
             }
+            let _ = drained.send(());
         });
         let (sender, lines) = channel();
         let server = Self {
@@ -90,7 +92,7 @@ impl Server {
             stdin,
             lines,
             stderr: captured,
-            stderr_reader: Some(stderr_reader),
+            stderr_done: Some(stderr_done),
         };
         (server, stdout, sender)
     }
@@ -120,9 +122,16 @@ impl Server {
     }
 
     pub fn send_raw(&mut self, line: &str) {
-        let stdin = self.stdin.as_mut().expect("stdin is open");
-        writeln!(stdin, "{line}").expect("the server reads its input");
-        stdin.flush().expect("the server reads its input");
+        let mut stdin = self.take_input();
+        let line = line.to_owned();
+        let (sent, done) = channel();
+        thread::spawn(move || {
+            let result = writeln!(stdin, "{line}").and_then(|()| stdin.flush());
+            let _ = sent.send((stdin, result));
+        });
+        let (stdin, result) = done.recv_timeout(WAIT).expect("the input write finishes");
+        self.stdin = Some(stdin);
+        result.expect("the server reads its input");
     }
 
     /// Sends a request and returns the response with the same id.
@@ -230,9 +239,11 @@ impl Server {
         loop {
             if let Some(status) = self.child.try_wait().expect("the child can be waited on") {
                 let took = started.elapsed();
-                // The process has exited, so its standard error is closed: read all of it.
-                if let Some(reader) = self.stderr_reader.take() {
-                    reader.join().expect("the stderr reader ends");
+                // An inherited pipe can outlive the server. Bound the wait for its diagnostics too.
+                if let Some(reader) = self.stderr_done.take() {
+                    reader
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("the stderr reader ends");
                 }
                 return (status, took);
             }

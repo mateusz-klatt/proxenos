@@ -15,13 +15,13 @@ tokio = { version = "1.54.1", features = ["io-std", "io-util", "macros", "proces
 tokio-util = "0.7.20"
 
 [target.'cfg(unix)'.dependencies]
+tokio = { version = "1.54.1", features = ["signal"] }
 libc = "0.2.191"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
-    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
@@ -29,7 +29,7 @@ windows-sys = { version = "0.61.2", features = [
 # A stand-in for an agent CLI, for the tests (D12).
 [[bin]]
 name = "proxenos-stub"
-path = "src/bin/proxenos-stub.rs"
+path = "src/proxenos-stub.rs"
 required-features = ["test-tools"]
 
 [features]

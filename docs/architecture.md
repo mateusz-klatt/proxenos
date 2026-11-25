@@ -5,9 +5,9 @@ what was measured, and what is still unknown. A decision here stands until a rec
 changes it. [ADR 001](adr/001-decisions-by-the-families-that-can-answer.md) says how decisions are
 taken, and [votes.md](votes.md) records who proposed and who supported each one.
 
-**Status: milestone 1 in progress.** Built so far: the MCP layer of D4, served by
-`proxenos mcp --client <client>` with no provider yet. Nothing else below is built. Sentences in the
-present tense describe the design, not a running program.
+**Status: milestone 1 in progress.** `proxenos mcp --client <client>` serves the MCP layer of D4.
+The D6 supervisor runs the stub CLI in the behavioural tests. The first provider comes later.
+The remaining decisions describe the design.
 
 ## 1. Terms
 
@@ -199,22 +199,28 @@ Antigravity's reply must name a model; Cursor's must not. A shared test could as
 
 ### D6. Children are supervised to the end
 
-- **Unix**: each child starts in a new session, so it has no terminal to prompt on. Stopping it
-  means a termination signal to its process group, then a kill signal after three seconds.
-- **Windows**: each child runs in a job object that the system closes when Proxenos dies, so its
-  descendants die with it. The child is in the job before it runs any code, and it gets no
-  console window. There is no polite stop on Windows: the job is terminated.
-- **Everywhere**: standard input is closed, output is captured as bytes up to a limit, and
-  temporary files are removed only after the child is reaped. Past the limit the pipes are still
-  drained, or the child would block on a full pipe; a descendant that keeps a pipe open after the
-  child has gone is given a deadline. The time of the last output is recorded.
+- **Unix**: the child calls `setsid` before it executes the CLI. It leads its own session and
+  process group and starts without a controlling terminal. On a stop, Proxenos sends SIGTERM to
+  the group and gives it three seconds before SIGKILL, even when the leader exits first.
+  Proxenos observes the leader's exit with `waitid` and keeps its PID reserved until the last
+  group signal, so a reused PID cannot take that signal to another group.
+- **Windows**: Proxenos creates a job with kill-on-close and starts the CLI suspended, without
+  a console window. It assigns the process to the job and only then resumes its primary thread.
+  A stop terminates the job. The job handle belongs to Proxenos alone, so its members also die
+  when Proxenos dies. The Windows behavioural test proves containment by making the stub request
+  breakaway as it spawns a grandchild. It checks that Windows denies the request and that the
+  same grandchild, started inside the job, dies when the job is stopped.
+- **Everywhere**: the child reads EOF from the null device on standard input. Proxenos captures
+  output as bytes up to a limit per stream and removes temporary files only after reaping the
+  child. Past the limit it still drains the pipes, or the child would block. Once the child exits,
+  a descendant gets up to two more seconds to finish writing. Proxenos then closes its readers
+  and kills the remaining group or job members. The result keeps the child's exit status and
+  the time of the last read from either stream, including bytes beyond the capture limit.
 
 What this cannot do: on Unix, if Proxenos itself is killed outright, its children survive, and a
-descendant that leaves the process group is not reached. Stopping a child does not undo what it
-wrote.
-
-Not decided: how the Windows child enters its job before it runs. It will be settled by a test on
-a Windows runner in which a grandchild tries to escape.
+descendant that leaves the process group is not reached. On Windows, if Proxenos dies between
+creating the suspended process and assigning it to the job, the process can remain suspended.
+It has run no CLI code at that point. Stopping a child does not undo what it wrote.
 
 ### D7. A CLI is found by reading `PATH`, and a batch file is never run
 
