@@ -2,12 +2,16 @@
 
 mod client;
 mod mcp;
+#[cfg(feature = "test-tools")]
+mod platform;
+#[cfg(feature = "test-tools")]
+mod supervise;
 mod tools;
 
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client::Client;
 
@@ -56,13 +60,21 @@ fn serve(client: Client) -> ExitCode {
     eprintln!("proxenos: serving MCP for {}", client.name());
     let runtime = tokio::runtime::Runtime::new().expect("the async runtime starts");
     let served = runtime.block_on(mcp::serve(tools::Registry));
-    // A write to an output that nobody reads blocks a thread that a plain drop would wait for.
-    runtime.shutdown_timeout(RUNTIME_STOPS_WITHIN);
-    match served {
+    let stopping = Instant::now();
+    let code = match served {
         mcp::Served::Ended => ExitCode::SUCCESS,
         mcp::Served::Failed(reason) => {
-            eprintln!("proxenos: {reason}");
+            // A cleanup diagnostic can already be blocked writing to this same stream.
+            let report = runtime.spawn_blocking(move || {
+                let _ = writeln!(std::io::stderr().lock(), "proxenos: {reason}");
+            });
+            runtime.block_on(async {
+                let _ = tokio::time::timeout(RUNTIME_STOPS_WITHIN, report).await;
+            });
             ExitCode::FAILURE
         }
-    }
+    };
+    // A client can leave an output pipe full, including standard error.
+    runtime.shutdown_timeout(RUNTIME_STOPS_WITHIN.saturating_sub(stopping.elapsed()));
+    code
 }

@@ -40,12 +40,22 @@ pub struct Server {
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     stderr: Arc<Mutex<String>>,
-    stderr_reader: Option<thread::JoinHandle<()>>,
+    stderr_done: Option<Receiver<()>>,
 }
 
 impl Server {
     pub fn start(args: &[&str]) -> Self {
-        let (server, stdout, sender) = Self::spawn(args);
+        Self::start_command(Self::command(args))
+    }
+
+    fn command(args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_proxenos"));
+        command.args(args).stderr(Stdio::piped());
+        command
+    }
+
+    pub fn start_command(command: Command) -> Self {
+        let (server, stdout, sender) = Self::spawn(command);
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if sender.send(line).is_err() {
@@ -58,31 +68,33 @@ impl Server {
 
     /// Gives the test the read end of stdout so it can withhold reads or close the pipe.
     pub fn mcp_with_unread_output() -> (Self, ChildStdout) {
-        let (server, stdout, _) = Self::spawn(&["mcp", "--client", "claude"]);
+        let (server, stdout, _) = Self::spawn(Self::command(&["mcp", "--client", "claude"]));
         (server, stdout)
     }
 
-    fn spawn(args: &[&str]) -> (Self, ChildStdout, Sender<String>) {
+    fn spawn(mut command: Command) -> (Self, ChildStdout, Sender<String>) {
         let spawning = spawning();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_proxenos"))
-            .args(args)
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .spawn()
             .expect("the binary starts");
         drop(spawning);
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
-        let stderr = child.stderr.take().expect("stderr is piped");
+        let stderr = child.stderr.take();
         let captured = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&captured);
-        let stderr_reader = thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let mut text = sink.lock().expect("stderr lock");
-                text.push_str(&line);
-                text.push('\n');
+        let (drained, stderr_done) = channel();
+        thread::spawn(move || {
+            if let Some(stderr) = stderr {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let mut text = sink.lock().expect("stderr lock");
+                    text.push_str(&line);
+                    text.push('\n');
+                }
             }
+            let _ = drained.send(());
         });
         let (sender, lines) = channel();
         let server = Self {
@@ -90,7 +102,7 @@ impl Server {
             stdin,
             lines,
             stderr: captured,
-            stderr_reader: Some(stderr_reader),
+            stderr_done: Some(stderr_done),
         };
         (server, stdout, sender)
     }
@@ -102,7 +114,12 @@ impl Server {
     /// Starts a server and completes the `initialize` handshake of an earlier revision.
     pub fn initialized(version: &str) -> (Self, Value) {
         let mut server = Self::mcp();
-        let answer = server.request(
+        let answer = server.initialize(version);
+        (server, answer)
+    }
+
+    pub fn initialize(&mut self, version: &str) -> Value {
+        let answer = self.request(
             0,
             "initialize",
             json!({
@@ -111,8 +128,8 @@ impl Server {
                 "clientInfo": { "name": "proxenos-tests", "version": "0" }
             }),
         );
-        server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
-        (server, answer)
+        self.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        answer
     }
 
     pub fn send(&mut self, frame: &Value) {
@@ -120,9 +137,16 @@ impl Server {
     }
 
     pub fn send_raw(&mut self, line: &str) {
-        let stdin = self.stdin.as_mut().expect("stdin is open");
-        writeln!(stdin, "{line}").expect("the server reads its input");
-        stdin.flush().expect("the server reads its input");
+        let mut stdin = self.take_input();
+        let line = line.to_owned();
+        let (sent, done) = channel();
+        thread::spawn(move || {
+            let result = writeln!(stdin, "{line}").and_then(|()| stdin.flush());
+            let _ = sent.send((stdin, result));
+        });
+        let (stdin, result) = done.recv_timeout(WAIT).expect("the input write finishes");
+        self.stdin = Some(stdin);
+        result.expect("the server reads its input");
     }
 
     /// Sends a request and returns the response with the same id.
@@ -230,9 +254,11 @@ impl Server {
         loop {
             if let Some(status) = self.child.try_wait().expect("the child can be waited on") {
                 let took = started.elapsed();
-                // The process has exited, so its standard error is closed: read all of it.
-                if let Some(reader) = self.stderr_reader.take() {
-                    reader.join().expect("the stderr reader ends");
+                // An inherited pipe can outlive the server. Bound the wait for its diagnostics too.
+                if let Some(reader) = self.stderr_done.take() {
+                    reader
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("the stderr reader ends");
                 }
                 return (status, took);
             }

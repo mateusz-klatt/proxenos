@@ -12,7 +12,12 @@ fn a_release_build_lists_no_tools_and_refuses_the_test_ones() {
     let (mut server, _) = Server::initialized("2025-11-25");
     let listed = server.request(1, "tools/list", json!({}));
     assert_eq!(listed["result"]["tools"], json!([]));
-    for (id, name) in [(2, "test_echo"), (3, "test_panic"), (4, "test_wait")] {
+    for (id, name) in [
+        (2, "test_echo"),
+        (3, "test_panic"),
+        (4, "test_wait"),
+        (5, "test_run"),
+    ] {
         let refused = server.call(id, name, json!({}));
         assert_eq!(refused["error"]["code"], -32602, "{name}: {refused}");
     }

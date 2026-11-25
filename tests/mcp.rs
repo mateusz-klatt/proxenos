@@ -2,6 +2,8 @@
 #![cfg(feature = "test-tools")]
 
 mod common;
+#[path = "mcp/supervisor.rs"]
+mod supervisor;
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -46,9 +48,18 @@ fn an_earlier_revision_is_served_after_initialize() {
             .iter()
             .map(|tool| tool["name"].as_str().expect("a name"))
             .collect();
-        assert_eq!(names, ["test_echo", "test_fail", "test_panic", "test_wait"]);
+        assert_eq!(
+            names,
+            [
+                "test_echo",
+                "test_fail",
+                "test_panic",
+                "test_run",
+                "test_wait"
+            ]
+        );
         // The schema goes out as it was written.
-        let wait = &listed["result"]["tools"][3]["inputSchema"];
+        let wait = &listed["result"]["tools"][4]["inputSchema"];
         assert_eq!(wait["additionalProperties"], false);
         assert_eq!(wait["required"], json!(["ms"]));
 

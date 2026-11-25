@@ -56,6 +56,12 @@ pub struct ToolOutcome {
 /// The call named no tool this server has.
 pub struct UnknownTool;
 
+/// A call and its background workers keep serving alive until their last handle drops.
+#[derive(Clone)]
+pub struct Activity {
+    _running: mpsc::Sender<()>,
+}
+
 /// What the server offers. Implemented outside this module, without `rmcp` types.
 pub trait Service: Send + Sync + 'static {
     fn tools(&self) -> Vec<ToolSpec>;
@@ -67,6 +73,7 @@ pub trait Service: Send + Sync + 'static {
         name: String,
         arguments: Map<String, Value>,
         cancel: CancellationToken,
+        activity: Activity,
     ) -> impl Future<Output = Result<ToolOutcome, UnknownTool>> + Send + 'static;
 }
 
@@ -94,7 +101,7 @@ pub async fn serve<S: Service>(service: S) -> Served {
     let handler = Handler {
         service: Arc::new(service),
         stopper: Arc::clone(&stopper),
-        active,
+        active: Activity { _running: active },
     };
     let (server_input, input) = tokio::io::duplex(PIPE_BYTES);
     let (server_output, output) = tokio::io::duplex(PIPE_BYTES);
@@ -122,8 +129,8 @@ pub async fn serve<S: Service>(service: S) -> Served {
         // a client that reads may be owed the answer that explains the failure.
         stopper.record(failure);
         // rmcp stops draining after five seconds. Whatever is still running is told to stop and
-        // waited for: each call holds a sender until it finishes, and the handler that owned the
-        // last one is gone by now. So is rmcp's end of the output pipe, so the collector and then
+        // waited for. Each call and any worker still reaping its child hold a sender. The handler
+        // has dropped its copy, as well as rmcp's end of the output pipe, so the collector and then
         // the writer finish once what is left has been written. On failure stdout may be blocked.
         stopper.shutdown.cancel();
         let _ = finished.recv().await;
@@ -306,7 +313,7 @@ struct Handler<S> {
     service: Arc<S>,
     stopper: Arc<Stopper>,
     /// Cloned into every running call; [`serve`] waits until no clone is left.
-    active: mpsc::Sender<()>,
+    active: Activity,
 }
 
 impl<S: Service> ServerHandler for Handler<S> {
@@ -359,7 +366,6 @@ impl<S: Service> ServerHandler for Handler<S> {
         // The call runs as its own task, and is created inside it, so that a panic anywhere in
         // it ends that task, not the server, and can be answered.
         let mut task = tokio::spawn(async move {
-            let _running = running;
             // The tool's work runs when its future is polled, so the lock covers only the check.
             stopper
                 .unless_halted(|| ())
@@ -367,7 +373,14 @@ impl<S: Service> ServerHandler for Handler<S> {
                     "The MCP connection has failed.",
                     None,
                 ))?;
-            let call = service.call(call_name.to_string(), arguments, call_cancel);
+            // The task owns its handle through the whole call, even if the service transfers
+            // its copy to a worker that finishes before the call constructs its result.
+            let call = service.call(
+                call_name.to_string(),
+                arguments,
+                call_cancel,
+                running.clone(),
+            );
             call.await.map_err(|UnknownTool| {
                 ErrorData::invalid_params(format!("Unknown tool: {call_name}"), None)
             })
