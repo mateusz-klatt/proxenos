@@ -9,6 +9,54 @@ use serde_json::{Value, json};
 
 use crate::common::{Server, text};
 
+/// The stub CLI that tests install under provider names.
+///
+/// On Intel macOS the linker does not sign binaries ad hoc, as it does on arm64. AppleSystemPolicy
+/// evaluates unsigned code each time it runs from a new path, and under load it can kill the process
+/// with SIGKILL while it waits. Measured by claude-laptop-proxenos on 2026-11-25: 21 of 50 runs of
+/// the provider tests failed that way. There the stub is copied once per test process, signed ad
+/// hoc and run once, and every test links to that copy. Signing replaces the file with a new
+/// inode, so the copy is signed before any link to it exists.
+pub fn stub() -> &'static std::path::Path {
+    static STUB: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    STUB.get_or_init(prepare_stub)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+fn prepare_stub() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_proxenos-stub"))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn prepare_stub() -> std::path::PathBuf {
+    let built = std::path::Path::new(env!("CARGO_BIN_EXE_proxenos-stub"));
+    let signed = built.with_file_name(format!("proxenos-stub-signed-{}", uuid::Uuid::new_v4()));
+    let _spawning = crate::common::spawning();
+    std::fs::copy(built, &signed).expect("the stub copies");
+    let codesign = |args: &[&str]| {
+        let status = std::process::Command::new("/usr/bin/codesign")
+            .args(args)
+            .arg(&signed)
+            .status()
+            .expect("/usr/bin/codesign runs");
+        assert!(status.success(), "codesign {args:?} failed: {status}");
+    };
+    codesign(&["-s", "-", "--force"]);
+    codesign(&["-v"]);
+    // The first run of new code pays for its evaluation, here rather than inside a test.
+    let probe = std::process::Command::new(&signed)
+        .arg("out:signed")
+        .env_remove("PROXENOS_STUB_DIR")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("the signed stub runs");
+    assert!(
+        probe.success(),
+        "the signed stub failed its first run: {probe}"
+    );
+    signed
+}
+
 pub struct Fleet {
     pub root: PathBuf,
 }
@@ -16,8 +64,9 @@ pub struct Fleet {
 impl Fleet {
     pub fn new(clis: &[&str]) -> Self {
         // TMPDIR may be mounted noexec, and copying creates a new inode that macOS
-        // AppleSystemPolicy must evaluate from scratch. Keep hard links under target/.
-        let stub = std::path::Path::new(env!("CARGO_BIN_EXE_proxenos-stub"));
+        // AppleSystemPolicy must evaluate from scratch. Keep hard links under target/, to the
+        // stub that common::stub() prepares.
+        let stub = stub();
         let root = stub
             .parent()
             .unwrap()

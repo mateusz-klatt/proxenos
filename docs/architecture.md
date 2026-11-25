@@ -612,6 +612,12 @@ startup, and Windows SmartScreen.
 - During the migration, the same scenarios are replayed against claude-delegator 3.5.0 and the
   results compared, apart from a short list of intended differences.
 - No test starts a real agent CLI or spends a model call.
+- On Intel macOS the linker does not sign binaries ad hoc, as it does on arm64. AppleSystemPolicy
+  then evaluates the unsigned stub each time it runs from a new path, and under load it killed the
+  stub with SIGKILL in 21 of 50 runs of the provider tests (measured on 2026-11-25). There, the
+  tests copy the stub once per process, sign the copy ad hoc with `/usr/bin/codesign`, and link
+  only to that copy. This changes nothing in what ships: releases are signed with the Developer ID
+  (D11).
 
 ### D13. Migration
 

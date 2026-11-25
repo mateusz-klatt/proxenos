@@ -11,7 +11,7 @@ use crate::provider_support::{Fleet, call, turn};
 
 fn install(file: &Path) {
     fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let stub = Path::new(env!("CARGO_BIN_EXE_proxenos-stub"));
+    let stub = crate::provider_support::stub();
     fs::hard_link(stub, file).unwrap_or_else(|error| {
         panic!(
             "hard-linking {} to {} failed: {error}",
