@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::common::Server;
-use crate::provider_support::{Fleet, call, turn};
+use crate::provider_support::{
+    Fleet, assert_observed_failure, assert_reported_failure, call, turn,
+};
 
 fn file(result: &Value) -> PathBuf {
     PathBuf::from(
@@ -59,6 +61,7 @@ fn the_excerpt_preserves_utf8_and_the_private_answer_outlives_child_cleanup() {
     }
     assert!(server.finish().0.success());
     assert!(!directory.exists());
+    fleet.assert_steps_remaining("agy", 0);
 }
 
 #[test]
@@ -79,18 +82,26 @@ fn the_archive_bounds_disk_use_and_preserves_the_turn_outcome_on_eviction_failur
         )
     };
     let first = file(&run());
+    fleet.assert_steps_remaining("agy", 11);
     let second = file(&run());
+    fleet.assert_steps_remaining("agy", 10);
     let directory = first.parent().unwrap();
-    for _ in 2..8 {
+    for i in 2..8 {
         assert!(file(&run()).is_file());
+        fleet.assert_steps_remaining("agy", 11 - i);
     }
     assert_eq!(fs::read_dir(directory).unwrap().count(), 8);
     fs::remove_file(&first).unwrap(); // A client may remove a captured answer after reading it.
     assert!(file(&run()).is_file());
+    fleet.assert_steps_remaining("agy", 3);
     fs::remove_file(&second).unwrap();
     fs::create_dir(&second).unwrap(); // Cannot remove this entry as a regular file.
     let failed_capture = run();
-    assert_eq!(failed_capture["observed"]["failure"]["kind"], "capture");
+    assert_observed_failure(
+        &failed_capture,
+        "capture",
+        "Could not retain the captured content",
+    );
     assert!(failed_capture["observed"]["content_file"].is_null());
     assert_eq!(
         failed_capture["reported"]["content"]
@@ -99,15 +110,35 @@ fn the_archive_bounds_disk_use_and_preserves_the_turn_outcome_on_eviction_failur
             .len(),
         16 << 10
     );
+    fleet.assert_steps_remaining("agy", 2);
     let failed_turn = run();
-    assert_eq!(failed_turn["observed"]["failure"]["kind"], "abnormal_exit");
-    assert_eq!(failed_turn["reported"]["failure"]["kind"], "quota");
+    assert_reported_failure(
+        &failed_turn,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        "Quota exceeded",
+    );
     assert_eq!(failed_turn["observed"]["capture_error"]["kind"], "capture");
+    assert!(
+        failed_turn["observed"]["capture_error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing capture_error message: {failed_turn}"))
+            .contains("Could not retain the captured content"),
+        "{failed_turn}"
+    );
+    fleet.assert_steps_remaining("agy", 1);
     fs::remove_dir(&second).unwrap();
     fs::write(&second, []).unwrap();
     assert!(file(&run()).is_file());
     assert!(!second.exists());
     assert_eq!(fs::read_dir(directory).unwrap().count(), 8);
+    fleet.assert_steps_remaining("agy", 0);
+    let turns = fleet
+        .records()
+        .into_iter()
+        .filter(|record| record["args"] != json!(["--version"]))
+        .count();
+    assert_eq!(turns, 12);
 }
 
 #[test]
@@ -132,6 +163,7 @@ fn the_file_carries_only_what_was_captured_from_the_final_message() {
     assert_eq!(result["observed"]["content_captured_bytes"], limit);
     assert_eq!(result["observed"]["content_file_bytes"], limit);
     assert_eq!(fs::read_to_string(file(&result)).unwrap(), answer[..limit]);
+    fleet.assert_steps_remaining("codex", 0);
 }
 
 #[test]
@@ -145,8 +177,12 @@ fn long_provider_failure_messages_and_reset_times_are_bounded_and_archived() {
     fleet.script("agy", json!([{"stdout": failed.to_string(), "code": 1}]));
     let mut server = fleet.server("claude");
     let result = call(&mut server, "antigravity", json!({"prompt": "fail long"}));
-    assert_eq!(result["observed"]["state"], "failed", "{result}");
-    assert_eq!(result["reported"]["failure"]["kind"], "quota", "{result}");
+    assert_reported_failure(
+        &result,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        lead,
+    );
     assert_eq!(result["reported"]["failure"]["message"], prefix);
     assert_eq!(
         result["observed"]["failure_captured_bytes"],
@@ -167,6 +203,7 @@ fn long_provider_failure_messages_and_reset_times_are_bounded_and_archived() {
     let directory = retained.parent().unwrap();
     assert!(server.finish().0.success());
     assert!(!directory.exists());
+    fleet.assert_steps_remaining("agy", 0);
 }
 
 #[test]
@@ -223,4 +260,5 @@ fn relative_tmpdir_still_produces_absolute_scratch_and_archive_paths() {
             .unwrap()
             == rel_tmp.canonicalize().unwrap()
     );
+    fleet.assert_steps_remaining("agy", 0);
 }

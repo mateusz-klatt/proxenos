@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use std::path::Path;
 
-use crate::provider_support::{Fleet, call};
+use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_failure, call};
 
 const FINISHED: &str = include_str!("../fixtures/codex/finished.jsonl");
 const EMPTY: &str = include_str!("../fixtures/codex/empty.jsonl");
@@ -60,6 +60,7 @@ fn codex_starts_and_resumes_with_the_same_settings_and_exact_prompt() {
     assert_eq!(start["reported"]["usage"]["input_tokens"], 17);
     assert!(start["reported"]["model"].is_null());
     assert_eq!(start["observed"]["passed"]["model"], "test-model");
+    fleet.assert_steps_remaining("codex", 2);
 
     let reply = call(
         &mut server,
@@ -75,6 +76,7 @@ fn codex_starts_and_resumes_with_the_same_settings_and_exact_prompt() {
             > 5_000,
         "reply inherited the start timeout: {reply}"
     );
+    fleet.assert_steps_remaining("codex", 1);
     let refused = call(
         &mut server,
         "codex-reply",
@@ -82,20 +84,15 @@ fn codex_starts_and_resumes_with_the_same_settings_and_exact_prompt() {
             "thread_id":THREAD, "prompt":"act", "mode":"implementation"
         }),
     );
-    assert_eq!(refused["observed"]["state"], "failed", "{refused}");
-    assert!(refused.to_string().to_lowercase().contains("mode"));
+    assert_observed_failure(&refused, "invalid_request", "mode");
+    fleet.assert_steps_remaining("codex", 1);
     let amended = call(
         &mut server,
         "codex-reply",
         json!({"thread_id":THREAD,"prompt":"explain","instructions":"Different instructions"}),
     );
-    assert_eq!(amended["observed"]["state"], "failed", "{amended}");
-    assert!(
-        amended["observed"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("instructions")
-    );
+    assert_observed_failure(&amended, "invalid_request", "instructions");
+    fleet.assert_steps_remaining("codex", 1);
     let changed = call(
         &mut server,
         "codex-reply",
@@ -104,6 +101,7 @@ fn codex_starts_and_resumes_with_the_same_settings_and_exact_prompt() {
         }),
     );
     assert_eq!(changed["observed"]["state"], "finished", "{changed}");
+    fleet.assert_steps_remaining("codex", 0);
 
     let records = invocations(&fleet);
     assert_eq!(records.len(), 3);
@@ -163,20 +161,32 @@ fn codex_requires_a_completion_and_confirms_the_id_on_resume() {
     ]));
     let mut server = fleet.server("claude");
     let dash = call(&mut server, "codex", json!({"prompt":"-"}));
-    assert_eq!(dash["observed"]["state"], "failed", "{dash}");
+    assert_observed_failure(&dash, "invalid_request", "lone dash");
+    fleet.assert_steps_remaining("codex", 3);
     let incomplete = call(&mut server, "codex", json!({"prompt":"check"}));
-    assert_eq!(incomplete["observed"]["state"], "failed", "{incomplete}");
+    assert_observed_failure(
+        &incomplete,
+        "unknown",
+        "without evidence of a completed turn",
+    );
     assert!(incomplete["reported"]["content"].is_null());
+    fleet.assert_steps_remaining("codex", 2);
     let started = call(&mut server, "codex", json!({"prompt":"--help"}));
     assert_eq!(started["observed"]["state"], "finished", "{started}");
+    fleet.assert_steps_remaining("codex", 1);
     let mismatch = call(
         &mut server,
         "codex-reply",
         json!({"prompt":"continue","thread_id":THREAD}),
     );
-    assert_eq!(mismatch["observed"]["state"], "failed", "{mismatch}");
+    assert_reported_failure(
+        &mismatch,
+        None,
+        "unknown",
+        "did not confirm the requested thread",
+    );
     assert!(mismatch["reported"]["content"].is_null());
-    assert_eq!(mismatch["reported"]["failure"]["kind"], "unknown");
+    fleet.assert_steps_remaining("codex", 0);
     let records = invocations(&fleet);
     assert_eq!(records.len(), 3);
     assert!(!argv(&records[0]).contains(&"-m"));
@@ -205,6 +215,7 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
             ),
             "quota",
             Some("1234567890"),
+            "Window closed",
         ),
         (
             backend(
@@ -213,16 +224,19 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
             ),
             "quota",
             Some("2030-01-01T00:00:00Z"),
+            "No capacity",
         ),
         (
             backend(429, json!({"message":"Try later"})),
             "unknown",
             None,
+            "Try later",
         ),
         (
             backend(401, json!({"message":"Session expired"})),
             "authentication",
             None,
+            "Session expired",
         ),
         (
             backend(
@@ -231,6 +245,7 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
             ),
             "authentication",
             None,
+            "Invalid credentials",
         ),
         (
             backend(
@@ -239,19 +254,32 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
             ),
             "refusal",
             None,
+            "Request rejected",
         ),
         (
             failed("Request flagged for possible cybersecurity risk"),
             "refusal",
             None,
+            "cybersecurity risk",
         ),
         (
             failed("You've hit your usage limit. Please try again at 3:00 PM."),
             "quota",
             Some("3:00 PM"),
+            "usage limit",
         ),
-        (failed("The turn failed"), "unknown", None),
-        ("{\"type\":\"turn.failed\"}".to_owned(), "unknown", None),
+        (
+            failed("The turn failed"),
+            "unknown",
+            None,
+            "The turn failed",
+        ),
+        (
+            "{\"type\":\"turn.failed\"}".to_owned(),
+            "unknown",
+            None,
+            "unsuccessful turn",
+        ),
         (
             format!(
                 "{}\n{}",
@@ -260,27 +288,36 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
             ),
             "authentication",
             None,
+            "401 Unauthorized",
         ),
     ];
     let mut script: Vec<_> = cases
         .iter()
-        .map(|(stdout, _, _)| json!({"stdout":stdout,"code":1}))
+        .map(|(stdout, _, _, _)| json!({"stdout":stdout,"code":1}))
         .collect();
     script.push(json!({"stderr":"unexpected status 401 Unauthorized", "code":1}));
     script.push(json!({"stdout":FINISHED.replace("The two paragraphs agree.", "You've hit your usage limit.")}));
     fleet.script("codex", json!(script));
     let mut server = fleet.server("claude");
-    for (_, kind, reset) in cases {
+    for (index, (_, kind, reset, detail)) in cases.iter().enumerate() {
         let result = call(&mut server, "codex", json!({"prompt":"check"}));
-        assert_eq!(result["observed"]["state"], "failed", "{result}");
-        assert_eq!(result["reported"]["failure"]["kind"], kind, "{result}");
-        assert_eq!(result["reported"]["failure"]["reset_at"].as_str(), reset);
+        assert_reported_failure(
+            &result,
+            Some(("abnormal_exit", "exit code 1")),
+            kind,
+            detail,
+        );
+        assert_eq!(result["reported"]["failure"]["reset_at"].as_str(), *reset);
+        fleet.assert_steps_remaining("codex", cases.len() + 1 - index);
     }
     let stderr = call(&mut server, "codex", json!({"prompt":"check"}));
-    assert_eq!(
-        stderr["reported"]["failure"]["kind"], "authentication",
-        "{stderr}"
+    assert_reported_failure(
+        &stderr,
+        Some(("abnormal_exit", "exit code 1")),
+        "authentication",
+        "401 Unauthorized",
     );
+    fleet.assert_steps_remaining("codex", 1);
     let answer = call(&mut server, "codex", json!({"prompt":"check"}));
     assert_eq!(answer["observed"]["state"], "finished", "{answer}");
     assert_eq!(
@@ -288,6 +325,8 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
         "You've hit your usage limit."
     );
     assert!(answer["reported"]["failure"].is_null());
+    fleet.assert_steps_remaining("codex", 0);
+    assert_eq!(invocations(&fleet).len(), cases.len() + 2);
 }
 
 #[test]
@@ -309,19 +348,15 @@ fn codex_requests_a_missing_final_answer_once_in_the_original_thread() {
         2
     );
     assert_eq!(answered["reported"]["content"], "The two paragraphs agree.");
+    fleet.assert_steps_remaining("codex", 2);
     let empty = call(
         &mut server,
         "codex-reply",
         json!({"thread_id":THREAD, "prompt":"Check my edit."}),
     );
-    assert_eq!(empty["observed"]["state"], "failed", "{empty}");
+    assert_reported_failure(&empty, None, "unknown", "final message");
     assert_eq!(empty["observed"]["attempts"].as_array().unwrap().len(), 2);
-    assert!(
-        empty["reported"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("final message")
-    );
+    fleet.assert_steps_remaining("codex", 0);
     let records = invocations(&fleet);
     assert_eq!(records.len(), 4);
     for index in [1, 3] {
@@ -350,15 +385,27 @@ fn codex_retries_only_an_explicit_missing_answer_diagnostic() {
         ]),
     );
     let mut server = fleet.server("claude");
-    for kind in ["refusal", "refusal", "unknown"] {
+    for (index, (kind, detail)) in [
+        ("refusal", "cybersecurity risk"),
+        ("refusal", "cybersecurity risk"),
+        ("unknown", "Transport closed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let result = call(
             &mut server,
             "codex",
             json!({"prompt":"Check the paragraph."}),
         );
-        assert_eq!(result["observed"]["state"], "failed", "{result}");
-        assert_eq!(result["reported"]["failure"]["kind"], kind);
+        assert_reported_failure(
+            &result,
+            Some(("abnormal_exit", "exit code 1")),
+            kind,
+            detail,
+        );
         assert_eq!(result["observed"]["attempts"].as_array().unwrap().len(), 1);
+        fleet.assert_steps_remaining("codex", 4 - index);
     }
     let retried = call(
         &mut server,
@@ -367,6 +414,7 @@ fn codex_retries_only_an_explicit_missing_answer_diagnostic() {
     );
     assert_eq!(retried["observed"]["state"], "finished", "{retried}");
     assert_eq!(retried["observed"]["attempts"].as_array().unwrap().len(), 2);
+    fleet.assert_steps_remaining("codex", 0);
     assert_eq!(invocations(&fleet).len(), 5);
 }
 
@@ -389,17 +437,15 @@ fn codex_rejects_non_uuid_thread_ids_on_reply_and_retry() {
                 "access": "read-only", "mode": "advisory"
             }),
         );
-        assert_eq!(
-            rejected["observed"]["failure"]["kind"], "invalid_request",
-            "{bad_id}: {rejected}"
-        );
+        assert_observed_failure(&rejected, "invalid_request", "canonical UUID");
     }
     assert!(
         fleet.records().is_empty(),
         "non-UUID reply IDs must fail before discovery or dispatch"
     );
+    fleet.assert_steps_remaining("codex", 1);
     let no_retry = call(&mut server, "codex", json!({"prompt": "work"}));
-    assert_eq!(no_retry["observed"]["state"], "failed", "{no_retry}");
+    assert_reported_failure(&no_retry, None, "unknown", "without a final message");
     assert_eq!(
         no_retry["observed"]["attempts"]
             .as_array()
@@ -411,6 +457,7 @@ fn codex_rejects_non_uuid_thread_ids_on_reply_and_retry() {
         no_retry["reported"]["thread_id"].is_null(),
         "non-UUID thread_id must not be returned or cached: {no_retry}"
     );
+    fleet.assert_steps_remaining("codex", 0);
     assert_eq!(invocations(&fleet).len(), 1);
 }
 
@@ -451,10 +498,13 @@ fn codex_filters_usage_to_expected_scalar_fields_and_drops_invalid_thread_ids() 
         json!({"output_tokens": 9, "reasoning_output_tokens": 4}),
         "{first}"
     );
+    fleet.assert_steps_remaining("codex", 1);
     let second = call(&mut server, "codex", json!({"prompt": "second"}));
     assert_eq!(second["observed"]["state"], "finished", "{second}");
     assert_eq!(second["reported"]["thread_id"], THREAD, "{second}");
     assert!(second["reported"]["usage"].is_null(), "{second}");
+    fleet.assert_steps_remaining("codex", 0);
+    assert_eq!(invocations(&fleet).len(), 2);
 }
 
 #[test]
@@ -477,6 +527,7 @@ fn codex_reads_an_atomically_replaced_final_message_file() {
         result["observed"]["attempts"][0]["provider_file_captured"],
         replaced.len()
     );
+    fleet.assert_steps_remaining("codex", 0);
 }
 
 #[test]
@@ -491,8 +542,7 @@ fn codex_retry_keeps_confirmed_thread_id_when_second_attempt_fails_early() {
     );
     let mut server = fleet.server("claude");
     let result = call(&mut server, "codex", json!({"prompt": "check"}));
-    assert_eq!(result["observed"]["state"], "failed", "{result}");
-    assert_eq!(result["observed"]["failure"]["kind"], "abnormal_exit");
+    assert_observed_failure(&result, "abnormal_exit", "exit code 1");
     assert_eq!(
         result["observed"]["attempts"]
             .as_array()
@@ -502,4 +552,6 @@ fn codex_retry_keeps_confirmed_thread_id_when_second_attempt_fails_early() {
     );
     assert_eq!(result["reported"]["thread_id"], THREAD, "{result}");
     assert_eq!(result["reported"]["diagnostic"], "transport dropped");
+    fleet.assert_steps_remaining("codex", 0);
+    assert_eq!(invocations(&fleet).len(), 2);
 }

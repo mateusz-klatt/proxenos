@@ -9,6 +9,11 @@ use serde_json::{Value, json};
 
 use crate::common::{Server, text};
 
+/// The stub CLI that tests install under provider names.
+pub fn stub() -> &'static std::path::Path {
+    std::path::Path::new(env!("CARGO_BIN_EXE_proxenos-stub"))
+}
+
 pub struct Fleet {
     pub root: PathBuf,
 }
@@ -17,7 +22,7 @@ impl Fleet {
     pub fn new(clis: &[&str]) -> Self {
         // TMPDIR may be mounted noexec, and copying creates a new inode that macOS
         // AppleSystemPolicy must evaluate from scratch. Keep hard links under target/.
-        let stub = std::path::Path::new(env!("CARGO_BIN_EXE_proxenos-stub"));
+        let stub = stub();
         let root = stub
             .parent()
             .unwrap()
@@ -74,12 +79,94 @@ impl Fleet {
     pub fn script(&self, cli: &str, steps: Value) {
         fs::write(self.root.join(format!("{cli}.steps")), steps.to_string()).unwrap();
     }
+
+    pub fn remaining_steps(&self, cli: &str) -> Vec<Value> {
+        let script = self.root.join(format!("{cli}.steps"));
+        let bytes = fs::read(&script)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", script.display()));
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("invalid JSON in {}: {error}", script.display()))
+    }
+
+    #[track_caller]
+    pub fn assert_steps_remaining(&self, cli: &str, expected: usize) {
+        let remaining = self.remaining_steps(cli);
+        assert_eq!(
+            remaining.len(),
+            expected,
+            "{cli}.steps had {} step(s) left instead of {expected}: {remaining:?}",
+            remaining.len()
+        );
+    }
 }
 
 impl Drop for Fleet {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[track_caller]
+pub fn assert_observed_failure(envelope: &Value, kind: &str, detail: &str) {
+    let expected_state = if kind == "cancellation" {
+        "cancelled"
+    } else {
+        "failed"
+    };
+    assert_eq!(envelope["observed"]["state"], expected_state, "{envelope}");
+    assert_eq!(envelope["observed"]["failure"]["kind"], kind, "{envelope}");
+    let message = envelope["observed"]["failure"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing observed failure message in envelope: {envelope}"));
+    assert!(
+        !message.is_empty() && message.contains(detail),
+        "expected observed failure message to contain {detail:?}: {envelope}"
+    );
+    assert!(
+        envelope["reported"]["failure"].is_null(),
+        "unexpected reported failure in envelope: {envelope}"
+    );
+}
+
+#[track_caller]
+pub fn assert_reported_failure(
+    envelope: &Value,
+    observed: Option<(&str, &str)>,
+    reported_kind: &str,
+    reported_detail: &str,
+) {
+    assert_eq!(envelope["observed"]["state"], "failed", "{envelope}");
+    match observed {
+        Some((kind, detail)) => {
+            assert_eq!(envelope["observed"]["failure"]["kind"], kind, "{envelope}");
+            let message = envelope["observed"]["failure"]["message"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("missing observed failure message in envelope: {envelope}")
+                });
+            assert!(
+                !message.is_empty() && message.contains(detail),
+                "expected observed failure message to contain {detail:?}: {envelope}"
+            );
+        }
+        None => {
+            assert!(
+                envelope["observed"]["failure"].is_null(),
+                "unexpected observed failure in envelope: {envelope}"
+            );
+        }
+    }
+    assert_eq!(
+        envelope["reported"]["failure"]["kind"], reported_kind,
+        "{envelope}"
+    );
+    let message = envelope["reported"]["failure"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing reported failure message in envelope: {envelope}"));
+    assert!(
+        !message.is_empty() && message.contains(reported_detail),
+        "expected reported failure message to contain {reported_detail:?}: {envelope}"
+    );
 }
 
 pub fn call(server: &mut Server, name: &str, args: Value) -> Value {
