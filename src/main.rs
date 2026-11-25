@@ -2,6 +2,8 @@
 
 mod client;
 mod mcp;
+mod platform;
+mod supervise;
 mod tools;
 
 use std::ffi::OsString;
@@ -54,6 +56,10 @@ fn version() -> ExitCode {
 
 fn serve(client: Client) -> ExitCode {
     eprintln!("proxenos: serving MCP for {}", client.name());
+    // Run from a shell, Proxenos leads its process group and cannot leave its terminal; started
+    // by a client it can, and then no child it starts has a terminal to prompt on.
+    #[cfg(unix)]
+    let _ = platform::leave_terminal();
     let runtime = tokio::runtime::Runtime::new().expect("the async runtime starts");
     let served = runtime.block_on(mcp::serve(tools::Registry));
     // A write to an output that nobody reads blocks a thread that a plain drop would wait for.

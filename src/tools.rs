@@ -66,6 +66,7 @@ mod test_tools {
     use tokio_util::sync::CancellationToken;
 
     use crate::mcp::{ToolOutcome, ToolSpec};
+    use crate::supervise::{self, Launch, LaunchError};
 
     fn spec(name: &str, description: &str, schema: Value) -> ToolSpec {
         ToolSpec {
@@ -82,6 +83,24 @@ mod test_tools {
             spec("test_fail", "Fails as a tool.", open.clone()),
             spec("test_panic", "Panics.", open),
             spec(
+                "test_run",
+                "Runs a program under the supervisor and returns what it left, as JSON.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "program": { "type": "string" },
+                        "args": { "type": "array", "items": { "type": "string" } },
+                        "cwd": { "type": "string" },
+                        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+                        "env_remove": { "type": "array", "items": { "type": "string" } },
+                        "deadline_ms": { "type": "integer", "minimum": 0 },
+                        "capture_limit": { "type": "integer", "minimum": 0 },
+                        "cancel_after_ms": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["program", "deadline_ms", "capture_limit"]
+                }),
+            ),
+            spec(
                 "test_wait",
                 "Waits for `ms` milliseconds or until cancelled, then for `linger_ms` more.",
                 json!({
@@ -95,6 +114,65 @@ mod test_tools {
                 }),
             ),
         ]
+    }
+
+    fn strings(value: Option<&Value>) -> Vec<String> {
+        value
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    fn millis(arguments: &Map<String, Value>, name: &str) -> Option<u64> {
+        arguments.get(name).and_then(Value::as_u64)
+    }
+
+    async fn run(arguments: &Map<String, Value>, cancel: &CancellationToken) -> ToolOutcome {
+        let text = |name: &str| arguments.get(name).and_then(Value::as_str).map(str::to_owned);
+        let env = arguments.get("env").and_then(Value::as_object);
+        let launch = Launch {
+            program: text("program").unwrap_or_default().into(),
+            args: strings(arguments.get("args")).into_iter().map(Into::into).collect(),
+            cwd: text("cwd").map(Into::into),
+            env_set: env
+                .into_iter()
+                .flatten()
+                .map(|(name, value)| (name.into(), value.as_str().unwrap_or_default().into()))
+                .collect(),
+            env_remove: strings(arguments.get("env_remove")).into_iter().map(Into::into).collect(),
+            deadline: Duration::from_millis(millis(arguments, "deadline_ms").unwrap_or(0)),
+            capture_limit: usize::try_from(millis(arguments, "capture_limit").unwrap_or(0))
+                .unwrap_or(usize::MAX),
+        };
+        let cancel = cancel.child_token();
+        if let Some(ms) = millis(arguments, "cancel_after_ms") {
+            let timer = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                timer.cancel();
+            });
+        }
+        match supervise::run(launch, cancel).await {
+            Ok(finished) => ToolOutcome {
+                text: json!({
+                    "ending": finished.ending.name(),
+                    "code": finished.code,
+                    "signal": finished.signal,
+                    "stdout": String::from_utf8_lossy(&finished.stdout.bytes),
+                    "stdout_total": finished.stdout.total,
+                    "stderr": String::from_utf8_lossy(&finished.stderr.bytes),
+                    "stderr_total": finished.stderr.total,
+                    "elapsed_ms": finished.elapsed.as_millis(),
+                    "last_output_ms": finished.last_output.map(|at| at.as_millis()),
+                })
+                .to_string(),
+                is_error: false,
+            },
+            Err(LaunchError(error)) => ToolOutcome {
+                text: format!("launch failed: {error}"),
+                is_error: true,
+            },
+        }
     }
 
     pub async fn call(
@@ -112,6 +190,7 @@ mod test_tools {
                 is_error: true,
             },
             "test_panic" => panic!("test_panic was called"),
+            "test_run" => run(arguments, cancel).await,
             "test_wait" => {
                 let ms = arguments.get("ms").and_then(Value::as_u64).unwrap_or(0);
                 // The tests read these lines to know the call is running, and how it ended.
