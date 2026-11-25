@@ -805,3 +805,52 @@ fn explicitly_cancelling_an_mcp_request_releases_its_provider_files() {
     server.start_call(5, "test_echo", json!({}));
     assert_eq!(server.exact_next_frame()["id"], 5);
 }
+
+#[test]
+fn cancelling_a_provider_turn_reaps_its_grandchild() {
+    let fleet = Fleet::new(&["codex"]);
+    let grandchild = fleet.root.join("grandchild");
+    let ready = fleet.root.join("turn.ready");
+    fleet.script(
+        "codex",
+        json!([{"grandchild": grandchild, "ready": ready, "sleep_ms": 60000}]),
+    );
+    let mut server = fleet.server("claude");
+    server.request(1, "tools/list", json!({}));
+    server.start_call(9, "codex", json!({"prompt": "stop grandchild"}));
+    let until = Instant::now() + common::WAIT;
+    while !ready.exists() {
+        assert!(Instant::now() < until, "stub and grandchild did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&grandchild)
+        .unwrap();
+    assert!(
+        matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "grandchild was not holding its lock"
+    );
+    server.send(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 9}}),
+    );
+    let deadline = Instant::now() + common::WAIT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => {
+                lock.unlock().unwrap();
+                break;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "grandchild survived provider cancellation"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("probing grandchild lock failed: {error}"),
+        }
+    }
+    fleet.assert_steps_remaining("codex", 0);
+}

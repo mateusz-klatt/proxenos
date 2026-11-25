@@ -163,6 +163,9 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
     io::stdout().flush()?;
     io::stderr().write_all(step["stderr"].as_str().unwrap_or("").as_bytes())?;
     io::stderr().flush()?;
+    if let Some(path) = step["grandchild"].as_str() {
+        spawn_and_wait_ready(&mut grandchild(path)?, path)?;
+    }
     if let Some(ready) = step["ready"].as_str() {
         fs::write(ready, [])?;
     }
@@ -179,6 +182,7 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
 /// to this instance: its lock survives until this process exits, including death by signal.
 fn grandchild(path: &str) -> io::Result<Command> {
     let mut copy = Command::new(std::env::current_exe()?);
+    copy.env_remove("PROXENOS_STUB_DIR");
     #[cfg(unix)]
     copy.arg("ignore-term");
     copy.arg("out:grandchild ready")

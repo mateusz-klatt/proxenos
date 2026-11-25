@@ -37,6 +37,12 @@ name = "proxenos-stub"
 path = "src/proxenos-stub.rs"
 required-features = ["test-tools"]
 
+# Honest comparison harness driving Proxenos and claude-delegator over stdio.
+[[example]]
+name = "comparison"
+path = "examples/comparison/main.rs"
+required-features = ["test-tools"]
+
 [features]
 # Extra tools that exist only to test the MCP layer through the compiled binary.
 test-tools = []
