@@ -77,7 +77,9 @@ four answers gave four names.
 role. A verifier or challenger that edits has lost its independence, and a test role may edit
 tests only.
 
-**Owner.** Not decided.
+**Owner.** On 2026-11-25, "3 x tak" (yes to all three): the first three to ship are Code Reviewer,
+Debugger and Claim Verifier, which eight of the ten rosters of votes 2 and 6 named. The rest of the
+roster, and the name of the cross-discipline role, are not decided.
 
 ## Vote 3: background delegations and the watchdog (2026-11-24)
 
@@ -150,7 +152,7 @@ the first milestone should contain. Asked because vote 1 had run on weaker model
 | A long answer | A bounded preview, the rest read in pages. | A bounded excerpt, the rest in a file. | A file, chosen by Claude (Fable 5.2, max). Vote 6: six of nine for it. Still provisional. |
 | How the result may change | A schema version from the first release. | Additive changes only, without a version field. | A version field, chosen by Claude (Fable 5.2, max). Vote 6: eight of nine for it. |
 | A warning before starting on a provider at its quota | First version, from a fresh reading. | Later. | Later, chosen by Claude (Fable 5.2, max). Vote 6: eight of nine for later. |
-| The strongest model as each provider's default | Not Proxenos's business to choose everyone's default. | First version. | The strongest, chosen by Claude (Fable 5.2, max), as one user also asked. Vote 6: seven of nine against it. D8 is now written to the proposal of ADR 002, in which Proxenos chooses no model. The owner has not decided it. |
+| The strongest model as each provider's default | Not Proxenos's business to choose everyone's default. | First version. | The strongest, chosen by Claude (Fable 5.2, max), as one user also asked. Vote 6: seven of nine against it. D8 is now ADR 002, in which Proxenos chooses no model. The owner accepted it on 2026-11-25. |
 | Named file inputs | Later. | Not Proxenos's job. | Later, chosen by Claude (Fable 5.2, max). Vote 6: four of nine for later, five for not Proxenos's job. Still provisional. |
 
 Every "chosen by Claude" above was provisional and went to the next vote, which was vote 6. The
@@ -460,7 +462,7 @@ would have answered.
 follows it. Where it is not, the choice stays provisional and the architecture says so. The owner
 has ruled on none of this.
 
-- D8, as a proposal in ADR 002 that the owner has not decided: Proxenos chooses no model. On a
+- D8, as the proposal of ADR 002, since accepted by the owner: Proxenos chooses no model. On a
   start it passes the one that the call or the user's overlay names, and otherwise none. Seven of
   nine opposed the strongest model as the default. Five of them said to pass no model unless one
   is named, and three of those let the user's configuration name it.
@@ -485,13 +487,15 @@ has ruled on none of this.
   parent-death signal (D6), known shim layouts only (D7), tests inside the process (D12), the six
   targets in the first milestone (D13), one file for each session (D19), a configurable limit of
   delegations (D17), stated defaults for `mode` and `access` (D2), and an exit written down for
-  `rmcp` (D4), which is the owner's to decide. D15 still describes the roster as vote 2 left it.
+  `rmcp` (D4), which is the owner's to decide. D15 then still described the roster as vote 2
+  left it.
 
-**Owner.** No ruling on this vote yet. `rmcp` stays, as he decided in vote 4. The roster is still
-not decided.
+**Owner.** On 2026-11-25, "3 x tak" (yes to all three): ADR 002 is accepted, and the first three
+roles are Code Reviewer, Debugger and Claim Verifier. `rmcp` stays, as the owner decided in vote 4.
+The rest of the roster, the await limit and the other provisional choices above are not ruled on.
 
 **Recorded as** the revisions of D2, D5, D8, D9, D17 and D19, and of sections 3, 4 and 5. The
-revision of D8 is the proposal of ADR 002.
+revision of D8 is ADR 002.
 
 ## Waiting for another vote
 
