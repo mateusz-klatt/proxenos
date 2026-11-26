@@ -67,6 +67,51 @@ pub fn claude_settings_path() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".claude").join("settings.json"))
 }
 
+/// Resolves the Codex user configuration file. An explicit CODEX_HOME names an existing
+/// directory. Relative paths are interpreted from the process working directory.
+pub fn codex_settings_path() -> Result<PathBuf, String> {
+    let directory = match env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+        Some(raw) => resolve_codex_directory(Path::new(&raw), "CODEX_HOME")?,
+        None => resolve_default_codex_directory(&home_dir()?.join(".codex"))?,
+    };
+    Ok(directory.join("config.toml"))
+}
+
+fn resolve_default_codex_directory(path: &Path) -> Result<PathBuf, String> {
+    // Bind the same path before and after a missing tail is created. Inspect the link itself
+    // so a dangling directory alias is refused instead of treated as another missing component.
+    let mut ancestor = path;
+    while let Some(parent) = ancestor.parent()
+        && fs::symlink_metadata(ancestor)
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    {
+        ancestor = parent;
+    }
+    let directory = resolve_codex_directory(ancestor, "default Codex configuration")?;
+    let missing = path
+        .strip_prefix(ancestor)
+        .expect("closest directory is an ancestor of the config path");
+    Ok(directory.join(missing))
+}
+
+fn resolve_codex_directory(path: &Path, source: &str) -> Result<PathBuf, String> {
+    let directory = fs::canonicalize(path)
+        .map(normalize_path)
+        .map_err(|error| {
+            format!(
+                "Cannot resolve {source} directory {}: {error}",
+                path.display()
+            )
+        })?;
+    if !directory.is_dir() {
+        return Err(format!(
+            "{source} path {} is not a directory.",
+            path.display()
+        ));
+    }
+    Ok(directory)
+}
+
 /// Resolves the absolute path of the running Proxenos executable without following symlinks.
 ///
 /// On Linux `current_exe()` reads `/proc/self/exe`, which has already resolved symlinks, so
@@ -217,6 +262,63 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(builder, 0o700);
     builder.create(path)
+}
+
+/// Holds the shared integration lock for this state root. Normally the lock is beside
+/// the root, so removal can clean up an empty root. An existing root under a read-only
+/// parent can use a lock inside that root, which is kept through removal and later runs.
+pub fn lock_integration(state_dir: &Path) -> io::Result<fs::File> {
+    const LOCK_NAME: &str = ".proxenos-integrate.lock";
+    let inside = state_dir.join(LOCK_NAME);
+    if inside.try_exists()? {
+        return open_integration_lock(&inside);
+    }
+    let adjacent = state_dir.with_file_name(LOCK_NAME);
+    fs::create_dir_all(adjacent.parent().expect("integration lock has a parent"))?;
+    match open_integration_lock(&adjacent) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ) && !adjacent.try_exists()? =>
+        {
+            open_integration_lock(&inside)
+        }
+        result => result,
+    }
+}
+
+fn open_integration_lock(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    let regular = metadata.is_file();
+    #[cfg(windows)]
+    let regular = {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        regular && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    };
+    if !regular {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "integration lock is not a regular file or is a reparse point",
+        ));
+    }
+    file.lock()?;
+    Ok(file)
 }
 
 /// Records every directory from `root` downward to `target` that does not currently exist, in

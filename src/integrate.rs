@@ -1,15 +1,20 @@
 //! Client registration management for `proxenos integrate` (D10).
 
+mod codex;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::state;
+
+pub use codex::{integrate_codex, read_codex_registration, remove_codex};
 
 pub const CLIENT_CLAUDE_CODE: &str = "claude-code";
 pub const MARKETPLACE_NAME: &str = "proxenos";
@@ -44,7 +49,34 @@ fn io_err(path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -> IntegrateError 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub schema_version: u32,
-    pub clients: BTreeMap<String, ClientRecord>,
+    pub clients: BTreeMap<String, Value>,
+}
+
+impl Manifest {
+    fn record<T: DeserializeOwned>(
+        &self,
+        client: &str,
+        path: &Path,
+    ) -> Result<Option<T>, IntegrateError> {
+        self.clients
+            .get(client)
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    IntegrateError::Message(format!(
+                        "Could not parse {client} integration record in {}: {error}",
+                        path.display()
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    fn insert(&mut self, client: &str, record: &impl Serialize) {
+        self.clients.insert(
+            client.to_owned(),
+            serde_json::to_value(record).expect("integration record serializes"),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +140,7 @@ fn resolve_settings_target(path: &Path) -> Result<ResolvedSettingsPath, Integrat
             .map(state::normalize_path)
             .map_err(|err| {
                 IntegrateError::Message(format!(
-                    "Refusing to modify Claude Code settings symlink {}: target cannot be resolved ({err}).",
+                    "Refusing to modify settings symlink {}: target cannot be resolved ({err}).",
                     path.display()
                 ))
             })?;
@@ -125,26 +157,27 @@ fn resolve_settings_target(path: &Path) -> Result<ResolvedSettingsPath, Integrat
 }
 
 fn check_settings_path_unchanged(
-    record: &ClientRecord,
+    client: &str,
+    recorded_settings_path: &str,
     current_settings_path: &str,
 ) -> Result<(), IntegrateError> {
-    if record.settings_path != current_settings_path {
+    if recorded_settings_path != current_settings_path {
         return Err(IntegrateError::Message(format!(
-            "Refusing to modify Claude Code integration: settings path changed since integrate (recorded {}, current {}).",
-            record.settings_path, current_settings_path
+            "Refusing to modify {client} integration: settings path changed since integrate (recorded {recorded_settings_path}, current {current_settings_path})."
         )));
     }
     Ok(())
 }
 
 fn check_settings_target_unchanged(
-    record: &ClientRecord,
+    settings_is_symlink: bool,
+    settings_symlink_target: Option<&str>,
     resolved: &ResolvedSettingsPath,
     settings_path: &Path,
 ) -> Result<(), IntegrateError> {
     if fs::symlink_metadata(settings_path).is_ok()
-        && (record.settings_is_symlink != resolved.symlink_target.is_some()
-            || record.settings_symlink_target != resolved.symlink_target)
+        && (settings_is_symlink != resolved.symlink_target.is_some()
+            || settings_symlink_target != resolved.symlink_target.as_deref())
     {
         return Err(IntegrateError::Message(format!(
             "Refusing to modify {}: symlink target changed since integrate.",
@@ -192,6 +225,53 @@ fn load_manifest(path: &Path) -> Result<Manifest, IntegrateError> {
         )));
     }
     Ok(manifest)
+}
+
+pub fn read_installed_clients(state_dir: &Path) -> Result<BTreeMap<String, Value>, IntegrateError> {
+    Ok(load_manifest(&manifest_path(state_dir))?.clients)
+}
+
+fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), IntegrateError> {
+    let value = serde_json::to_value(manifest).expect("manifest serializes");
+    write_json_atomic(path, &value, None)?;
+    Ok(())
+}
+
+fn shared_created_dirs(
+    state_dir: &Path,
+    settings_dir: &Path,
+    manifest: &Manifest,
+    mut created_dirs: Vec<String>,
+) -> Result<Vec<String>, IntegrateError> {
+    let shared_paths = [
+        state_dir.to_path_buf(),
+        state_dir.join("integrate"),
+        state_dir.join("integrate").join("backups"),
+        settings_dir.to_path_buf(),
+    ];
+    for path in shared_paths {
+        let name = state::path_string(&path).map_err(io_err(&path))?;
+        if !created_dirs.contains(&name)
+            && [CLIENT_CLAUDE_CODE, codex::CLIENT].iter().any(|client| {
+                manifest.clients.get(*client).is_some_and(|record| {
+                    record["created_dirs"]
+                        .as_array()
+                        .is_some_and(|dirs| dirs.iter().any(|dir| dir.as_str() == Some(&name)))
+                })
+            })
+        {
+            created_dirs.push(name);
+        }
+    }
+    created_dirs.sort_unstable_by(|left, right| {
+        Path::new(left)
+            .components()
+            .count()
+            .cmp(&Path::new(right).components().count())
+            .then_with(|| left.cmp(right))
+    });
+    created_dirs.dedup();
+    Ok(created_dirs)
 }
 
 fn parse_settings(path: &Path, bytes: &[u8]) -> Result<Map<String, Value>, IntegrateError> {
@@ -292,8 +372,9 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
     let settings_str = state::path_string(&settings_path).map_err(io_err(&settings_path))?;
     let manifest_file = manifest_path(&state_dir);
 
+    let _lock = state::lock_integration(&state_dir).map_err(io_err(&manifest_file))?;
     let mut manifest = load_manifest(&manifest_file)?;
-    let existing = manifest.clients.get(CLIENT_CLAUDE_CODE).cloned();
+    let existing: Option<ClientRecord> = manifest.record(CLIENT_CLAUDE_CODE, &manifest_file)?;
 
     let marketplace_is_ours = existing
         .as_ref()
@@ -306,11 +387,16 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
     }
 
     if let Some(record) = &existing {
-        check_settings_path_unchanged(record, &settings_str)?;
+        check_settings_path_unchanged("Claude Code", &record.settings_path, &settings_str)?;
     }
     let resolved_settings = resolve_settings_target(&settings_path)?;
     if let Some(record) = &existing {
-        check_settings_target_unchanged(record, &resolved_settings, &settings_path)?;
+        check_settings_target_unchanged(
+            record.settings_is_symlink,
+            record.settings_symlink_target.as_deref(),
+            &resolved_settings,
+            &settings_path,
+        )?;
     }
     let (mut settings_map, orig_bytes, orig_mode) = match read_optional(&resolved_settings.target)?
     {
@@ -390,6 +476,7 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
         state::plan_private_dir_tree(&state_dir, &backups_dir, &mut created_dirs)
             .map_err(io_err(&backups_dir))?;
     }
+    let created_dirs = shared_created_dirs(&state_dir, claude_dir, &manifest, created_dirs)?;
 
     let marketplace_json_path = marketplace_meta_dir.join("marketplace.json");
     let plugin_json_path = plugin_meta_dir.join("plugin.json");
@@ -458,12 +545,8 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
     // before taking backups or creating the settings or marketplace directories, so an
     // interrupted write never strands directories or entries as foreign.
     state::ensure_private_dir_tree(&state_dir, &integrate_dir).map_err(io_err(&integrate_dir))?;
-    manifest.schema_version = MANIFEST_SCHEMA_VERSION;
-    manifest
-        .clients
-        .insert(CLIENT_CLAUDE_CODE.to_owned(), record.clone());
-    let pending_value = serde_json::to_value(&manifest).expect("manifest serializes");
-    write_json_atomic(&manifest_file, &pending_value, None)?;
+    manifest.insert(CLIENT_CLAUDE_CODE, &record);
+    write_manifest(&manifest_file, &manifest)?;
 
     let took_backup = if need_backup {
         state::ensure_private_dir_tree(&state_dir, &backups_dir).map_err(io_err(&backups_dir))?;
@@ -558,11 +641,8 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
 
     record.pending = false;
     record.settings_written_sha256 = settings_written_sha256;
-    manifest
-        .clients
-        .insert(CLIENT_CLAUDE_CODE.to_owned(), record);
-    let manifest_value = serde_json::to_value(&manifest).expect("manifest serializes");
-    write_json_atomic(&manifest_file, &manifest_value, None)?;
+    manifest.insert(CLIENT_CLAUDE_CODE, &record);
+    write_manifest(&manifest_file, &manifest)?;
 
     Ok(format!(
         "{status_line}\n  marketplace: {marketplace_str}\n  settings: {settings_str}\n  binary: {binary_str}\n"
@@ -599,20 +679,31 @@ fn remove_managed_entry(
 }
 
 pub fn remove_claude_code() -> Result<String, IntegrateError> {
+    const NOT_INSTALLED: &str = "Claude Code integration is not installed; nothing to remove.\n";
     let state_dir = state::require_state_dir().map_err(IntegrateError::Message)?;
     let current_settings_path = state::claude_settings_path().map_err(IntegrateError::Message)?;
     let current_settings_str =
         state::path_string(&current_settings_path).map_err(io_err(&current_settings_path))?;
+    if !state_dir.try_exists().map_err(io_err(&state_dir))? {
+        return Ok(NOT_INSTALLED.to_owned());
+    }
     let manifest_file = manifest_path(&state_dir);
+    let _lock = state::lock_integration(&state_dir).map_err(io_err(&manifest_file))?;
     let mut manifest = load_manifest(&manifest_file)?;
-    let Some(record) = manifest.clients.get(CLIENT_CLAUDE_CODE).cloned() else {
-        return Ok("Claude Code integration is not installed; nothing to remove.\n".to_owned());
+    let Some(record): Option<ClientRecord> = manifest.record(CLIENT_CLAUDE_CODE, &manifest_file)?
+    else {
+        return Ok(NOT_INSTALLED.to_owned());
     };
 
-    check_settings_path_unchanged(&record, &current_settings_str)?;
+    check_settings_path_unchanged("Claude Code", &record.settings_path, &current_settings_str)?;
     let settings_path = Path::new(&record.settings_path);
     let resolved_settings = resolve_settings_target(settings_path)?;
-    check_settings_target_unchanged(&record, &resolved_settings, settings_path)?;
+    check_settings_target_unchanged(
+        record.settings_is_symlink,
+        record.settings_symlink_target.as_deref(),
+        &resolved_settings,
+        settings_path,
+    )?;
     let mut refused = Vec::new();
     if let Some(data) = read_optional(&resolved_settings.target)? {
         let restore_bytes = if let (Some(expected), Some(backup_path)) = (
@@ -679,8 +770,7 @@ pub fn remove_claude_code() -> Result<String, IntegrateError> {
     if manifest.clients.is_empty() {
         remove_if_exists(&manifest_file)?;
     } else {
-        let manifest_value = serde_json::to_value(&manifest).expect("manifest serializes");
-        write_json_atomic(&manifest_file, &manifest_value, None)?;
+        write_manifest(&manifest_file, &manifest)?;
     }
 
     for dir in record.created_dirs.iter().rev() {

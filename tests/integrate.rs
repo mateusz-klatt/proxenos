@@ -1,5 +1,8 @@
 //! Behavioural tests for `proxenos integrate claude-code [--remove]` and `proxenos doctor` (D10).
 
+#[path = "integrate/codex.rs"]
+mod codex;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -554,6 +557,10 @@ fn refuses_modified_entries_on_rerun_and_invalid_config_shapes() {
 #[test]
 fn remove_cleans_up_fresh_install_and_second_remove_is_idempotent() {
     let sb = Sandbox::new();
+    let never_installed = sb.run(&["integrate", "claude-code", "--remove"]);
+    assert!(never_installed.status.success());
+    assert!(String::from_utf8_lossy(&never_installed.stdout).contains("nothing to remove"));
+    assert!(!sb.state_dir().exists());
     assert!(sb.run(&["integrate", "claude-code"]).status.success());
 
     let first = sb.run(&["integrate", "claude-code", "--remove"]);
