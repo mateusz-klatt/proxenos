@@ -33,9 +33,10 @@ pub(super) const SPEC: Provider = Provider {
             "Codex requests its OS read-only sandbox. Writes, including build caches, can fail.",
         ),
     ],
-    not_claimed: &[],
     fixed_instructions: true,
     reply_model: false,
+    not_claimed: &[],
+    read_only_not_claimed: &[],
     prepare,
     argv,
     parse,
@@ -45,7 +46,7 @@ fn is_canonical_uuid(id: &str) -> bool {
     uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
 }
 
-fn prepare(turn: &Turn) -> Result<(), String> {
+fn prepare(turn: &mut Turn) -> Result<(), String> {
     if turn.prompt == "-" {
         return Err("Codex interprets a lone dash as a request to read stdin.".into());
     }

@@ -31,9 +31,10 @@ pub(super) const SPEC: Provider = Provider {
             "Antigravity denies shell permission in print mode. It can still write files, search the web and fetch URLs.",
         ),
     ],
-    not_claimed: &[],
     fixed_instructions: false,
     reply_model: true,
+    not_claimed: &[],
+    read_only_not_claimed: &[],
     prepare,
     argv,
     parse,
@@ -61,7 +62,7 @@ fn is_valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
 }
 
-fn prepare(turn: &Turn) -> Result<(), String> {
+fn prepare(turn: &mut Turn) -> Result<(), String> {
     let Some(id) = &turn.thread_id else {
         return Ok(());
     };

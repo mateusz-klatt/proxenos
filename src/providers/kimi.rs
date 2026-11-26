@@ -28,6 +28,7 @@ pub(super) const SPEC: Provider = Provider {
     not_claimed: &[
         "That the delegation was free of the working directory's AGENTS.md; Kimi Code auto-loads it and has no switch to disable it.",
     ],
+    read_only_not_claimed: &[],
     fixed_instructions: false,
     reply_model: false,
     prepare,
@@ -43,7 +44,7 @@ fn is_valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
 }
 
-fn prepare(turn: &Turn) -> Result<(), String> {
+fn prepare(turn: &mut Turn) -> Result<(), String> {
     if let Some(id) = &turn.thread_id
         && !is_valid_id(id)
     {
