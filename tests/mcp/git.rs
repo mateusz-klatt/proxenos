@@ -227,3 +227,70 @@ fn git_omits_an_unsupported_object_format_without_affecting_the_call() {
         .count();
     assert_eq!(git_runs, 2);
 }
+
+#[test]
+fn stalled_git_lookup_can_be_cancelled_or_timed_out_and_is_reused_after_release() {
+    use serde_json::Value;
+
+    let fleet = Fleet::new(&["git", "agy"]);
+    let gate_path = fleet.root.join("git-lookup.lock");
+    let gate = fs::File::create(&gate_path).unwrap();
+    gate.lock().unwrap();
+    let metadata = json!({"stdout": format!("{}\nobjects\nindex\nsha1\n", fleet.root.display())});
+    let status = json!({"stdout": "?? recovered.txt\u{0}"});
+    fleet.script("git", json!([metadata, status, metadata, status]));
+    fleet.script("agy", json!([turn("without Git"), turn("with Git")]));
+
+    let mut cmd = fleet.command("codex");
+    cmd.env("PROXENOS_TEST_GIT_LOOKUP_LOCK", &gate_path);
+    let mut server = Server::start_command(cmd);
+    server.initialize("2025-11-25");
+    server.request(1, "tools/list", json!({}));
+
+    let control = |server: &mut Server, name: &str, args: Value| -> Value {
+        let reply = server.call(2, name, args);
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
+        serde_json::from_str(text(&reply)).unwrap()
+    };
+    let started = control(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "cancel", "wait": false}),
+    );
+    server.wait_for_stderr("git lookup waiting on test gate");
+    let handle = started["handle"].as_str().unwrap();
+    let cancelled = control(&mut server, "cancel", json!({"handle": handle}));
+    assert_eq!(cancelled["cancel_requested"], true, "{cancelled}");
+    let done = control(&mut server, "await", json!({"handles": [handle]}));
+    assert_observed_failure(&done["results"][0]["result"], "cancellation", "");
+
+    let timed = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "timeout", "timeout_ms": 500}),
+    );
+    assert_observed_failure(&timed, "timeout", "deadline");
+    fleet.assert_steps_remaining("agy", 2);
+
+    // An ordinary delegation can still run when the best-effort Git observation times out.
+    let skipped = call(&mut server, "antigravity", json!({"prompt": "continue"}));
+    assert_eq!(skipped["reported"]["content"], "without Git", "{skipped}");
+    assert!(skipped["observed"]["git"].is_null());
+    fleet.assert_steps_remaining("git", 4);
+
+    gate.unlock().unwrap();
+    let recovered = call(&mut server, "antigravity", json!({"prompt": "observe"}));
+    assert_eq!(recovered["reported"]["content"], "with Git", "{recovered}");
+    for when in ["before", "after"] {
+        assert_eq!(
+            recovered["observed"]["git"][when]["untracked"],
+            json!(["recovered.txt"]),
+            "{recovered}"
+        );
+    }
+    fleet.assert_steps_remaining("git", 0);
+    fleet.assert_steps_remaining("agy", 0);
+    assert!(server.finish().0.success());
+    let stderr = server.stderr();
+    assert_eq!(stderr.matches("git lookup waiting on test gate").count(), 1);
+}
