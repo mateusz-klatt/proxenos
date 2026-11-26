@@ -586,9 +586,11 @@ async fn run_handshake(
         Err(_) => Err(HandshakeError::TimedOut(limit)),
     };
 
-    // Close stdin first so a server that reacts to EOF exits cleanly before any signal is sent,
-    // bounded by both the 2-second clean-exit grace and the handshake deadline. Only if it does
-    // not exit on its own do we escalate through D6's stop (SIGTERM, grace, SIGKILL) and finish.
+    // Drain stdout while the server handles stdin EOF so a full pipe cannot prevent it from
+    // exiting. Keep the clean-exit grace bounded by the handshake deadline.
+    let drain_stdout = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+    });
     drop(stdin);
     let grace_deadline =
         tokio_deadline.min(tokio::time::Instant::now() + HANDSHAKE_CLEAN_EXIT_GRACE);
@@ -600,7 +602,7 @@ async fn run_handshake(
     } else {
         false
     };
-    drop(reader);
+    drain_stdout.abort();
     let stop_error = if exited_cleanly {
         None
     } else {
