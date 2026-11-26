@@ -167,13 +167,13 @@ pub(super) async fn read(
         }
     })
     .await;
-    if result.is_err() {
-        let _ = child.stop().await;
-    }
+    let stopped = if result.is_err() {
+        child.stop().await
+    } else {
+        Ok(())
+    };
     let (status, _) = child.finish().await;
+    let status = stopped.and(status).map_err(|_| "cleanup_failed")?;
     let report = result?;
-    status
-        .is_ok_and(|s| s.success())
-        .then_some(report)
-        .ok_or("unavailable")
+    status.success().then_some(report).ok_or("unavailable")
 }

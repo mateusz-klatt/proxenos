@@ -521,6 +521,39 @@ mod linux_supervision {
     }
 
     #[test]
+    fn an_account_read_reports_a_denied_stop_even_when_the_final_kill_reaps_the_cli() {
+        let fleet = Fleet::new(&["codex"]);
+        let lock = fleet.root.join("codex-account");
+        fleet.script("codex", json!([{"hold_file":lock,"sleep_ms":60_000}]));
+        let mut server = server_without_sigterm(&fleet);
+        server.start_call(9, "usage", json!({"providers":["codex"]}));
+        let until = Instant::now() + common::WAIT;
+        while !lock.with_extension("ready").is_file() {
+            assert!(
+                Instant::now() < until,
+                "Codex stub did not acquire its lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let witness = std::fs::File::options().write(true).open(lock).unwrap();
+        assert!(matches!(
+            witness.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        server.close_input();
+        let report: Value = serde_json::from_str(common::text(&server.response(9))).unwrap();
+        assert_eq!(
+            report["providers"]["codex"],
+            json!({"status":"unavailable","reason":"cleanup_failed"})
+        );
+        assert!(
+            witness.try_lock().is_ok(),
+            "Codex stub still holds its lock"
+        );
+        assert!(server.wait_for_exit(common::EXIT_WAIT).0.success());
+    }
+
+    #[test]
     fn denied_stop_after_spawn_keeps_dispatch_evidence_and_cleans_up_after_reap() {
         let fleet = Fleet::new(&["agy"]);
         let ready = fleet.root.join("live.ready");
