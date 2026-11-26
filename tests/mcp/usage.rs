@@ -220,6 +220,46 @@ fn codex_requires_a_matching_rpc_response_and_keeps_account_errors_private() {
 }
 
 #[test]
+fn a_reported_account_error_allows_the_app_server_to_exit_normally() {
+    let fleet = Fleet::new(&["codex"]);
+    let lock = fleet.root.join("rpc-error");
+    let release = fleet.root.join("allow-exit");
+    let mut step = rpc(
+        json!({"id":2,"error":{"code":-32600,"message":"codex account authentication required to read rate limits"}}),
+    );
+    step["hold_file"] = json!(lock);
+    step["wait_for"] = json!(release);
+    fleet.script("codex", json!([step]));
+    let mut server = fleet.server("cursor");
+    server.start_call(14, "usage", json!({"providers":["codex"]}));
+    let until = Instant::now() + WAIT;
+    while !lock.with_extension("ready").exists() {
+        assert!(
+            Instant::now() < until,
+            "app-server failed to finish its RPC exchange"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        server
+            .next_frame(Instant::now() + Duration::from_millis(150))
+            .is_none()
+    );
+    let witness = std::fs::File::options().write(true).open(&lock).unwrap();
+    assert!(matches!(
+        witness.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    std::fs::write(release, []).unwrap();
+    let report: Value = serde_json::from_str(text(&server.response(14))).unwrap();
+    assert_eq!(
+        report["providers"]["codex"],
+        json!({"status":"unavailable","reason":"authentication"})
+    );
+    assert!(witness.try_lock().is_ok());
+}
+
+#[test]
 fn a_closed_connection_stops_each_running_account_read() {
     for (source, cli, next) in [
         ("codex", "codex", "cursor"),
@@ -337,7 +377,19 @@ fn an_exited_account_reader_cannot_leave_its_output_pipes_with_a_descendant() {
 fn an_unlaunchable_account_cli_does_not_disclose_os_diagnostics() {
     let fleet = Fleet::new(&[]);
     let mut server = fleet.server("cursor");
-    for (source, cli) in [("codex", "codex"), ("cursor", "cursor-agent")] {
+    for (source, cli, step) in [
+        (
+            "codex",
+            "codex",
+            rpc(json!({"id":2,"result":{"rateLimits":{}}})),
+        ),
+        (
+            "cursor",
+            "cursor-agent",
+            json!({"stdout":r#"{"subscriptionTier":"Pro"}"#}),
+        ),
+    ] {
+        fleet.script(cli, json!([step]));
         let path = fleet
             .root
             .join("bin")
@@ -363,5 +415,10 @@ fn an_unlaunchable_account_cli_does_not_disclose_os_diagnostics() {
             reports[source],
             json!({"status":"unavailable","reason":"unavailable"})
         );
+        assert!(
+            fleet.records().is_empty(),
+            "a locked or non-executable CLI started"
+        );
+        fleet.assert_steps_remaining(cli, 1);
     }
 }

@@ -542,7 +542,10 @@ supported: Kimi is used through its subscription.
 The shared MCP tool currently accepts `providers: ["codex", "cursor"]` or either name alone.
 It can read the calling client's own subscription. Each provider has its own status and a
 ten-second deadline including CLI lookup, followed by D6 process cleanup. Failure to read one
-account leaves the other result available.
+account leaves the other result available. If the OS stalls while creating a process, the
+account read can return while the launch worker still waits for a handle. D6 cleans up a
+handle that arrives later. On Windows, an invalid executable can trigger an OS loader dialog
+during that wait.
 
 - Codex CLI 0.172.0 accepts `account/rateLimits/read` over `app-server --listen stdio://`
   after initialization. Proxenos asks for windows without reset credit details. It prefers the

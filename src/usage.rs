@@ -117,6 +117,14 @@ pub async fn call(
     }
 }
 
+async fn read_interruption(deadline: Instant, cancel: &CancellationToken) -> &'static str {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => "cancelled",
+        () = tokio::time::sleep_until(deadline.into()) => "timeout",
+    }
+}
+
 async fn read_cursor(
     mut exe: Executable,
     deadline: Instant,
@@ -136,9 +144,14 @@ async fn read_cursor(
         capture_limit: REPORT_LIMIT,
         temporary_files: Vec::new(),
     };
-    let run = supervise::run(launch, cancel, activity)
-        .await
-        .map_err(|_| "unavailable")?;
+    let run = supervise::run_with_interruptible_spawn(
+        launch,
+        cancel,
+        activity,
+        read_interruption(deadline, cancel),
+    )
+    .await?
+    .map_err(|_| "unavailable")?;
     match run.ending {
         Ending::TimedOut => return Err("timeout"),
         Ending::Cancelled => return Err("cancelled"),

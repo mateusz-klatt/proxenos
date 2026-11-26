@@ -3,6 +3,7 @@
 pub(crate) mod cleanup;
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::pin;
@@ -167,10 +168,47 @@ pub(crate) async fn write_stdin(
     result
 }
 
+pub(crate) async fn until_interrupted<T, E>(
+    operation: impl Future<Output = T>,
+    interrupt: impl Future<Output = E>,
+) -> Result<T, E> {
+    tokio::select! {
+        biased;
+        reason = interrupt => Err(reason),
+        value = operation => Ok(value),
+    }
+}
+
+/// An interrupted wait cannot say whether native process creation already started.
+pub(crate) async fn run_with_interruptible_spawn<E>(
+    launch: Launch,
+    cancel: &CancellationToken,
+    activity: Activity,
+    interrupt: impl Future<Output = E>,
+) -> Result<io::Result<Finished>, E> {
+    let (accepted, received) = oneshot::channel();
+    let mut running = pin!(run_inner(launch, cancel, activity, Some(accepted)));
+    tokio::select! {
+        biased;
+        // Once the supervisor owns the child, wait for its complete D6 result.
+        _ = received => Ok(running.await),
+        result = until_interrupted(&mut running, interrupt) => result,
+    }
+}
+
 pub async fn run(
+    launch: Launch,
+    cancel: &CancellationToken,
+    activity: Activity,
+) -> io::Result<Finished> {
+    run_inner(launch, cancel, activity, None).await
+}
+
+async fn run_inner(
     mut launch: Launch,
     cancel: &CancellationToken,
     activity: Activity,
+    accepted: Option<oneshot::Sender<()>>,
 ) -> io::Result<Finished> {
     let started = Instant::now();
     let mut command = Command::new(&launch.program);
@@ -226,6 +264,9 @@ pub async fn run(
             };
         }
     };
+    if let Some(accepted) = accepted {
+        let _ = accepted.send(());
+    }
     let out = child.stdout.take().expect("stdout was piped");
     let err = child.stderr.take().expect("stderr was piped");
     let mut stdout = Captured::default();

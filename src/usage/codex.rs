@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::discovery::Executable;
 use crate::mcp::Activity;
 use crate::platform;
-use crate::supervise::{StartError, check_start, write_stdin};
+use crate::supervise::{StartError, check_start, until_interrupted, write_stdin};
 
 type Output = Take<BufReader<ChildStdout>>;
 type ReadResult<T> = Result<T, &'static str>;
@@ -66,7 +66,7 @@ async fn drain<R: AsyncRead + Unpin>(reader: &mut Take<R>) -> ReadResult<()> {
     (reader.limit() != 0).then_some(()).ok_or("capture")
 }
 
-async fn exchange(mut reader: Output, writer: io::PipeWriter) -> ReadResult<Value> {
+async fn request_limits(reader: &mut Output, writer: io::PipeWriter) -> ReadResult<Value> {
     let mut writer = Some(writer);
     let init = json!({"id":1, "method":"initialize", "params":{"clientInfo":{
         "name":"proxenos", "version":env!("CARGO_PKG_VERSION")
@@ -74,16 +74,13 @@ async fn exchange(mut reader: Output, writer: io::PipeWriter) -> ReadResult<Valu
     write_stdin(&mut writer, format!("{init}\n"))
         .await
         .map_err(unavailable)?;
-    response(&mut reader, 1).await?;
+    response(reader, 1).await?;
     let ready = json!({"method":"initialized"});
     let limits = json!({"id":2, "method":"account/rateLimits/read", "params":{"excludeResetCreditDetails":true}});
     write_stdin(&mut writer, format!("{ready}\n{limits}\n"))
         .await
         .map_err(unavailable)?;
-    let result = response(&mut reader, 2).await?;
-    drop(writer);
-    drain(&mut reader).await?;
-    Ok(result)
+    response(reader, 2).await
 }
 
 async fn bounded<T>(
@@ -91,20 +88,16 @@ async fn bounded<T>(
     cancel: &CancellationToken,
     operation: impl Future<Output = ReadResult<T>>,
 ) -> ReadResult<T> {
-    let result = tokio::select! {
-        biased;
-        () = cancel.cancelled() => None,
-        () = tokio::time::sleep_until(deadline.into()) => None,
-        result = operation => Some(result),
-    };
+    let result = until_interrupted(operation, super::read_interruption(deadline, cancel)).await;
     // A worker can skip the launch before Tokio delivers the timer tick. The token and
     // monotonic clock still identify why it skipped when its result wins the select.
     if cancel.is_cancelled() {
         return Err("cancelled");
     }
-    result
-        .filter(|_| Instant::now() < deadline)
-        .unwrap_or(Err("timeout"))
+    if Instant::now() >= deadline {
+        return Err("timeout");
+    }
+    result?
 }
 
 pub(super) async fn read(
@@ -142,7 +135,7 @@ pub(super) async fn read(
     })
     .await?;
     let writer = child.stdin.take().expect("stdin was piped");
-    let stdout = BufReader::new(child.stdout.take().expect("stdout was piped"))
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout was piped"))
         .take(super::REPORT_LIMIT as u64 + 1);
     let mut stderr = child
         .stderr
@@ -151,7 +144,14 @@ pub(super) async fn read(
         .take(super::REPORT_LIMIT as u64 + 1);
     let result = bounded(deadline, cancel, async {
         let mut pipes = pin!(async {
-            let (value, ()) = tokio::try_join!(exchange(stdout, writer), drain(&mut stderr))?;
+            // A protocol error also ends the dialogue. Closing stdin lets a well-behaved
+            // app-server exit and flush its remaining output before D6 reaps it.
+            let stdout_exchange = async {
+                let reported = request_limits(&mut stdout, writer).await;
+                drain(&mut stdout).await?;
+                Ok(reported)
+            };
+            let (value, ()) = tokio::try_join!(stdout_exchange, drain(&mut stderr))?;
             Ok(value)
         });
         let mut wait = pin!(child.wait_for_exit());
@@ -176,6 +176,6 @@ pub(super) async fn read(
     };
     let (status, _) = child.finish().await;
     let status = stopped.and(status).map_err(|_| "cleanup_failed")?;
-    let report = result?;
+    let report = result??;
     status.success().then_some(report).ok_or("unavailable")
 }
