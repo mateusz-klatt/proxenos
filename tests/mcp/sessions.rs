@@ -47,6 +47,18 @@ fn single_session_file(dir: &Path) -> PathBuf {
     files.pop().unwrap()
 }
 
+fn assert_no_staging_files(dir: &Path) {
+    let staging_left: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".proxenos.tmp.") || name.starts_with(".tmp-"))
+        .collect();
+    assert!(
+        staging_left.is_empty(),
+        "left staging files: {staging_left:?}"
+    );
+}
+
 fn agy_store(fleet: &Fleet) -> PathBuf {
     fleet.root.join(".gemini/antigravity-cli/conversations")
 }
@@ -131,6 +143,7 @@ fn reply_after_server_restart_uses_persisted_file_and_stores_no_secrets() {
             0o600
         );
     }
+    assert_no_staging_files(&provider_dir);
 
     let raw = fs::read_to_string(&session_file).unwrap();
     for forbidden in [
@@ -243,6 +256,7 @@ fn reply_after_server_restart_uses_persisted_file_and_stores_no_secrets() {
     assert_eq!(refreshed_json["ambiguous"], false);
     assert_eq!(refreshed_json["settings"]["model"], "refreshed-model");
     assert!(refreshed_json["saved_at_epoch_s"].as_u64().unwrap() > 1);
+    assert_no_staging_files(&provider_dir);
 }
 
 #[test]
@@ -820,15 +834,7 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
         json!({"prompt": "save fails cleanly", "model": "seed-model"}),
     );
     assert_eq!(saved_err_turn["observed"]["state"], "finished");
-    let staging_left: Vec<_> = fs::read_dir(&provider_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with(".tmp-"))
-        .collect();
-    assert!(
-        staging_left.is_empty(),
-        "left staging files: {staging_left:?}"
-    );
+    assert_no_staging_files(&provider_dir);
     server2.wait_for_stderr("could not save session settings");
 
     // Replacing the provider sessions directory with a regular file also fails save safely.

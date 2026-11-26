@@ -6,12 +6,11 @@
 //! never stored here.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::providers::{Provider, RememberedStart, Settings, is_valid_model};
 use crate::state;
@@ -206,29 +205,12 @@ pub fn save(
             "session payload exceeds size limit",
         ));
     }
-    let staging = provider_dir.join(format!(".tmp-{}", Uuid::new_v4()));
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let _staging_guard = Staging(staging.clone());
-    let mut file = options.open(&staging)?;
-    file.write_all(&encoded)?;
-    drop(file);
-    fs::rename(&staging, &target)?;
+    state::write_atomic(&target, &encoded, None)?;
     Ok(if ambiguous {
         SaveOutcome::Ambiguous
     } else {
         SaveOutcome::Saved
     })
-}
-
-struct Staging(PathBuf);
-
-impl Drop for Staging {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
 }
 
 fn verify_existing_dir(path: &Path) -> io::Result<()> {
