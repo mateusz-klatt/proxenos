@@ -243,6 +243,21 @@ fixtures are synthetic, derived from claude-delegator's code. Capturing real CLI
 pre-turn errors that spend no model call (such as `codex exec` with an invalid model while logged
 out) as well as live turn output—is the next step.
 
+Measured for Kimi (`kimi 2.8.0` on Linux x86_64, 2026-11-26): non-interactive turns run with
+`--output-format stream-json [-S <id>] [-m <model>] -p <prompt>` in the delegation's working
+directory. Kimi print mode has no permission tier—`--plan`, `--yolo` and `--auto` are rejected
+when combined with `-p`—so Proxenos advertises only `access: full` and refuses `access: read-only`
+with `invalid_request` before dispatch. Kimi auto-loads `AGENTS.md` from the working directory with
+no disable switch; Proxenos states this in `access`'s description and in `not_claimed`. Replies
+resume only by explicit `-S <id>` (never `--continue` / `-c`) and repeat the working directory
+because Kimi sessions are directory-bound; Kimi accepts `-m` on replies without requiring one, so
+model-less starts omit `-m` on reply (D19) while named models are reapplied from `StartStore` or
+the persisted session file. `stream-json` emits `system.version`, `assistant` content chunks, and a
+terminal `session.resume_hint` carrying `session_id` (and neither a model name nor token usage in
+2.8.0); Proxenos treats `session.resume_hint` plus non-empty assistant content as completion
+evidence and rejects any reply whose reported `session_id` does not match the requested ID without
+returning or archiving content.
+
 ### D6. Children are supervised to the end
 
 - **Unix**: the child calls `setsid` before it executes the CLI. It leads its own session and

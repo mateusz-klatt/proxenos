@@ -33,6 +33,7 @@ pub(super) const SPEC: Provider = Provider {
             "Codex requests its OS read-only sandbox. Writes, including build caches, can fail.",
         ),
     ],
+    not_claimed: &[],
     fixed_instructions: true,
     reply_model: false,
     prepare,
