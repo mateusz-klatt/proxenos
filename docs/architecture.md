@@ -239,29 +239,54 @@ These checks cannot make the store lookup atomic with Antigravity's own lookup.
 `~/.gemini/antigravity-cli/conversations`.
 
 For Claude Code, Proxenos runs `claude --print --output-format json --disable-slash-commands`
-with `--permission-mode plan` for `read-only`, `--permission-mode bypassPermissions` for `full`
-(because `acceptEdits` leaves non-allowlisted shell commands denied in non-interactive print mode),
-`--append-system-prompt` on starts, `--resume <uuid>` on replies (never `--continue`), optional
-`--model` and `--effort` (`low`, `medium`, `high`, `xhigh`, `max`), and `-- <prompt>`. Because
-`--resume` accepts session titles as well as UUIDs, Proxenos requires a canonical UUID before
-dispatch and confirms the returned `session_id` before accepting response content, model, usage, or
-cost. Because `--system-prompt-snapshot` defaults to `on` and reuses the initial system prompt
-verbatim on resumes, `fixed_instructions` is `true` and Proxenos refuses mode or instructions
-changes on a reply. Because `claude --resume` retains the session's model when `--model` is omitted,
-`reply_model` is `false` (D19 reapplies an explicit start model and passes no `--model` on a
-model-less start). Claude Code's `plan` mode is a provider permission policy rather than an OS
-sandbox, and user or project settings files and permission allow-lists can interact with it; this
-limit is stated in both the tool schema and `not_claimed`. Self-delegation and recursive delegation
-are stopped by D1 (`--client claude` omits `claude` and `claude-reply`) and the D13 depth guard
-(`PROXENOS_DEPTH=1` and `CLAUDE_DELEGATOR_*_DEPTH=1` set on child processes and refused before
-discovery when present, with `CLAUDECODE` stripped from delegated children); a provider with full
-access can still invoke another CLI directly or clear environment variables. The JSON result object
-is mapped into `reported` (`thread_id`, `content`, single-entry `modelUsage` model, allowlisted
-`usage` token counters, and `cost_usd` from `total_cost_usd`). `is_error: true` (emitted even
-alongside `subtype: "success"` on API and login errors), non-`"success"` subtypes, empty results,
-and zero-turn exits (`num_turns: 0`, such as local slash commands) are reported as failures.
-Measured on 2026-11-26 on Linux x86_64 against Claude Code `2.1.332` (two live `haiku` turns in
-`--permission-mode plan` plus zero-model error captures).
+with `--permission-mode plan --setting-sources user` for `read-only`, `--permission-mode
+bypassPermissions` for `full` (because `acceptEdits` leaves non-allowlisted shell commands denied
+in non-interactive print mode), `--append-system-prompt` on starts, `--resume <uuid>` on replies
+(never `--continue`), optional `--model` and `--effort` (`low`, `medium`, `high`, `xhigh`, `max`),
+and `-- <prompt>`. Because `--resume` accepts session titles as well as UUIDs, Proxenos requires a
+canonical UUID before dispatch and confirms the returned `session_id` before accepting response
+content, model, usage, or cost. Because Claude Code retains the initial `--append-system-prompt`
+across `--resume`, `fixed_instructions` is `true` and Proxenos refuses mode or instructions changes
+on a reply. Because Claude Code's documentation states `claude --resume` retains the session's
+model when `--model` is omitted, `reply_model` is `false` (D19 reapplies an explicit start model
+and passes no `--model` on a model-less start). With `--print`, Claude Code skips workspace trust;
+without `--setting-sources user`, project `.claude/settings.json` and `.claude/settings.local.json`
+`SessionStart` hooks and `.mcp.json` servers execute even under `--permission-mode plan`. Passing
+`--setting-sources user` under `read-only` excludes project and local settings sources, but does
+not create an OS sandbox and does not prevent user or managed settings, hooks, or permission
+allow-lists from interacting with plan mode (and under `full`, project settings still load). Both
+non-claims are stated in `not_claimed` (with the plan-mode non-claim added only under `read-only`)
+and in the tool schema. Self-delegation and recursive delegation are stopped by D1 (`--client
+claude` omits `claude` and `claude-reply`) and the D13 depth guard (`PROXENOS_DEPTH=1` and
+`CLAUDE_DELEGATOR_*_DEPTH=1` set on child processes and refused before discovery when present, with
+`CLAUDECODE` stripped from delegated children); a provider with full access can still invoke another
+CLI directly or clear environment variables. The JSON result object is mapped into `reported`
+(`thread_id`, `content`, single-entry `modelUsage` model, allowlisted `usage` token counters, and
+`session_cost_usd` from `total_cost_usd`, which is cumulative for the session rather than per-turn).
+`is_error: true` (emitted even alongside `subtype: "success"` on API and login errors),
+non-`"success"` subtypes (preferring the `errors` array over `result`), empty results, and
+zero-turn exits (`num_turns: 0`, such as local slash commands) are reported as failures.
+
+Measured on 2026-11-26 on Linux x86_64 against Claude Code `2.1.332`:
+- Live model captures (4 turns with `--model haiku` and `--permission-mode plan` in empty `/tmp`
+  directories; all four reported `claude-sonnet-5-5` in `modelUsage`): start and resume JSON shape
+  and cumulative session `total_cost_usd` / `modelUsage` (`captured-start-ok.stdout.json`,
+  `captured-resume-ok.stdout.json`), and persistence of `--append-system-prompt` across `--resume`
+  without re-passing it (`captured-canary-start.stdout.json`, `captured-canary-resume.stdout.json`,
+  returning the codeword `ZEBRA-41`).
+- Zero-model CLI measurements: `is_error: true` with `subtype: "success"` on unknown model and
+  unauthenticated `--bare` (`captured-unknown-model.stdout.json`, `captured-unknown-model.stderr.txt`,
+  `captured-not-logged-in.stdout.json`), unknown `--resume` UUID and session-title lookup
+  (`captured-bogus-resume.stderr.txt`), `num_turns: 0` local slash command exit
+  (`captured-local-command.stdout.json`) and `--disable-slash-commands` blocking `/cost` execution,
+  `--effort` valid values (`low`, `medium`, `high`, `xhigh`, `max`), and project
+  `.claude/settings.json` / `.claude/settings.local.json` `SessionStart` hooks plus `.mcp.json`
+  executing under default settings in `--permission-mode plan` but not under `--setting-sources user`.
+- Documented only (not live-measured): model persistence across `--resume` when `--model` is
+  omitted, `--effort` effect on live turns, `--disable-slash-commands` on non-canary tool turns,
+  `--permission-mode bypassPermissions` vs `acceptEdits` tool approval behavior, `error_max_turns` /
+  `error_during_execution` / `permission_denials` JSON payloads (synthetic fixtures), managed
+  settings and `CLAUDE.md` behavior under `--setting-sources user`, and Windows/macOS execution.
 
 Not measured: Proxenos has not yet captured the real Codex or `agy` CLI output shape; the
 fixtures are synthetic, derived from claude-delegator's code. Capturing real CLI output—including

@@ -33,6 +33,7 @@ pub struct Provider {
     pub fixed_instructions: bool,
     pub reply_model: bool,
     pub not_claimed: &'static [&'static str],
+    pub read_only_not_claimed: &'static [&'static str],
     pub prepare: fn(&Turn) -> Result<(), String>,
     pub argv: fn(&Turn, &Path) -> CommandLine,
     pub parse: fn(&Finished, &str, Option<&str>) -> Report,
@@ -92,7 +93,7 @@ pub struct Report {
     pub model: Option<String>,
     pub usage: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost_usd: Option<f64>,
+    pub session_cost_usd: Option<f64>,
     pub failure: Option<Failure>,
     pub diagnostic: Option<String>,
     #[serde(skip)]

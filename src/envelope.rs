@@ -61,6 +61,7 @@ pub struct Envelope {
     attempts: Vec<Value>,
     accounting: Option<Accounting>,
     not_claimed: &'static [&'static str],
+    access_not_claimed: &'static [&'static str],
 }
 
 impl Envelope {
@@ -77,6 +78,7 @@ impl Envelope {
             attempts: Vec::new(),
             accounting: None,
             not_claimed: provider.not_claimed,
+            access_not_claimed: &[],
             observed: json!({
                 "provider": provider.name,
                 "requested": requested,
@@ -120,6 +122,9 @@ impl Envelope {
                 .find(|(name, _)| *name == turn.settings.access)
                 .map(|(_, text)| text);
             self.observed["access_mechanism"] = json!(mechanism);
+            if turn.settings.access == "read-only" {
+                self.access_not_claimed = provider.read_only_not_claimed;
+            }
         }
         self.accounting = Some(merge_accounting(self.accounting.take(), &result.accounting));
         self.attempts.push(json!({
@@ -173,6 +178,7 @@ impl Envelope {
             "A git snapshot identifies the author of a change or captures every edit.",
         ];
         not_claimed.extend_from_slice(self.not_claimed);
+        not_claimed.extend_from_slice(self.access_not_claimed);
         let value = json!({
             "schema_version": 1,
             "observed": self.observed,

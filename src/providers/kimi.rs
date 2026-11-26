@@ -28,6 +28,7 @@ pub(super) const SPEC: Provider = Provider {
     not_claimed: &[
         "That the delegation was free of the working directory's AGENTS.md; Kimi Code auto-loads it and has no switch to disable it.",
     ],
+    read_only_not_claimed: &[],
     fixed_instructions: false,
     reply_model: false,
     prepare,

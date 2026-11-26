@@ -34,6 +34,7 @@ pub(super) const SPEC: Provider = Provider {
     fixed_instructions: false,
     reply_model: true,
     not_claimed: &[],
+    read_only_not_claimed: &[],
     prepare,
     argv,
     parse,

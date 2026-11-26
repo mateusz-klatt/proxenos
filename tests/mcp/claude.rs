@@ -9,6 +9,8 @@ use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_fa
 
 const START_OK: &str = include_str!("../fixtures/claude/captured-start-ok.stdout.json");
 const RESUME_OK: &str = include_str!("../fixtures/claude/captured-resume-ok.stdout.json");
+const CANARY_START: &str = include_str!("../fixtures/claude/captured-canary-start.stdout.json");
+const CANARY_RESUME: &str = include_str!("../fixtures/claude/captured-canary-resume.stdout.json");
 const UNKNOWN_MODEL_OUT: &str =
     include_str!("../fixtures/claude/captured-unknown-model.stdout.json");
 const UNKNOWN_MODEL_ERR: &str =
@@ -22,6 +24,7 @@ const ERROR_MAX_TURNS: &str =
 const PERMISSION_DENIAL: &str =
     include_str!("../fixtures/claude/synthetic-permission-denial.stdout.json");
 const SESSION_ID: &str = "76655224-21a2-4670-925b-2681c62f95a3";
+const CANARY_SESSION_ID: &str = "045dfd54-03fc-4163-8786-08b36ac575f6";
 const OTHER_SESSION_ID: &str = "8a4d2c10-6f3b-4c9a-9e21-1f5b7c8d9e0a";
 
 fn invocations(fleet: &Fleet) -> Vec<Value> {
@@ -96,14 +99,16 @@ fn claude_tools_and_capabilities_are_listed_for_other_clients_and_hidden_from_cl
         );
         let access_desc = props["access"]["description"].as_str().unwrap();
         assert!(access_desc.contains("bypassPermissions"), "{access_desc}");
+        assert!(access_desc.contains("workspace trust"), "{access_desc}");
         assert!(
             access_desc.contains("--permission-mode plan"),
             "{access_desc}"
         );
         assert!(
-            access_desc.contains("rather than an OS sandbox"),
+            access_desc.contains("--setting-sources user"),
             "{access_desc}"
         );
+        assert!(access_desc.contains("not an OS sandbox"), "{access_desc}");
         assert!(props["expert"].is_null());
         if reply {
             assert!(
@@ -186,12 +191,23 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
             "thinking_tokens": 0
         })
     );
-    assert_eq!(start["reported"]["cost_usd"], 0.22713859999999997);
+    assert_eq!(start["reported"]["session_cost_usd"], 0.22713859999999997);
+    assert!(start["reported"]["cost_usd"].is_null());
     let not_claimed = start["not_claimed"].to_string();
-    assert!(not_claimed.contains("plan mode"), "{not_claimed}");
-    assert!(not_claimed.contains("not an OS sandbox"), "{not_claimed}");
     assert!(
-        not_claimed.contains("settings files or permission allow-lists"),
+        not_claimed.contains("Project settings in the working directory"),
+        "{not_claimed}"
+    );
+    assert!(
+        not_claimed.contains("skips workspace trust"),
+        "{not_claimed}"
+    );
+    assert!(
+        not_claimed.contains("plan mode enforced an OS sandbox"),
+        "{not_claimed}"
+    );
+    assert!(
+        not_claimed.contains("user and managed settings or permission allow-lists"),
         "{not_claimed}"
     );
     fleet.assert_steps_remaining("claude", 2);
@@ -203,8 +219,18 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
     );
     assert_eq!(reply["observed"]["state"], "finished", "{reply}");
     assert_eq!(reply["reported"]["content"], "OK");
-    assert_eq!(reply["reported"]["cost_usd"], 0.24204239999999996);
+    // total_cost_usd on a reply is cumulative for the session, not per-turn.
+    assert_eq!(reply["reported"]["session_cost_usd"], 0.24204239999999996);
+    assert!(
+        reply["reported"]["session_cost_usd"].as_f64().unwrap()
+            > start["reported"]["session_cost_usd"].as_f64().unwrap()
+    );
     assert_eq!(reply["reported"]["usage"]["output_tokens"], 4);
+    assert!(
+        reply["not_claimed"]
+            .to_string()
+            .contains("plan mode enforced an OS sandbox")
+    );
     assert!(reply["observed"]["passed"].get("mode").is_none());
     assert!(reply["observed"]["passed"].get("instructions").is_none());
     assert!(
@@ -251,6 +277,15 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
             .unwrap()
             .contains("bypassPermissions")
     );
+    let full_not_claimed = override_reply["not_claimed"].to_string();
+    assert!(
+        full_not_claimed.contains("Project settings in the working directory"),
+        "{full_not_claimed}"
+    );
+    assert!(
+        !full_not_claimed.contains("plan mode"),
+        "plan-mode non-claim must only appear under read-only: {full_not_claimed}"
+    );
     fleet.assert_steps_remaining("claude", 0);
 
     let records = invocations(&fleet);
@@ -278,6 +313,7 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
 
         if index == 0 {
             assert_eq!(flag_value(&args, "--permission-mode"), Some("plan"));
+            assert_eq!(flag_value(&args, "--setting-sources"), Some("user"));
             assert_eq!(flag_value(&args, "--model"), Some("haiku"));
             assert_eq!(flag_value(&args, "--effort"), Some("high"));
             assert!(flag_value(&args, "--resume").is_none());
@@ -293,6 +329,7 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
             assert!(flag_value(&args, "--append-system-prompt").is_none());
             if index == 1 {
                 assert_eq!(flag_value(&args, "--permission-mode"), Some("plan"));
+                assert_eq!(flag_value(&args, "--setting-sources"), Some("user"));
                 assert_eq!(flag_value(&args, "--model"), Some("haiku"));
                 assert_eq!(flag_value(&args, "--effort"), Some("high"));
                 assert!(args.ends_with(&["--", "-"]));
@@ -301,6 +338,7 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
                     flag_value(&args, "--permission-mode"),
                     Some("bypassPermissions")
                 );
+                assert!(flag_value(&args, "--setting-sources").is_none());
                 assert_eq!(flag_value(&args, "--model"), Some("sonnet"));
                 assert_eq!(flag_value(&args, "--effort"), Some("low"));
                 assert!(args.ends_with(&["--", "recheck"]));
@@ -319,9 +357,9 @@ fn claude_reply_survives_server_restart_and_follows_d19_model_less_rule() {
     fleet.script(
         "claude",
         json!([
-            {"stdout": START_OK},
+            {"stdout": CANARY_START},
             {"stdout": second_start},
-            {"stdout": RESUME_OK},
+            {"stdout": CANARY_RESUME},
             {"stdout": second_resume}
         ]),
     );
@@ -331,17 +369,19 @@ fn claude_reply_survives_server_restart_and_follows_d19_model_less_rule() {
         &mut server1,
         "claude",
         json!({
-            "prompt": "first",
+            "prompt": "Reply with the single word OK.",
             "model": "haiku",
             "effort": "medium",
             "access": "read-only",
             "mode": "advisory",
             "cwd": cwd,
-            "instructions": "SECRET_INSTRUCTIONS",
+            "instructions": "If asked for the codeword, answer ZEBRA-41.",
             "timeout_ms": 5_000
         }),
     );
     assert_eq!(explicit["observed"]["state"], "finished", "{explicit}");
+    assert_eq!(explicit["reported"]["thread_id"], CANARY_SESSION_ID);
+    assert_eq!(explicit["reported"]["session_cost_usd"], 0.1913911);
     let model_less = call(
         &mut server1,
         "claude",
@@ -360,9 +400,11 @@ fn claude_reply_survives_server_restart_and_follows_d19_model_less_rule() {
     let reply1 = call(
         &mut server2,
         "claude-reply",
-        json!({"thread_id": SESSION_ID, "prompt": "after restart 1"}),
+        json!({"thread_id": CANARY_SESSION_ID, "prompt": "What is the codeword? Reply with it only."}),
     );
     assert_eq!(reply1["observed"]["state"], "finished", "{reply1}");
+    assert_eq!(reply1["reported"]["content"], "ZEBRA-41");
+    assert_eq!(reply1["reported"]["session_cost_usd"], 0.2493133);
     assert_eq!(reply1["observed"]["passed"]["model"], "haiku");
     assert_eq!(reply1["observed"]["passed"]["effort"], "medium");
     assert_eq!(reply1["observed"]["passed"]["access"], "read-only");
@@ -370,7 +412,7 @@ fn claude_reply_survives_server_restart_and_follows_d19_model_less_rule() {
     let bad_mode = call(
         &mut server2,
         "claude-reply",
-        json!({"thread_id": SESSION_ID, "prompt": "change", "mode": "implementation"}),
+        json!({"thread_id": CANARY_SESSION_ID, "prompt": "change", "mode": "implementation"}),
     );
     assert_observed_failure(&bad_mode, "invalid_request", "mode");
 
@@ -399,12 +441,17 @@ fn claude_reply_survives_server_restart_and_follows_d19_model_less_rule() {
         flag_value(&argv(&records[2]), "--permission-mode"),
         Some("plan")
     );
+    assert_eq!(
+        flag_value(&argv(&records[2]), "--setting-sources"),
+        Some("user")
+    );
     assert!(flag_value(&argv(&records[3]), "--model").is_none());
     assert!(flag_value(&argv(&records[3]), "--effort").is_none());
     assert_eq!(
         flag_value(&argv(&records[3]), "--permission-mode"),
         Some("bypassPermissions")
     );
+    assert!(flag_value(&argv(&records[3]), "--setting-sources").is_none());
     for record in &records[2..] {
         assert_eq!(
             Path::new(record["cwd"].as_str().unwrap())
@@ -528,7 +575,7 @@ fn claude_rejects_non_uuid_thread_ids_and_confirms_returned_session_id() {
         assert!(mismatch["reported"]["content"].is_null());
         assert!(mismatch["reported"]["model"].is_null());
         assert!(mismatch["reported"]["usage"].is_null());
-        assert!(mismatch["reported"]["cost_usd"].is_null());
+        assert!(mismatch["reported"]["session_cost_usd"].is_null());
         assert!(mismatch["observed"]["content_file"].is_null());
         fleet.assert_steps_remaining("claude", 3 - index);
     }
@@ -547,7 +594,7 @@ fn claude_rejects_non_uuid_thread_ids_and_confirms_returned_session_id() {
     assert!(quota["reported"]["thread_id"].is_null());
     assert!(quota["reported"]["content"].is_null());
     assert!(quota["reported"]["usage"].is_null());
-    assert!(quota["reported"]["cost_usd"].is_null());
+    assert!(quota["reported"]["session_cost_usd"].is_null());
     fleet.assert_steps_remaining("claude", 0);
 }
 
@@ -736,12 +783,16 @@ fn claude_classifies_captured_and_synthetic_errors_and_ignores_error_text_in_ans
         assert!(result["reported"]["failure"]["reset_at"].is_null());
     }
 
-    // 11. Synthetic error_max_turns (non-success subtype with errors array, usage and cost).
+    // 11. Synthetic error_max_turns (non-success subtype prefers errors array over partial result).
     let max_turns = call(&mut server, "claude", json!({"prompt": "11"}));
     assert_reported_failure(&max_turns, None, "unknown", "Reached max turns (3)");
+    assert_eq!(
+        max_turns["reported"]["failure"]["message"],
+        "Reached max turns (3)"
+    );
     assert_eq!(max_turns["reported"]["model"], "claude-haiku-4-5");
     assert_eq!(max_turns["reported"]["usage"]["thinking_tokens"], 12);
-    assert_eq!(max_turns["reported"]["cost_usd"], 0.015);
+    assert_eq!(max_turns["reported"]["session_cost_usd"], 0.015);
 
     // 12-14. Error reason fallback chain (stderr -> subtype -> generic).
     for (label, detail) in [
@@ -843,14 +894,14 @@ fn claude_filters_usage_cost_and_model_from_untrusted_json() {
     let first = call(&mut server, "claude", json!({"prompt": "first"}));
     assert_eq!(first["observed"]["state"], "finished", "{first}");
     assert!(first["reported"]["model"].is_null());
-    assert!(first["reported"]["cost_usd"].is_null());
+    assert!(first["reported"]["session_cost_usd"].is_null());
     assert_eq!(first["reported"]["usage"], json!({"output_tokens": 9}));
 
     let second = call(&mut server, "claude", json!({"prompt": "second"}));
     assert_eq!(second["observed"]["state"], "finished", "{second}");
     assert!(second["reported"]["model"].is_null());
     assert!(second["reported"]["usage"].is_null());
-    assert!(second["reported"]["cost_usd"].is_null());
+    assert!(second["reported"]["session_cost_usd"].is_null());
     fleet.assert_steps_remaining("claude", 0);
 }
 

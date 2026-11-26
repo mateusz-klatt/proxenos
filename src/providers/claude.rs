@@ -25,17 +25,20 @@ pub(super) const SPEC: Provider = Provider {
     access: &[
         (
             "full",
-            "Claude Code runs with --permission-mode bypassPermissions, approving tools and commands without interactive prompts.",
+            "Claude Code runs with --permission-mode bypassPermissions, approving tools and commands without interactive prompts. With --print, workspace trust is skipped and project settings in cwd (hooks, env, MCP servers) still load.",
         ),
         (
             "read-only",
-            "Claude Code runs with --permission-mode plan, a provider-side read-only policy rather than an OS sandbox; user or project settings and allow-lists can still interact with it.",
+            "Claude Code runs with --permission-mode plan and --setting-sources user. Plan mode is a provider-side policy, not an OS sandbox; --setting-sources user excludes project and local settings files, while user/managed settings and allow-lists still apply.",
         ),
     ],
     fixed_instructions: true,
     reply_model: false,
     not_claimed: &[
-        "Claude Code plan mode is a provider permission policy, not an OS sandbox, and settings files or permission allow-lists can interact with it.",
+        "Project settings in the working directory (hooks, env, MCP servers) were not applied; with --print Claude Code skips workspace trust.",
+    ],
+    read_only_not_claimed: &[
+        "Claude Code's plan mode enforced an OS sandbox or prevented user and managed settings or permission allow-lists from interacting with it.",
     ],
     prepare,
     argv,
@@ -56,7 +59,8 @@ fn prepare(turn: &Turn) -> Result<(), String> {
 }
 
 fn argv(turn: &Turn, _output: &Path) -> CommandLine {
-    let permission_mode = if turn.settings.access == "read-only" {
+    let read_only = turn.settings.access == "read-only";
+    let permission_mode = if read_only {
         "plan"
     } else {
         "bypassPermissions"
@@ -69,6 +73,9 @@ fn argv(turn: &Turn, _output: &Path) -> CommandLine {
         permission_mode.into(),
         "--disable-slash-commands".into(),
     ];
+    if read_only {
+        args.extend(["--setting-sources".into(), "user".into()]);
+    }
     if let Some(id) = &turn.thread_id {
         args.extend(["--resume".into(), id.into()]);
     } else {
@@ -203,9 +210,6 @@ fn classify(message: &str, api_status: Option<u64>, api_type: Option<&str>) -> O
 }
 
 fn error_reason(value: &Value, stderr: &str, subtype: Option<&str>) -> String {
-    if let Some(message) = text(value, "result") {
-        return message.to_owned();
-    }
     if let Some(joined) = value["errors"].as_array().and_then(|items| {
         let messages: Vec<&str> = items
             .iter()
@@ -215,6 +219,9 @@ fn error_reason(value: &Value, stderr: &str, subtype: Option<&str>) -> String {
         (!messages.is_empty()).then(|| messages.join("; "))
     }) {
         return joined;
+    }
+    if let Some(message) = text(value, "result") {
+        return message.to_owned();
     }
     if let Some(detail) = nonempty(stderr) {
         return detail.to_owned();
@@ -254,7 +261,7 @@ fn parse(finished: &Finished, _output: &str, expected: Option<&str>) -> Report {
     if id_matches {
         report.model = parse_model(&value);
         report.usage = parse_usage(value.get("usage"));
-        report.cost_usd = parse_cost(value.get("total_cost_usd"));
+        report.session_cost_usd = parse_cost(value.get("total_cost_usd"));
     }
     if !is_error && subtype == Some("success") && !ran_turn {
         report.failure = Some(Failure::new(
