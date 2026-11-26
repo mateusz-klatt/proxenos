@@ -4,9 +4,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::common::{Server, spawning, text};
+use crate::common::{EXIT_WAIT, Server, spawning, text};
 use crate::provider_support::{Fleet, assert_observed_failure, call, turn};
 
 struct Repository {
@@ -228,24 +228,77 @@ fn git_omits_an_unsupported_object_format_without_affecting_the_call() {
     assert_eq!(git_runs, 2);
 }
 
+const GATE_WAIT: &str = "git lookup waiting on test gate";
+const EARLY_LOOKUP_BOUND: Duration = Duration::from_millis(1500);
+
+struct GateLock(Option<fs::File>);
+
+impl GateLock {
+    fn release(&mut self) {
+        if let Some(file) = self.0.take() {
+            file.unlock().unwrap();
+        }
+    }
+}
+
+impl Drop for GateLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.take() {
+            let _ = file.unlock();
+        }
+    }
+}
+
+// Declare `gate` before `server` and `fleet`: struct fields drop in declaration order, so a
+// panic releases the external gate before `Server::drop` waits on the child to exit.
+struct GatedServer {
+    gate: GateLock,
+    server: Server,
+    fleet: Fleet,
+}
+
+impl GatedServer {
+    fn new(clis: &[&str]) -> Self {
+        let fleet = Fleet::new(clis);
+        let gate_path = fleet.root.join("git-lookup.lock");
+        let gate_file = fs::File::create(&gate_path).unwrap();
+        gate_file.lock().unwrap();
+        let mut cmd = fleet.command("codex");
+        cmd.env("PROXENOS_TEST_GIT_LOOKUP_LOCK", &gate_path);
+        let server = Server::start_command(cmd);
+        let mut gated = Self {
+            gate: GateLock(Some(gate_file)),
+            server,
+            fleet,
+        };
+        gated.server.initialize("2025-11-25");
+        gated.server.request(1, "tools/list", json!({}));
+        gated
+    }
+}
+
+fn assert_only_version_probe(fleet: &Fleet) {
+    let records = fleet.records();
+    assert_eq!(records.len(), 1, "unexpected child launch: {records:?}");
+    assert_eq!(records[0]["args"], json!(["--version"]));
+}
+
+fn assert_no_launch_or_git(fleet: &Fleet, result: &Value) {
+    assert!(result["observed"]["git"].is_null(), "{result}");
+    assert!(result["observed"]["passed"].is_null(), "{result}");
+    assert_only_version_probe(fleet);
+}
+
 #[test]
 fn stalled_git_lookup_can_be_cancelled_or_timed_out_and_is_reused_after_release() {
-    use serde_json::Value;
-
-    let fleet = Fleet::new(&["git", "agy"]);
-    let gate_path = fleet.root.join("git-lookup.lock");
-    let gate = fs::File::create(&gate_path).unwrap();
-    gate.lock().unwrap();
-    let metadata = json!({"stdout": format!("{}\nobjects\nindex\nsha1\n", fleet.root.display())});
+    let mut gated = GatedServer::new(&["git", "agy"]);
+    let root = gated.fleet.root.display();
+    let metadata = json!({"stdout": format!("{root}\nobjects\nindex\nsha1\n")});
     let status = json!({"stdout": "?? recovered.txt\u{0}"});
-    fleet.script("git", json!([metadata, status, metadata, status]));
-    fleet.script("agy", json!([turn("without Git"), turn("with Git")]));
-
-    let mut cmd = fleet.command("codex");
-    cmd.env("PROXENOS_TEST_GIT_LOOKUP_LOCK", &gate_path);
-    let mut server = Server::start_command(cmd);
-    server.initialize("2025-11-25");
-    server.request(1, "tools/list", json!({}));
+    let git_steps = json!([metadata, status, metadata, status]);
+    let agy_steps = json!([turn("without Git"), turn("with Git")]);
+    gated.fleet.script("git", git_steps);
+    gated.fleet.script("agy", agy_steps);
 
     let control = |server: &mut Server, name: &str, args: Value| -> Value {
         let reply = server.call(2, name, args);
@@ -253,33 +306,60 @@ fn stalled_git_lookup_can_be_cancelled_or_timed_out_and_is_reused_after_release(
         serde_json::from_str(text(&reply)).unwrap()
     };
     let started = control(
-        &mut server,
+        &mut gated.server,
         "antigravity",
         json!({"prompt": "cancel", "wait": false}),
     );
-    server.wait_for_stderr("git lookup waiting on test gate");
+    gated.server.wait_for_stderr(GATE_WAIT);
+    let cancel_started = Instant::now();
     let handle = started["handle"].as_str().unwrap();
-    let cancelled = control(&mut server, "cancel", json!({"handle": handle}));
+    let cancelled = control(&mut gated.server, "cancel", json!({"handle": handle}));
     assert_eq!(cancelled["cancel_requested"], true, "{cancelled}");
-    let done = control(&mut server, "await", json!({"handles": [handle]}));
-    assert_observed_failure(&done["results"][0]["result"], "cancellation", "");
+    let done = control(&mut gated.server, "await", json!({"handles": [handle]}));
+    let cancel_elapsed = cancel_started.elapsed();
+    assert!(
+        cancel_elapsed < EARLY_LOOKUP_BOUND,
+        "cancelled lookup waited past early-cancel bound: {cancel_elapsed:?}"
+    );
+    let cancelled_result = &done["results"][0]["result"];
+    assert_observed_failure(cancelled_result, "cancellation", "");
+    assert_no_launch_or_git(&gated.fleet, cancelled_result);
+    gated.fleet.assert_steps_remaining("agy", 2);
+    gated.fleet.assert_steps_remaining("git", 4);
 
+    let timed_started = Instant::now();
     let timed = call(
-        &mut server,
+        &mut gated.server,
         "antigravity",
         json!({"prompt": "timeout", "timeout_ms": 500}),
     );
+    let timed_elapsed = timed_started.elapsed();
+    assert!(
+        timed_elapsed < EARLY_LOOKUP_BOUND,
+        "timed-out lookup waited past call-deadline bound: {timed_elapsed:?}"
+    );
     assert_observed_failure(&timed, "timeout", "deadline");
-    fleet.assert_steps_remaining("agy", 2);
+    assert_no_launch_or_git(&gated.fleet, &timed);
+    gated.fleet.assert_steps_remaining("agy", 2);
+    gated.fleet.assert_steps_remaining("git", 4);
 
     // An ordinary delegation can still run when the best-effort Git observation times out.
-    let skipped = call(&mut server, "antigravity", json!({"prompt": "continue"}));
+    let skipped = call(
+        &mut gated.server,
+        "antigravity",
+        json!({"prompt": "continue"}),
+    );
     assert_eq!(skipped["reported"]["content"], "without Git", "{skipped}");
     assert!(skipped["observed"]["git"].is_null());
-    fleet.assert_steps_remaining("git", 4);
+    gated.fleet.assert_steps_remaining("git", 4);
+    gated.fleet.assert_steps_remaining("agy", 1);
 
-    gate.unlock().unwrap();
-    let recovered = call(&mut server, "antigravity", json!({"prompt": "observe"}));
+    gated.gate.release();
+    let recovered = call(
+        &mut gated.server,
+        "antigravity",
+        json!({"prompt": "observe"}),
+    );
     assert_eq!(recovered["reported"]["content"], "with Git", "{recovered}");
     for when in ["before", "after"] {
         assert_eq!(
@@ -288,9 +368,48 @@ fn stalled_git_lookup_can_be_cancelled_or_timed_out_and_is_reused_after_release(
             "{recovered}"
         );
     }
-    fleet.assert_steps_remaining("git", 0);
-    fleet.assert_steps_remaining("agy", 0);
-    assert!(server.finish().0.success());
-    let stderr = server.stderr();
-    assert_eq!(stderr.matches("git lookup waiting on test gate").count(), 1);
+    gated.fleet.assert_steps_remaining("git", 0);
+    gated.fleet.assert_steps_remaining("agy", 0);
+    assert!(gated.server.finish().0.success());
+    let stderr = gated.server.stderr();
+    assert_eq!(stderr.matches(GATE_WAIT).count(), 1);
+}
+
+#[test]
+fn stalled_git_lookup_holds_shutdown_until_watchdog_after_call_times_out() {
+    let mut gated = GatedServer::new(&["agy"]);
+    let timed = call(
+        &mut gated.server,
+        "antigravity",
+        json!({"prompt": "timeout", "timeout_ms": 500}),
+    );
+    assert_observed_failure(&timed, "timeout", "deadline");
+    assert_no_launch_or_git(&gated.fleet, &timed);
+    gated.server.wait_for_stderr(GATE_WAIT);
+
+    let closed = Instant::now();
+    gated.server.close_input();
+    let (status, _) = gated.server.wait_for_exit(EXIT_WAIT);
+    let elapsed = closed.elapsed();
+    gated.gate.release();
+
+    assert_eq!(status.code(), Some(1), "{}", gated.server.stderr());
+    let stderr = gated.server.stderr();
+    assert!(stderr.contains("did not finish within 10 s"), "{stderr}");
+    let watchdog_ms: u64 = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("proxenos test watchdog elapsed_ms="))
+        .unwrap_or_else(|| panic!("watchdog did not report elapsed time: {stderr}"))
+        .parse()
+        .unwrap();
+    assert!(
+        watchdog_ms >= 9_900,
+        "watchdog expired too early: {watchdog_ms} ms"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(9_900),
+        "shutdown finished too early: {elapsed:?}"
+    );
+    assert_eq!(stderr.matches(GATE_WAIT).count(), 1);
+    assert_only_version_probe(&gated.fleet);
 }
