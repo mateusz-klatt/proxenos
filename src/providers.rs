@@ -4,6 +4,7 @@
 mod antigravity;
 mod claude;
 mod codex;
+mod copilot;
 mod kimi;
 
 use std::ffi::OsString;
@@ -16,7 +17,13 @@ use crate::envelope::Failure;
 use crate::mcp::ToolSpec;
 use crate::supervise::Finished;
 
-pub const ALL: &[Provider] = &[codex::SPEC, antigravity::SPEC, kimi::SPEC, claude::SPEC];
+pub const ALL: &[Provider] = &[
+    codex::SPEC,
+    antigravity::SPEC,
+    kimi::SPEC,
+    claude::SPEC,
+    copilot::SPEC,
+];
 pub const DEFAULT_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_MODEL_LEN: usize = 256;
 
@@ -59,6 +66,10 @@ pub struct Settings {
 pub struct RememberedStart {
     pub settings: Settings,
     pub reported_model: Option<String>,
+}
+
+fn is_canonical_uuid(id: &str) -> bool {
+    uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
 }
 
 /// Validates a model name from either a caller or untrusted provider output.
