@@ -10,7 +10,7 @@ fn accounting_reports_platform_method_caveats_memory_and_cpu() {
     let mut step = turn("measured");
     step["alloc_bytes"] = json!(16_u64 << 20);
     step["burn_cpu_ms"] = json!(80);
-    step["sleep_ms"] = json!(150);
+    step["sleep_ms"] = json!(250);
     fleet.script("agy", json!([step]));
 
     let mut server = fleet.server("claude");
@@ -83,9 +83,9 @@ fn accounting_reports_platform_method_caveats_memory_and_cpu() {
 fn memory_limit_is_honoured_when_under_and_triggers_memory_limit_failure_when_exceeded() {
     let fleet = Fleet::new(&["agy"]);
     let mut baseline_step = turn("baseline");
-    baseline_step["sleep_ms"] = json!(150);
+    baseline_step["sleep_ms"] = json!(200);
     let mut under_step = turn("within limit");
-    under_step["sleep_ms"] = json!(150);
+    under_step["sleep_ms"] = json!(200);
     let mut over_step = turn("over limit");
     over_step["alloc_bytes"] = json!(64_u64 << 20);
     over_step["sleep_ms"] = json!(10_000);
@@ -151,7 +151,8 @@ fn accounting_preserves_exited_child_cpu_time() {
     let fleet = Fleet::new(&["agy"]);
     let mut step = turn("child burned");
     step["child_burn_cpu_ms"] = json!(150);
-    step["sleep_ms"] = json!(250);
+    step["child_sleep_ms"] = json!(300);
+    step["sleep_ms"] = json!(300);
     fleet.script("agy", json!([step]));
 
     let mut server = fleet.server("claude");
@@ -204,7 +205,7 @@ fn memory_limit_stop_runs_once_skips_output_read_and_beats_timeout() {
         json!({
             "prompt": "over with short timeout and bad output",
             "memory_limit_bytes": tight,
-            "timeout_ms": 1_500
+            "timeout_ms": 2_500
         }),
     );
     let elapsed = started.elapsed();

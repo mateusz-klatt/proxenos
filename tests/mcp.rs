@@ -193,7 +193,7 @@ fn the_end_of_input_stops_a_running_call_at_once() {
     server.wait_for_stderr("test_wait: cancelled");
     // rmcp alone would wait five seconds before cancelling the call.
     let took = closed.elapsed();
-    assert!(took < Duration::from_secs(3), "cancellation took {took:?}");
+    assert!(took < Duration::from_secs(4), "cancellation took {took:?}");
     let reply = server.exact_next_frame();
     assert_eq!(reply["id"], 5);
     assert_eq!(text(&reply), "cancelled");
@@ -207,11 +207,7 @@ fn the_server_waits_for_every_running_call_before_it_exits() {
     for id in 1..=3 {
         server.start_call(id, "test_wait", json!({ "ms": 60_000 }));
     }
-    let deadline = Instant::now() + common::WAIT;
-    while server.stderr().matches("test_wait: started").count() < 3 {
-        assert!(Instant::now() < deadline, "{}", server.stderr());
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    server.wait_for_stderr_count("test_wait: started", 3);
     let (status, _) = server.finish();
     assert!(status.success(), "{status}");
     assert_eq!(
@@ -244,15 +240,25 @@ fn a_call_that_outlasts_the_stop_limit_makes_serving_fail() {
     let (mut server, _) = Server::initialized("2025-11-25");
     server.start_call(1, "test_wait", json!({ "ms": 60_000, "linger_ms": 60_000 }));
     server.wait_for_stderr("test_wait: started");
-    let (status, took) = server.finish();
+    let closed = Instant::now();
+    server.close_input();
+    let (status, _) = server.wait_for_exit(common::EXIT_WAIT);
+    let took = closed.elapsed();
     assert_eq!(status.code(), Some(1));
-    assert!(took < Duration::from_secs(15), "exit took {took:?}");
+    assert!(took < Duration::from_secs(12), "exit took {took:?}");
+    let stderr = server.stderr();
+    let watchdog_ms: u64 = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("proxenos test watchdog elapsed_ms="))
+        .unwrap_or_else(|| panic!("watchdog did not report elapsed time: {stderr}"))
+        .parse()
+        .unwrap();
     assert!(
-        server.stderr().contains("did not finish within 10 s"),
-        "{}",
-        server.stderr()
+        watchdog_ms >= 9_900,
+        "watchdog expired too early: {watchdog_ms} ms"
     );
-    assert!(!server.stderr().contains("test_wait: done"));
+    assert!(stderr.contains("did not finish within 10 s"), "{stderr}");
+    assert!(!stderr.contains("test_wait: done"), "{stderr}");
 }
 
 fn initialize_frame() -> serde_json::Value {

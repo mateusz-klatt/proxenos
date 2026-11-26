@@ -544,7 +544,7 @@ fn cancelled_or_expired_wait_false_request_does_not_spawn_background_delegation(
             "thread_id": CODEX_THREAD,
             "prompt": "expired wait false",
             "wait": false,
-            "timeout_ms": 150
+            "timeout_ms": 500
         }),
     );
     assert_eq!(timed["observed"]["failure"]["kind"], "timeout", "{timed}");

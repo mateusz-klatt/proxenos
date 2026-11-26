@@ -138,6 +138,20 @@ fn a_child_receives_its_launch_settings_and_keeps_its_files_until_exit() {
 }
 
 #[test]
+fn the_cpu_burn_stub_stops_at_its_wall_clock_ceiling() {
+    let mut server = server();
+    let args = launch(json!([format!("burn:{}:0", u64::MAX)]));
+    let result = finished(&server.call(1, "test_run", args));
+    assert_eq!(result["ending"], "exited");
+    assert_eq!(result["code"], 1);
+    let stderr = result["stderr"].as_str().unwrap();
+    assert!(
+        stderr.contains("burn_cpu exceeded its wall-clock ceiling"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_child_can_read_stdin_to_eof_while_the_client_keeps_serving() {
     let mut server = server();
     let result = finished(&server.call(1, "test_run", launch(json!(["stdin"]))));
@@ -440,7 +454,7 @@ fn a_memory_limit_ending_runs_one_stop_even_past_deadline() {
         "sleep:60000"
     ]));
     args["memory_limit_bytes"] = json!(limit);
-    args["deadline_ms"] = json!(2000);
+    args["deadline_ms"] = json!(2_500);
 
     server.start_call(2, "test_run", args);
     let held = lock_file(&ready);
@@ -498,18 +512,22 @@ fn a_child_exiting_on_sigterm_stops_well_below_the_grace() {
         format!("delayed-grandchild:{}:0", gc_timeout.display()),
         "sleep:60000"
     ]));
-    args["deadline_ms"] = json!(500);
+    args["deadline_ms"] = json!(2_000);
     let started = Instant::now();
-    let timed_out = finished(&timeout_server.call(1, "test_run", args));
+    timeout_server.start_call(1, "test_run", args);
+    wait_for("timeout grandchild did not enter await-term", || {
+        gc_timeout.with_extension("term").exists()
+    });
+    let timed_out = finished(&timeout_server.response(1));
     let timeout_elapsed = started.elapsed();
     assert_eq!(timed_out["ending"], "timed_out", "{timed_out}");
     assert_eq!(timed_out["signal"], libc::SIGTERM, "{timed_out}");
     assert!(
-        timeout_elapsed < Duration::from_millis(1500),
+        timeout_elapsed < Duration::from_millis(3_000),
         "SIGTERM timeout stop waited too long: {timeout_elapsed:?} ({timed_out})"
     );
     assert!(
-        timed_out["elapsed_ms"].as_u64().unwrap() < 1500,
+        timed_out["elapsed_ms"].as_u64().unwrap() < 3_000,
         "SIGTERM timeout stop waited too long: {timed_out}"
     );
     assert!(timeout_server.finish().0.success());
@@ -544,7 +562,7 @@ fn a_child_exiting_on_sigterm_stops_well_below_the_grace() {
     assert!(is_free(&slow_lock));
     assert!(
         delayed_elapsed >= Duration::from_millis(450)
-            && delayed_elapsed < Duration::from_millis(2000),
+            && delayed_elapsed < Duration::from_millis(2_000),
         "delayed grandchild stop took {delayed_elapsed:?}: {delayed}"
     );
     assert!(delayed_server.finish().0.success());

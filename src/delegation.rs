@@ -405,6 +405,13 @@ impl Registry {
                         let saved_id = id.clone();
                         let save_activity = activity.clone();
                         tokio::task::spawn_blocking(move || {
+                            #[cfg(feature = "test-tools")]
+                            if std::env::var_os("PROXENOS_TEST_SAVE_LOCK_MARKERS").is_some() {
+                                let _ = writeln!(
+                                    std::io::stderr().lock(),
+                                    "proxenos test session save: acquired key lock"
+                                );
+                            }
                             let desired = (!starts.lock().unwrap().conflicts_with(
                                 p.name,
                                 &saved_id,
