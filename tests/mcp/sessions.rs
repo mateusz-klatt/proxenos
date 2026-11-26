@@ -1853,14 +1853,12 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
         ]),
     );
     let mut seed_c = fleet_c.server("claude");
-    assert_eq!(
-        call(
-            &mut seed_c,
-            "codex",
-            json!({"prompt": "locate lock", "access": "full"})
-        )["observed"]["state"],
-        "finished"
+    let seeded_c = call(
+        &mut seed_c,
+        "codex",
+        json!({"prompt": "locate lock", "access": "full"}),
     );
+    assert_eq!(seeded_c["observed"]["state"], "finished", "{seeded_c}");
     assert!(seed_c.finish().0.success());
 
     let session_c = single_session_file(&sessions_root(&fleet_c.root).join("codex"));
