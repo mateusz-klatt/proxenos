@@ -458,7 +458,7 @@ fn retained_background_results_are_bounded_and_evict_the_oldest() {
         assert!(!is_error, "{started}");
         let handle = started["handle"].as_str().unwrap().to_owned();
         let (done, _) = raw_call(&mut server, 200 + i, "await", json!({"handles": [handle]}));
-        assert_eq!(done["results"][0]["state"], "finished");
+        assert_eq!(done["results"][0]["state"], "finished", "{done}");
         handles.push(handle);
     }
 
@@ -507,7 +507,11 @@ fn retained_background_results_evict_the_oldest_when_they_exceed_the_byte_limit(
         assert!(!is_error, "result {index} failed to await");
         let item = &done["results"][0];
         assert_eq!(item["handle"], handle);
-        assert_eq!(item["state"], "finished");
+        assert_eq!(
+            item["state"], "finished",
+            "result {index}: observed failure {}, reported failure {}",
+            item["result"]["observed"]["failure"], item["result"]["reported"]["failure"]
+        );
         let result = &item["result"];
         assert_eq!(result["reported"]["content"], answer);
         result_bytes[index] = result.to_string().len();
