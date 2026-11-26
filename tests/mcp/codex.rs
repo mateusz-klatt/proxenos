@@ -206,7 +206,10 @@ fn captured_missing_provider_key_reports_the_terminal_error_without_an_answer() 
     let stdout = include_str!("../fixtures/codex/captured-missing-provider-key.stdout.jsonl");
     let stderr = include_str!("../fixtures/codex/captured-missing-provider-key.stderr.txt");
     let fleet = Fleet::new(&["codex"]);
-    fleet.script("codex", json!([{"stdout":stdout, "stderr":stderr, "code":1}]));
+    fleet.script(
+        "codex",
+        json!([{"stdout":stdout, "stderr":stderr, "code":1}]),
+    );
     let mut server = fleet.server("claude");
     let result = call(&mut server, "codex", json!({"prompt":"Reply with OK."}));
 
@@ -217,8 +220,7 @@ fn captured_missing_provider_key_reports_the_terminal_error_without_an_answer() 
         "Missing environment variable: `PROXENOS_D5_EMPTY_TEST_KEY`.",
     );
     assert_eq!(
-        result["reported"]["thread_id"],
-        "01a21898-0d84-70a1-b61f-e5dcec9a06b1",
+        result["reported"]["thread_id"], "01a21898-0d84-70a1-b61f-e5dcec9a06b1",
         "{result}"
     );
     assert!(result["reported"]["content"].is_null(), "{result}");
