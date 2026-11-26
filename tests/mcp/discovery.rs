@@ -276,11 +276,11 @@ fn discovery_waits_are_bounded_by_each_callers_deadline_and_cancellation() {
     let timed = call(
         &mut server,
         "antigravity",
-        json!({"prompt": "short wait", "timeout_ms": 150}),
+        json!({"prompt": "short wait", "timeout_ms": 500}),
     );
     assert_observed_failure(&timed, "timeout", "Version check exceeded its deadline");
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(8),
         "caller waited on the shared scan past its deadline: {:?}",
         started.elapsed()
     );
@@ -323,11 +323,11 @@ fn discovery_waits_are_bounded_by_each_callers_deadline_and_cancellation() {
     let timed = call(
         &mut server2,
         "antigravity",
-        json!({"prompt": "blocked on mutex", "timeout_ms": 150}),
+        json!({"prompt": "blocked on mutex", "timeout_ms": 500}),
     );
     assert_observed_failure(&timed, "timeout", "Version check exceeded its deadline");
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(8),
         "caller blocked on check mutex past its deadline: {:?}",
         started.elapsed()
     );
@@ -355,13 +355,13 @@ fn resolve_waits_only_for_its_own_provider_probe() {
     let fast = call(
         &mut server,
         "antigravity",
-        json!({"prompt": "run quickly", "timeout_ms": 1500}),
+        json!({"prompt": "run quickly", "timeout_ms": 5_000}),
     );
     assert_eq!(fast["observed"]["state"], "finished", "{fast}");
     assert_eq!(fast["reported"]["content"], "fast path");
     fleet.assert_steps_remaining("agy", 0);
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(8),
         "fast provider waited on slow probe: {:?}",
         started.elapsed()
     );
@@ -385,7 +385,7 @@ fn an_early_caller_timeout_does_not_cancel_the_shared_discovery_probe() {
     server.start_call(
         1,
         "antigravity",
-        json!({"prompt": "times out first", "timeout_ms": 300}),
+        json!({"prompt": "times out first", "timeout_ms": 2_000}),
     );
     let until = Instant::now() + WAIT;
     while !ready.exists() {

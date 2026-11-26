@@ -3,7 +3,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,12 +35,16 @@ pub fn meta(version: &str) -> Value {
     })
 }
 
+struct StderrBuffer {
+    text: String,
+    eof: bool,
+}
+
 pub struct Server {
     child: Child,
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
-    stderr: Arc<Mutex<String>>,
-    stderr_done: Option<Receiver<()>>,
+    stderr: Arc<(Mutex<StderrBuffer>, Condvar)>,
 }
 
 impl Server {
@@ -109,18 +113,28 @@ impl Server {
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take();
-        let captured = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::new((
+            Mutex::new(StderrBuffer {
+                text: String::new(),
+                eof: false,
+            }),
+            Condvar::new(),
+        ));
         let sink = Arc::clone(&captured);
-        let (drained, stderr_done) = channel();
         thread::spawn(move || {
             if let Some(stderr) = stderr {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    let mut text = sink.lock().expect("stderr lock");
-                    text.push_str(&line);
-                    text.push('\n');
+                    let (lock, cvar) = &*sink;
+                    let mut state = lock.lock().expect("stderr lock");
+                    state.text.push_str(&line);
+                    state.text.push('\n');
+                    cvar.notify_all();
                 }
             }
-            let _ = drained.send(());
+            let (lock, cvar) = &*sink;
+            let mut state = lock.lock().expect("stderr lock");
+            state.eof = true;
+            cvar.notify_all();
         });
         let (sender, lines) = channel();
         let server = Self {
@@ -128,7 +142,6 @@ impl Server {
             stdin,
             lines,
             stderr: captured,
-            stderr_done: Some(stderr_done),
         };
         (server, stdout, sender)
     }
@@ -245,19 +258,45 @@ impl Server {
     }
 
     pub fn wait_for_stderr_within(&self, needle: &str, limit: Duration) {
+        self.wait_for_stderr_count_within(needle, 1, limit);
+    }
+
+    /// Waits until standard error holds at least `count` occurrences of `needle`.
+    pub fn wait_for_stderr_count(&self, needle: &str, count: usize) {
+        self.wait_for_stderr_count_within(needle, count, WAIT);
+    }
+
+    fn wait_for_stderr_count_within(&self, needle: &str, count: usize, limit: Duration) {
         let deadline = Instant::now() + limit;
-        while !self.stderr().contains(needle) {
+        let (lock, cvar) = &*self.stderr;
+        let mut state = lock.lock().expect("stderr lock");
+        while state.text.matches(needle).count() < count {
             assert!(
-                Instant::now() < deadline,
-                "standard error never showed {needle:?}: {}",
-                self.stderr()
+                !state.eof,
+                "standard error ended before showing {needle:?} {count} time(s): {}",
+                state.text
             );
-            thread::sleep(Duration::from_millis(10));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "standard error never showed {needle:?} {count} time(s): {}",
+                state.text
+            );
+            let (next, _) = cvar.wait_timeout(state, remaining).expect("stderr condvar");
+            state = next;
         }
     }
 
+    /// Returns captured standard error after the server has exited and stderr reached EOF.
+    /// While the server is running, use [`Self::wait_for_stderr`] instead of sampling stderr.
     pub fn stderr(&self) -> String {
-        self.stderr.lock().expect("stderr lock").clone()
+        let (lock, _) = &*self.stderr;
+        let state = lock.lock().expect("stderr lock");
+        assert!(
+            state.eof,
+            "Server::stderr() sampled before stderr reached EOF; wait for a marker with wait_for_stderr() or drain via finish()/wait_for_exit() first"
+        );
+        state.text.clone()
     }
 
     pub fn close_input(&mut self) {
@@ -281,10 +320,15 @@ impl Server {
             if let Some(status) = self.child.try_wait().expect("the child can be waited on") {
                 let took = started.elapsed();
                 // An inherited pipe can outlive the server. Bound the wait for its diagnostics too.
-                if let Some(reader) = self.stderr_done.take() {
-                    reader
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .expect("the stderr reader ends");
+                let drain_deadline =
+                    Instant::now() + deadline.saturating_duration_since(Instant::now()).max(WAIT);
+                let (lock, cvar) = &*self.stderr;
+                let mut state = lock.lock().expect("stderr lock");
+                while !state.eof {
+                    let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "the stderr reader did not end");
+                    let (next, _) = cvar.wait_timeout(state, remaining).expect("stderr condvar");
+                    state = next;
                 }
                 return (status, took);
             }

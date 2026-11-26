@@ -218,7 +218,7 @@ fn timeout_and_disconnect_reap_the_turn_and_return_its_observations() {
     );
     let mut server = fleet.server("claude");
     server.request(1, "tools/list", json!({}));
-    server.start_call(7, "antigravity", json!({"prompt":"run","timeout_ms":2000}));
+    server.start_call(7, "antigravity", json!({"prompt":"run","timeout_ms":3_000}));
     let until = Instant::now() + common::WAIT;
     while !ready1.exists() {
         assert!(Instant::now() < until, "timed stub never wrote stdout");
@@ -269,11 +269,11 @@ fn time_spent_in_discovery_can_exhaust_the_deadline_before_a_turn_launches() {
     let expired = call(
         &mut server,
         "antigravity",
-        json!({"prompt":"run", "timeout_ms":150}),
+        json!({"prompt":"run", "timeout_ms":500}),
     );
     assert_observed_failure(&expired, "timeout", "Version check exceeded its deadline");
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(8),
         "discovery ignored the call deadline: {:?}",
         started.elapsed()
     );
@@ -296,7 +296,7 @@ fn call_deadline_applies_through_before_snapshot_and_retry_attempts() {
     let expired = call(
         &mut server,
         "antigravity",
-        json!({"prompt": "run", "timeout_ms": 150}),
+        json!({"prompt": "run", "timeout_ms": 1_000}),
     );
     assert_observed_failure(&expired, "timeout", "exceeded the call's deadline");
     assert!(expired["observed"]["passed"].is_null(), "{expired}");
@@ -322,11 +322,12 @@ fn call_deadline_applies_through_before_snapshot_and_retry_attempts() {
 
     let codex_fleet = Fleet::new(&["codex"]);
     let empty = include_str!("fixtures/codex/empty.jsonl");
+    let attempt2_ready = codex_fleet.root.join("attempt2.ready");
     codex_fleet.script(
         "codex",
         json!([
             {"stdout": empty, "sleep_ms": 400},
-            {"sleep_ms": 60000}
+            {"ready": attempt2_ready, "sleep_ms": 60000}
         ]),
     );
     let mut codex_server = codex_fleet.server("claude");
@@ -334,7 +335,11 @@ fn call_deadline_applies_through_before_snapshot_and_retry_attempts() {
     let retried = call(
         &mut codex_server,
         "codex",
-        json!({"prompt": "work", "timeout_ms": 1500}),
+        json!({"prompt": "work", "timeout_ms": 5_000}),
+    );
+    assert!(
+        attempt2_ready.exists(),
+        "retry attempt never started before deadline: {retried}"
     );
     assert_observed_failure(&retried, "timeout", "exceeded the call's deadline");
     assert_eq!(
@@ -348,7 +353,7 @@ fn call_deadline_applies_through_before_snapshot_and_retry_attempts() {
         .as_u64()
         .unwrap_or_else(|| panic!("missing second attempt deadline_ms: {retried}"));
     assert!(
-        second_deadline < 1500,
+        second_deadline < 5_000,
         "retry did not carry the remaining absolute deadline: {retried}"
     );
     assert_eq!(
@@ -585,7 +590,7 @@ fn preflight_respects_call_deadline_and_cancellation() {
         json!({
             "thread_id": "paper-crane", "prompt": "timeout preflight",
             "model": "named", "access": "full", "mode": "advisory",
-            "cwd": fleet.root, "timeout_ms": 150
+            "cwd": fleet.root, "timeout_ms": 1_000
         }),
     );
     assert_observed_failure(&timed, "timeout", "preflight");

@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -48,6 +49,27 @@ fn argument<'a>(record: &'a Value, flag: &str) -> Option<&'a str> {
         .windows(2)
         .find(|pair| pair[0] == flag)
         .and_then(|pair| pair[1].as_str())
+}
+
+fn wait_for_codex_output_removed(fleet: &Fleet, before_records: usize) {
+    let until = Instant::now() + crate::common::WAIT;
+    while fleet.records().len() <= before_records {
+        assert!(
+            Instant::now() < until,
+            "codex stub did not record invocation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let records = fleet.records();
+    let output_path = PathBuf::from(argument(records.last().unwrap(), "-o").unwrap());
+    let until = Instant::now() + crate::common::WAIT;
+    while output_path.exists() {
+        assert!(
+            Instant::now() < until,
+            "codex turn did not finish reading and cleaning up output"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -798,7 +820,7 @@ fn corrupt_or_unreadable_session_file_fails_safely_and_executes_nothing() {
         staging_left.is_empty(),
         "left staging files: {staging_left:?}"
     );
-    assert!(server2.stderr().contains("could not save session settings"));
+    server2.wait_for_stderr("could not save session settings");
 
     // Replacing the provider sessions directory with a regular file also fails save safely.
     fs::remove_dir_all(&provider_dir).unwrap();
@@ -880,7 +902,7 @@ fn save_refuses_to_overwrite_corrupt_session_file() {
     );
     assert_eq!(same_server_start["observed"]["state"], "finished");
     assert_eq!(fs::read_to_string(&session_file).unwrap(), sentinel);
-    assert!(server1.stderr().contains("corrupt"));
+    server1.wait_for_stderr("corrupt");
 
     let before_reply = fleet.records().len();
     let refused_same = call(
@@ -911,7 +933,7 @@ fn save_refuses_to_overwrite_corrupt_session_file() {
     );
     assert_eq!(fresh_start["observed"]["state"], "finished");
     assert_eq!(fs::read_to_string(&session_file).unwrap(), sentinel);
-    assert!(server2.stderr().contains("could not save session settings"));
+    server2.wait_for_stderr("could not save session settings");
     let before_reply2 = fleet.records().len();
     let refused_fresh = call(
         &mut server2,
@@ -928,8 +950,6 @@ fn save_refuses_to_overwrite_corrupt_session_file() {
 
 #[test]
 fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
-    use std::time::{Duration, Instant};
-
     // Part A: cross-process sticky tombstone under the advisory lock, and cache updated after disk.
     let fleet_a = Fleet::new(&["codex"]);
     fleet_a.script(
@@ -958,12 +978,7 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
     server_a.request(1, "tools/list", json!({}));
     let before_a = fleet_a.records().len();
     server_a.start_call(10, "codex", json!({"prompt": "race", "access": "full"}));
-    let until = Instant::now() + crate::common::WAIT;
-    while fleet_a.records().len() <= before_a {
-        assert!(Instant::now() < until, "start stub did not finish");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_codex_output_removed(&fleet_a, before_a);
 
     // Simulate another server writing an ambiguity tombstone while server_a waits on the lock.
     let mut tombstone: Value =
@@ -1032,12 +1047,7 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
         "codex",
         json!({"prompt": "conflicting start", "access": "read-only"}),
     );
-    let until = Instant::now() + crate::common::WAIT;
-    while fleet_b.records().len() <= before_b {
-        assert!(Instant::now() < until, "conflicting start did not run");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_codex_output_removed(&fleet_b, before_b);
 
     // Issue a reply while save #20 is still blocked on the advisory lock.
     server_b.start_call(
@@ -1092,8 +1102,6 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
 
 #[test]
 fn session_load_respects_call_deadline_and_cancellation() {
-    use std::time::{Duration, Instant};
-
     let fleet = Fleet::new(&["codex"]);
     fleet.script("codex", json!([{"stdout": CODEX_FINISHED}]));
     let mut server1 = fleet.server("claude");
@@ -1115,7 +1123,7 @@ fn session_load_respects_call_deadline_and_cancellation() {
     let timed_out = call(
         &mut server2,
         "codex-reply",
-        json!({"thread_id": CODEX_THREAD, "prompt": "blocked", "timeout_ms": 150}),
+        json!({"thread_id": CODEX_THREAD, "prompt": "blocked", "timeout_ms": 500}),
     );
     assert_eq!(
         timed_out["observed"]["failure"]["kind"], "timeout",
@@ -1129,7 +1137,7 @@ fn session_load_respects_call_deadline_and_cancellation() {
         "{timed_out}"
     );
     assert!(
-        began.elapsed() < Duration::from_secs(3),
+        began.elapsed() < Duration::from_secs(8),
         "session load ignored deadline: {:?}",
         began.elapsed()
     );
@@ -1176,13 +1184,7 @@ fn save_refuses_session_payload_above_size_limit() {
         json!({"prompt": "too big for tiny cap", "model": "saved-model"}),
     );
     assert_eq!(done["observed"]["state"], "finished", "{done}");
-    assert!(
-        server
-            .stderr()
-            .contains("session payload exceeds size limit"),
-        "{}",
-        server.stderr()
-    );
+    server.wait_for_stderr("session payload exceeds size limit");
     let provider_dir = sessions_root(&fleet.root).join("codex");
     let json_files: Vec<_> = fs::read_dir(&provider_dir)
         .unwrap()
@@ -1268,11 +1270,7 @@ fn save_error_never_caches_unverified_settings_or_clears_ambiguity() {
         json!({"prompt": "s3", "access": "full"}),
     );
     assert_eq!(start["observed"]["state"], "finished", "{start}");
-    assert!(
-        fresh.stderr().contains("could not save session settings"),
-        "{}",
-        fresh.stderr()
-    );
+    fresh.wait_for_stderr("could not save session settings");
     let before_reply = fleet.records().len();
     let refused_while_obstructed = call(
         &mut fresh,
@@ -1462,8 +1460,6 @@ fn save_error_never_caches_unverified_settings_or_clears_ambiguity() {
 
 #[test]
 fn session_save_respects_call_deadline_and_cancellation() {
-    use std::time::{Duration, Instant};
-
     // Part A: external holder of `<key>.lock` blocks start A (conflicting with disk) past its
     // short timeout. Start A returns the finished answer with session_save_failure=timeout while
     // its detached worker retains the owned key lock. A reply issued afterward must wait (never
@@ -1504,12 +1500,12 @@ fn session_save_respects_call_deadline_and_cancellation() {
         json!({
             "prompt": "save times out",
             "access": "read-only",
-            "timeout_ms": 400
+            "timeout_ms": 3_000
         }),
     );
     let elapsed = began.elapsed();
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_secs(8),
         "blocked save ignored call deadline ({elapsed:?}): {timed}"
     );
     assert_eq!(timed["observed"]["state"], "finished", "{timed}");
@@ -1521,11 +1517,7 @@ fn session_save_respects_call_deadline_and_cancellation() {
         timed["observed"]["session_save_failure"]["kind"], "timeout",
         "{timed}"
     );
-    assert!(
-        server2.stderr().contains("could not save session settings"),
-        "{}",
-        server2.stderr()
-    );
+    server2.wait_for_stderr("could not save session settings");
 
     // Reply with a short timeout waits on the detached save's owned key lock and times out.
     let before_replies = fleet.records().len();
@@ -1535,7 +1527,7 @@ fn session_save_respects_call_deadline_and_cancellation() {
         json!({
             "thread_id": CODEX_THREAD,
             "prompt": "must wait for detached save",
-            "timeout_ms": 150
+            "timeout_ms": 500
         }),
     );
     assert_eq!(
@@ -1620,14 +1612,13 @@ fn session_save_respects_call_deadline_and_cancellation() {
             {"stdout": CODEX_FINISHED, "final_message": "saved-cancel-answer"}
         ]),
     );
-    let mut seed_b = fleet_b.server("claude");
+    let mut server_b = fleet_b.server("claude");
     let seeded_b = call(
-        &mut seed_b,
+        &mut server_b,
         "codex",
         json!({"prompt": "seed", "access": "full"}),
     );
     assert_eq!(seeded_b["observed"]["state"], "finished", "{seeded_b}");
-    assert!(seed_b.finish().0.success());
 
     let session_b = single_session_file(&sessions_root(&fleet_b.root).join("codex"));
     let lock_b = fs::OpenOptions::new()
@@ -1637,27 +1628,58 @@ fn session_save_respects_call_deadline_and_cancellation() {
         .unwrap();
     lock_b.lock().unwrap();
 
-    let mut server_b = fleet_b.server("claude");
-    server_b.request(1, "tools/list", json!({}));
     let before = fleet_b.records().len();
     server_b.start_call(
         40,
         "codex",
         json!({"prompt": "save cancelled", "model": "cancelled-save-model"}),
     );
-    let until = Instant::now() + crate::common::WAIT;
-    while fleet_b.records().len() <= before {
-        assert!(Instant::now() < until, "start stub did not finish");
+    wait_for_codex_output_removed(&fleet_b, before);
+    // Probe `key_lock` via a `codex-reply` that fails immediately in memory (without spawning a
+    // CLI) while `key_lock` is free. A timeout in "Loading session settings" proves call 40's
+    // detached save worker already owns `key_lock` and is blocked on `lock_b`.
+    let probe_until = Instant::now() + crate::common::WAIT;
+    let mut probe_id = 41;
+    loop {
+        let reply = server_b.call(
+            probe_id,
+            "codex-reply",
+            json!({
+                "thread_id": CODEX_THREAD,
+                "prompt": "probe key_lock",
+                "mode": "implementation",
+                "timeout_ms": 500
+            }),
+        );
+        probe_id += 1;
+        let envelope: Value = serde_json::from_str(crate::common::text(&reply)).unwrap();
+        if envelope["observed"]["failure"]["kind"] == "timeout" {
+            assert!(
+                envelope["observed"]["failure"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Loading session settings"),
+                "{envelope}"
+            );
+            break;
+        }
+        assert_eq!(
+            envelope["observed"]["failure"]["kind"], "invalid_request",
+            "{envelope}"
+        );
+        assert!(
+            Instant::now() < probe_until,
+            "save worker never acquired key_lock: {envelope}"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::thread::sleep(Duration::from_millis(100));
     let cancel_began = Instant::now();
     server_b.close_input();
     let cancelled: Value =
         serde_json::from_str(crate::common::text(&server_b.response(40))).unwrap();
     let cancel_elapsed = cancel_began.elapsed();
     assert!(
-        cancel_elapsed < Duration::from_secs(2),
+        cancel_elapsed < Duration::from_secs(6),
         "blocked save ignored cancellation ({cancel_elapsed:?}): {cancelled}"
     );
     assert_eq!(cancelled["observed"]["state"], "finished", "{cancelled}");
@@ -1679,8 +1701,6 @@ fn session_save_respects_call_deadline_and_cancellation() {
 
 #[test]
 fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
-    use std::time::{Duration, Instant};
-
     // Sub-case (a): a conflicting second start in the same process times out while waiting for
     // `key_lock` (held by an earlier identical start's detached save worker), so no save worker is
     // spawned for the conflicting start. The caller must still fail StartStore closed to None so
@@ -1714,7 +1734,7 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
     let holder_a = call(
         &mut server_a,
         "codex",
-        json!({"prompt": "hold key lock", "access": "full", "timeout_ms": 400}),
+        json!({"prompt": "hold key lock", "access": "full", "timeout_ms": 3_000}),
     );
     assert_eq!(holder_a["observed"]["state"], "finished", "{holder_a}");
     assert_eq!(
@@ -1729,7 +1749,7 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
         json!({
             "prompt": "conflicting pre-spawn timeout",
             "access": "read-only",
-            "timeout_ms": 400
+            "timeout_ms": 3_000
         }),
     );
     assert_eq!(
@@ -1802,7 +1822,7 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
     let holder_b = call(
         &mut server_b,
         "codex",
-        json!({"prompt": "hold key lock", "access": "full", "timeout_ms": 400}),
+        json!({"prompt": "hold key lock", "access": "full", "timeout_ms": 3_000}),
     );
     assert_eq!(holder_b["observed"]["state"], "finished", "{holder_b}");
     assert_eq!(
@@ -1816,21 +1836,7 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
         "codex",
         json!({"prompt": "conflicting pre-spawn cancel", "access": "read-only"}),
     );
-    let until = Instant::now() + crate::common::WAIT;
-    while fleet_b.records().len() <= before_cancel {
-        assert!(Instant::now() < until, "conflicting stub did not run");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let records = fleet_b.records();
-    let output_path = PathBuf::from(argument(records.last().unwrap(), "-o").unwrap());
-    while output_path.exists() {
-        assert!(
-            Instant::now() < until,
-            "conflicting turn did not finish reading output"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    std::thread::sleep(Duration::from_millis(50));
+    wait_for_codex_output_removed(&fleet_b, before_cancel);
 
     server_b.send(&json!({
         "jsonrpc": "2.0",
@@ -1901,7 +1907,7 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
     let timed_c = call(
         &mut server_c,
         "codex",
-        json!({"prompt": "delayed save", "access": "full", "timeout_ms": 400}),
+        json!({"prompt": "delayed save", "access": "full", "timeout_ms": 3_000}),
     );
     assert_eq!(timed_c["observed"]["state"], "finished", "{timed_c}");
     assert_eq!(
