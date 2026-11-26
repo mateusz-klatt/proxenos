@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 #[path = "platform/session.rs"]
 mod session;
 
+const BURN_WALL_LIMIT_MS: u64 = 30_000;
+
 fn main() -> Result<ExitCode, Box<dyn Error>> {
     if let Some(directory) = std::env::var_os("PROXENOS_STUB_DIR") {
         return replay(Path::new(&directory));
@@ -27,7 +29,13 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
             "flood" => io::stdout().write_all(&vec![0xff; value.parse()?])?,
             "flood-err" => io::stderr().write_all(&vec![0xfe; value.parse()?])?,
             "sleep" => thread::sleep(Duration::from_millis(value.parse()?)),
-            "burn" => burn_cpu(value.parse()?)?,
+            "burn" => {
+                let (cpu_ms, wall_ms) = match value.split_once(':') {
+                    Some((cpu_ms, wall_ms)) => (cpu_ms, wall_ms.parse()?),
+                    None => (value, BURN_WALL_LIMIT_MS),
+                };
+                burn_cpu(cpu_ms.parse()?, wall_ms)?;
+            }
             #[cfg(unix)]
             "alloc" => held_memory.push(alloc_and_touch(value.parse()?)?),
             "close-output" => platform::close_output()?,
@@ -135,7 +143,7 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
         held_memory = alloc_and_touch(bytes as usize)?;
     }
     if let Some(ms) = step["burn_cpu_ms"].as_u64() {
-        burn_cpu(ms)?;
+        burn_cpu(ms, BURN_WALL_LIMIT_MS)?;
     }
     if let Some(ms) = step["child_burn_cpu_ms"].as_u64() {
         let mut child = Command::new(std::env::current_exe()?);
@@ -217,14 +225,14 @@ fn alloc_and_touch(len: usize) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(memory)
 }
 
-fn burn_cpu(ms: u64) -> Result<(), Box<dyn Error>> {
-    let start = platform::cpu_time_ms()?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+fn burn_cpu(ms: u64, wall_ms: u64) -> Result<(), Box<dyn Error>> {
+    let start = platform::cpu_time_ms();
+    let deadline = Instant::now() + Duration::from_millis(wall_ms);
     let mut acc = 0_u64;
-    while platform::cpu_time_ms()?.saturating_sub(start) < ms {
+    while platform::cpu_time_ms().saturating_sub(start) < ms {
         (Instant::now() < deadline)
             .then_some(())
-            .ok_or("burn_cpu exceeded 30 s wall-clock ceiling")?;
+            .ok_or("burn_cpu exceeded its wall-clock ceiling")?;
         for _ in 0..10_000 {
             acc = std::hint::black_box(acc).wrapping_add(1);
         }
@@ -324,13 +332,11 @@ mod platform {
         super::wait_until(|| Ok(RECEIVED_TERM.load(Ordering::Relaxed)))
     }
 
-    pub(super) fn cpu_time_ms() -> io::Result<u64> {
+    pub(super) fn cpu_time_ms() -> u64 {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
         // SAFETY: RUSAGE_SELF queries the current process and writes into valid storage.
         let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-        (rc == 0)
-            .then_some(())
-            .ok_or_else(io::Error::last_os_error)?;
+        assert_eq!(rc, 0, "getrusage(RUSAGE_SELF) failed for the stub");
         // SAFETY: getrusage returned 0 and initialized `usage`.
         let usage = unsafe { usage.assume_init() };
         let to_ms = |tv: libc::timeval| {
@@ -338,7 +344,7 @@ mod platform {
                 .saturating_mul(1000)
                 .saturating_add((tv.tv_usec.max(0) as u64) / 1000)
         };
-        Ok(to_ms(usage.ru_utime).saturating_add(to_ms(usage.ru_stime)))
+        to_ms(usage.ru_utime).saturating_add(to_ms(usage.ru_stime))
     }
 
     pub(super) fn replace_with_fifo(path: &std::path::Path) -> io::Result<()> {
@@ -370,7 +376,7 @@ mod platform {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
-    pub(super) fn cpu_time_ms() -> io::Result<u64> {
+    pub(super) fn cpu_time_ms() -> u64 {
         let mut created = FILETIME::default();
         let mut exited = FILETIME::default();
         let mut kernel = FILETIME::default();
@@ -386,12 +392,10 @@ mod platform {
                 &raw mut user,
             )
         };
-        (ok != 0)
-            .then_some(())
-            .ok_or_else(io::Error::last_os_error)?;
+        assert_ne!(ok, 0, "GetProcessTimes failed for the current stub process");
         let to_100ns =
             |ft: FILETIME| (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
-        Ok(to_100ns(kernel).saturating_add(to_100ns(user)) / 10_000)
+        to_100ns(kernel).saturating_add(to_100ns(user)) / 10_000
     }
 
     pub(super) fn visible_console() -> bool {

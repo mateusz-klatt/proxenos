@@ -173,14 +173,23 @@ pub async fn serve<S: Service>(service: S) -> Served {
     };
     let deadline = async {
         stopper.shutdown.cancelled().await;
+        #[cfg(feature = "test-tools")]
+        let started = tokio::time::Instant::now();
         tokio::time::sleep(STOP_WITHIN).await;
+        let reason = format!(
+            "running calls and pending output did not finish within {} s of the end of serving",
+            STOP_WITHIN.as_secs()
+        );
+        #[cfg(feature = "test-tools")]
+        let reason = format!(
+            "{reason}\nproxenos test watchdog elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        reason
     };
     tokio::select! {
         () = serving => (),
-        () = deadline => stopper.record(Some(format!(
-            "running calls and pending output did not finish within {} s of the end of serving",
-            STOP_WITHIN.as_secs()
-        ))),
+        reason = deadline => stopper.record(Some(reason)),
     }
     let fault = lock(&stopper.fault).take();
     fault.map_or(Served::Ended, Served::Failed)

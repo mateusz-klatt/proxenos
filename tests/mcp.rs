@@ -242,22 +242,23 @@ fn a_call_that_outlasts_the_stop_limit_makes_serving_fail() {
     server.wait_for_stderr("test_wait: started");
     let closed = Instant::now();
     server.close_input();
-    server.wait_for_stderr_within("did not finish within 10 s", Duration::from_secs(15));
-    let diagnostic_at = closed.elapsed();
-    assert!(
-        diagnostic_at >= Duration::from_millis(9_900),
-        "watchdog diagnostic appeared too early: {diagnostic_at:?}"
-    );
     let (status, _) = server.wait_for_exit(common::EXIT_WAIT);
     let took = closed.elapsed();
     assert_eq!(status.code(), Some(1));
     assert!(took < Duration::from_secs(12), "exit took {took:?}");
+    let stderr = server.stderr();
+    let watchdog_ms: u64 = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("proxenos test watchdog elapsed_ms="))
+        .unwrap_or_else(|| panic!("watchdog did not report elapsed time: {stderr}"))
+        .parse()
+        .unwrap();
     assert!(
-        server.stderr().contains("did not finish within 10 s"),
-        "{}",
-        server.stderr()
+        watchdog_ms >= 9_900,
+        "watchdog expired too early: {watchdog_ms} ms"
     );
-    assert!(!server.stderr().contains("test_wait: done"));
+    assert!(stderr.contains("did not finish within 10 s"), "{stderr}");
+    assert!(!stderr.contains("test_wait: done"), "{stderr}");
 }
 
 fn initialize_frame() -> serde_json::Value {

@@ -138,6 +138,20 @@ fn a_child_receives_its_launch_settings_and_keeps_its_files_until_exit() {
 }
 
 #[test]
+fn the_cpu_burn_stub_stops_at_its_wall_clock_ceiling() {
+    let mut server = server();
+    let args = launch(json!([format!("burn:{}:0", u64::MAX)]));
+    let result = finished(&server.call(1, "test_run", args));
+    assert_eq!(result["ending"], "exited");
+    assert_eq!(result["code"], 1);
+    let stderr = result["stderr"].as_str().unwrap();
+    assert!(
+        stderr.contains("burn_cpu exceeded its wall-clock ceiling"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_child_can_read_stdin_to_eof_while_the_client_keeps_serving() {
     let mut server = server();
     let result = finished(&server.call(1, "test_run", launch(json!(["stdin"]))));

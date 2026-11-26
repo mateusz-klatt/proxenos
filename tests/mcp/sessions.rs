@@ -13,6 +13,15 @@ const CODEX_FINISHED: &str = include_str!("../fixtures/codex/finished.jsonl");
 const CODEX_THREAD: &str = "eeb3a731-d53a-4444-8a6a-4d9d89e76073";
 const AGY_FINISHED: &str = include_str!("../fixtures/antigravity/finished.json");
 const AGY_ID: &str = "paper-crane";
+const SAVE_LOCK_ACQUIRED: &str = "proxenos test session save: acquired key lock";
+
+fn server_with_save_lock_markers(fleet: &Fleet) -> Server {
+    let mut command = fleet.command("claude");
+    command.env("PROXENOS_TEST_SAVE_LOCK_MARKERS", "1");
+    let mut server = Server::start_command(command);
+    server.initialize("2025-11-25");
+    server
+}
 
 fn sessions_root(base: &Path) -> PathBuf {
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -67,48 +76,6 @@ fn wait_for_codex_output_removed(fleet: &Fleet, before_records: usize) {
         assert!(
             Instant::now() < until,
             "codex turn did not finish reading and cleaning up output"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Probes `key_lock` via a `codex-reply` that fails immediately in memory (without spawning a
-/// CLI) whenever `key_lock` is free on a server that already seeded `CODEX_THREAD` in `advisory`
-/// mode. A timeout in "Loading session settings" proves the in-flight start's detached save worker
-/// already owns `key_lock` and is blocked on `<key>.lock`.
-fn wait_for_codex_key_lock_held(server: &mut Server, first_probe_id: i64) {
-    let probe_until = Instant::now() + crate::common::WAIT;
-    let mut probe_id = first_probe_id;
-    loop {
-        let reply = server.call(
-            probe_id,
-            "codex-reply",
-            json!({
-                "thread_id": CODEX_THREAD,
-                "prompt": "probe key_lock",
-                "mode": "implementation",
-                "timeout_ms": 500
-            }),
-        );
-        probe_id += 1;
-        let envelope: Value = serde_json::from_str(crate::common::text(&reply)).unwrap();
-        if envelope["observed"]["failure"]["kind"] == "timeout" {
-            assert!(
-                envelope["observed"]["failure"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Loading session settings"),
-                "{envelope}"
-            );
-            return;
-        }
-        assert_eq!(
-            envelope["observed"]["failure"]["kind"], "invalid_request",
-            "{envelope}"
-        );
-        assert!(
-            Instant::now() < probe_until,
-            "save worker never acquired key_lock: {envelope}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1064,7 +1031,7 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
             {"stdout": CODEX_FINISHED}
         ]),
     );
-    let mut server_b = fleet_b.server("claude");
+    let mut server_b = server_with_save_lock_markers(&fleet_b);
     let seeded_b = call(
         &mut server_b,
         "codex",
@@ -1080,14 +1047,13 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
         .unwrap();
     lock_b.lock().unwrap();
 
-    let before_b = fleet_b.records().len();
     server_b.start_call(
         20,
         "codex",
         json!({"prompt": "conflicting start", "access": "read-only"}),
     );
-    wait_for_codex_output_removed(&fleet_b, before_b);
-    wait_for_codex_key_lock_held(&mut server_b, 22);
+    // The seed emitted the first marker. The next save worker holds the key across file I/O.
+    server_b.wait_for_stderr_count(SAVE_LOCK_ACQUIRED, 2);
 
     // Issue a reply while save #20 is still blocked on the advisory lock.
     server_b.start_call(
@@ -1531,7 +1497,7 @@ fn session_save_respects_call_deadline_and_cancellation() {
         .unwrap();
     lock.lock().unwrap();
 
-    let mut server2 = fleet.server("claude");
+    let mut server2 = server_with_save_lock_markers(&fleet);
     server2.request(1, "tools/list", json!({}));
     let began = Instant::now();
     let timed = call(
@@ -1558,6 +1524,7 @@ fn session_save_respects_call_deadline_and_cancellation() {
         "{timed}"
     );
     server2.wait_for_stderr("could not save session settings");
+    server2.wait_for_stderr(SAVE_LOCK_ACQUIRED);
 
     // Reply with a short timeout waits on the detached save's owned key lock and times out.
     let before_replies = fleet.records().len();
@@ -1652,7 +1619,7 @@ fn session_save_respects_call_deadline_and_cancellation() {
             {"stdout": CODEX_FINISHED, "final_message": "saved-cancel-answer"}
         ]),
     );
-    let mut server_b = fleet_b.server("claude");
+    let mut server_b = server_with_save_lock_markers(&fleet_b);
     let seeded_b = call(
         &mut server_b,
         "codex",
@@ -1668,14 +1635,12 @@ fn session_save_respects_call_deadline_and_cancellation() {
         .unwrap();
     lock_b.lock().unwrap();
 
-    let before = fleet_b.records().len();
     server_b.start_call(
         40,
         "codex",
         json!({"prompt": "save cancelled", "model": "cancelled-save-model"}),
     );
-    wait_for_codex_output_removed(&fleet_b, before);
-    wait_for_codex_key_lock_held(&mut server_b, 41);
+    server_b.wait_for_stderr_count(SAVE_LOCK_ACQUIRED, 2);
     let cancel_began = Instant::now();
     server_b.close_input();
     let cancelled: Value =
@@ -1717,7 +1682,7 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
             {"stdout": CODEX_FINISHED, "final_message": "pre-spawn-timeout-answer"}
         ]),
     );
-    let mut server_a = fleet_a.server("claude");
+    let mut server_a = server_with_save_lock_markers(&fleet_a);
     let seeded_a = call(
         &mut server_a,
         "codex",
@@ -1744,6 +1709,7 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
         holder_a["observed"]["session_save_failure"]["kind"], "timeout",
         "{holder_a}"
     );
+    server_a.wait_for_stderr_count(SAVE_LOCK_ACQUIRED, 2);
 
     // Conflicting start times out in `key_lock.lock_owned().await` before spawning a save worker.
     let conflict_timeout = call(
@@ -1806,7 +1772,7 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
             {"stdout": CODEX_FINISHED}
         ]),
     );
-    let mut server_b = fleet_b.server("claude");
+    let mut server_b = server_with_save_lock_markers(&fleet_b);
     let seeded_b = call(
         &mut server_b,
         "codex",
@@ -1832,6 +1798,7 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
         holder_b["observed"]["session_save_failure"]["kind"], "timeout",
         "{holder_b}"
     );
+    server_b.wait_for_stderr_count(SAVE_LOCK_ACQUIRED, 2);
 
     let before_cancel = fleet_b.records().len();
     server_b.start_call(
