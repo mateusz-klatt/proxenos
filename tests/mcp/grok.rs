@@ -53,19 +53,21 @@ fn native_start_and_reply_report_per_invocation_usage_and_explicit_session() {
             .iter()
             .map(|s| s.as_str().unwrap())
             .collect();
-        for pair in [
-            ["--output-format", "json"],
-            ["--model", "proxenos-local"],
-            ["--reasoning-effort", "medium"],
-        ] {
-            assert!(args.windows(2).any(|p| p == pair), "{args:?}");
+        let mut expected = vec!["--output-format", "json", "--always-approve"];
+        if i == 1 {
+            expected.extend(["--resume", SESSION]);
         }
-        assert!(args.contains(&"--always-approve"));
-        assert_eq!(args.windows(2).any(|p| p == ["--resume", SESSION]), i == 1);
-        assert!(!args.contains(&"--continue") && !args.contains(&"--session-id"));
-        let pos = args.iter().position(|s| *s == "-p").unwrap();
-        assert!(args[pos + 1].contains("Check the example."));
-        assert!(args[pos + 1].ends_with(if i == 0 {
+        expected.extend([
+            "--model",
+            "proxenos-local",
+            "--reasoning-effort",
+            "medium",
+            "-p",
+        ]);
+        let (prompt, flags) = args.split_last().unwrap();
+        assert_eq!(flags, expected.as_slice());
+        assert!(prompt.contains("Check the example."));
+        assert!(prompt.ends_with(if i == 0 {
             "--detail"
         } else {
             "Review it again."

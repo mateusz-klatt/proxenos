@@ -52,21 +52,28 @@ fn start_and_explicit_resume_use_the_native_turn_and_keep_the_start_settings() {
             .iter()
             .map(|s| s.as_str().unwrap())
             .collect();
-        for pair in [
-            ["--output-format", "json"],
-            ["--stream", "off"],
-            ["--model", "proxenos-local"],
-            ["--reasoning-effort", "medium"],
-        ] {
-            assert!(argv.windows(2).any(|s| s == pair), "{argv:?}");
+        let mut expected = vec![
+            "--output-format",
+            "json",
+            "--stream",
+            "off",
+            "--no-custom-instructions",
+            "--allow-all",
+        ];
+        if i == 1 {
+            expected.push(&resume_argument);
         }
-        assert!(argv.contains(&"--allow-all"));
-        assert!(argv.contains(&"--no-custom-instructions"));
-        assert_eq!(argv.contains(&resume_argument.as_str()), i == 1);
-        assert!(!argv.contains(&"--continue"));
-        let field = argv.iter().position(|s| *s == "-p").unwrap();
-        assert!(argv[field + 1].contains("Keep the answer brief."));
-        assert!(argv[field + 1].ends_with(if i == 0 {
+        expected.extend([
+            "--model",
+            "proxenos-local",
+            "--reasoning-effort",
+            "medium",
+            "-p",
+        ]);
+        let (prompt, flags) = argv.split_last().unwrap();
+        assert_eq!(flags, expected.as_slice());
+        assert!(prompt.contains("Keep the answer brief."));
+        assert!(prompt.ends_with(if i == 0 {
             "--explain this"
         } else {
             "Check again."

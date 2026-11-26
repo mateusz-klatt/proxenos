@@ -54,20 +54,7 @@ fn argv(turn: &Turn, _output: &Path) -> CommandLine {
     if let Some(id) = &turn.thread_id {
         args.extend(["--resume".into(), id.into()]);
     }
-    if let Some(model) = &turn.settings.model {
-        args.extend(["--model".into(), model.into()]);
-    }
-    if let Some(effort) = &turn.settings.effort {
-        args.extend(["--reasoning-effort".into(), effort.into()]);
-    }
-    args.extend([
-        "-p".into(),
-        format!("{}\n\n{}", turn.guidance, turn.prompt).into(),
-    ]);
-    CommandLine {
-        args,
-        cli_timeout_ms: None,
-    }
+    CommandLine::for_print_turn(args, turn)
 }
 
 // A model usage entry records model calls. Multiple entries do not identify one answer model.

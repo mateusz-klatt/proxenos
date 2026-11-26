@@ -5,12 +5,13 @@ what was measured, and what is still unknown. A decision here stands until a rec
 changes it. [ADR 001](adr/001-decisions-by-the-families-that-can-answer.md) says how decisions are
 taken, and [votes.md](votes.md) records who proposed and who supported each one.
 
-**Status: milestone 1 in progress.** `proxenos mcp --client <client>` serves the MCP layer of D4.
-Codex, Antigravity, Kimi, Claude Code, GitHub Copilot CLI and Grok Build run through the D6 supervisor with D17 background delegations (`wait: false`,
-`await`, `cancel`, at most 3 concurrent delegations), D18 resource accounting and optional memory
-limits, and D19 persisted session settings files. Behavioural tests install the crate’s stub
-in a private search path.
-The remaining decisions describe the design.
+**D13 milestone 2 is in progress.** `proxenos mcp --client <client>` serves the MCP layer of D4.
+Codex, Antigravity, Kimi, Claude Code, GitHub Copilot CLI and Grok Build run through the D6
+supervisor. They support D17 background delegations (`wait: false`, `await`,
+`cancel`, at most three concurrent delegations), D18 resource accounting and optional memory
+limits, and D19 persisted session settings. Behavioural tests install the crate’s stub in a
+private search path. Cursor Agent and the comparison with claude-delegator are the remaining
+work in this milestone. Releases and the rollout to the four hosts are later D13 milestones.
 
 ## 1. Terms
 

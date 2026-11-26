@@ -53,6 +53,26 @@ pub struct CommandLine {
     pub cli_timeout_ms: Option<u64>,
 }
 
+impl CommandLine {
+    /// Finish a print invocation with the model, reasoning effort and guided prompt.
+    fn for_print_turn(mut args: Vec<OsString>, turn: &Turn) -> Self {
+        if let Some(model) = &turn.settings.model {
+            args.extend(["--model".into(), model.into()]);
+        }
+        if let Some(effort) = &turn.settings.effort {
+            args.extend(["--reasoning-effort".into(), effort.into()]);
+        }
+        args.extend([
+            "-p".into(),
+            format!("{}\n\n{}", turn.guidance, turn.prompt).into(),
+        ]);
+        Self {
+            args,
+            cli_timeout_ms: None,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct Settings {
     #[serde(serialize_with = "serialize_cwd")]
