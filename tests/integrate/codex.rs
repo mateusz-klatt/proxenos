@@ -76,10 +76,12 @@ fn assert_registered(path: &Path, binary: &Path) {
     );
 }
 
+#[track_caller]
 fn assert_success(out: &Output) {
     assert!(
         out.status.success(),
-        "stdout: {}\nstderr: {}",
+        "process status: {}\nstdout: {}\nstderr: {}",
+        out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
