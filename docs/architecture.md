@@ -6,7 +6,7 @@ changes it. [ADR 001](adr/001-decisions-by-the-families-that-can-answer.md) says
 taken, and [votes.md](votes.md) records who proposed and who supported each one.
 
 **Status: milestone 1 in progress.** `proxenos mcp --client <client>` serves the MCP layer of D4.
-Codex and Antigravity run through the D6 supervisor with D17 background delegations (`wait: false`,
+Codex, Antigravity and Kimi run through the D6 supervisor with D17 background delegations (`wait: false`,
 `await`, `cancel`, at most 3 concurrent delegations), D18 resource accounting and optional memory
 limits, and D19 persisted session settings files. Behavioural tests install the crate’s stub
 in a private search path.
@@ -243,20 +243,38 @@ fixtures are synthetic, derived from claude-delegator's code. Capturing real CLI
 pre-turn errors that spend no model call (such as `codex exec` with an invalid model while logged
 out) as well as live turn output—is the next step.
 
-Measured for Kimi (`kimi 2.8.0` on Linux x86_64, 2026-11-26): non-interactive turns run with
-`--output-format stream-json [-S <id>] [-m <model>] -p <prompt>` in the delegation's working
-directory. Kimi print mode has no permission tier—`--plan`, `--yolo` and `--auto` are rejected
-when combined with `-p`—so Proxenos advertises only `access: full` and refuses `access: read-only`
-with `invalid_request` before dispatch. Kimi auto-loads `AGENTS.md` from the working directory with
-no disable switch; Proxenos states this in `access`'s description and in `not_claimed`. Replies
-resume only by explicit `-S <id>` (never `--continue` / `-c`) and repeat the working directory
-because Kimi sessions are directory-bound; Kimi accepts `-m` on replies without requiring one, so
-model-less starts omit `-m` on reply (D19) while named models are reapplied from `StartStore` or
-the persisted session file. `stream-json` emits `system.version`, `assistant` content chunks, and a
-terminal `session.resume_hint` carrying `session_id` (and neither a model name nor token usage in
-2.8.0); Proxenos treats `session.resume_hint` plus non-empty assistant content as completion
-evidence and rejects any reply whose reported `session_id` does not match the requested ID without
-returning or archiving content.
+Measured for Kimi (`kimi 2.8.0` on Linux x86_64, 2026-11-26):
+
+- **Captured (`tests/fixtures/kimi/`, unedited raw bytes):** non-interactive start
+  (`captured-start.stdout.jsonl`), explicit `-S <id>` reply (`captured-reply.stdout.jsonl`), and a
+  multi-step file-read tool turn (`captured-tool-turn.stdout.jsonl`) run with
+  `--output-format stream-json [-S <id>] [-m <model>] -p <prompt>`. Each `stream-json` line is a
+  whole message per step: `system.version`, `assistant` messages carrying either `tool_calls` (with
+  no `content`) or string `content` (no content-array parts were observed), `tool` result messages,
+  and a terminal `session.resume_hint` carrying `session_id` (and neither a model name nor token
+  usage in 2.8.0). Zero-cost error captures record `--plan` rejected with `-p`
+  (`captured-plan-rejected.stderr.txt`), unknown model alias, unknown session ID, and missing login.
+- **Probed without saved capture (`kimi 2.8.0`, Linux x86_64, 2026-11-26):** `--yolo` and `--auto`
+  are likewise rejected when combined with `-p`; resuming `-S <id>` from another working directory
+  exits 1 with a directory-mismatch error (the live capture was discarded because `See log:`
+  contained a `/home/` path), confirming sessions are directory-bound; and `-S <id>` does not
+  require `-m`, so model-less starts omit `-m` on reply (D19) while named models are reapplied from
+  `StartStore` or the persisted session file.
+- **Documented by Kimi Code, not measured here:** Kimi Code auto-loads `AGENTS.md` from the working
+  directory with no switch to disable it. Proxenos states this in `access`'s description and as a
+  non-claim in `not_claimed`.
+- **Behaviour and limits (what this cannot do):** because Kimi print mode has no permission tier,
+  Proxenos advertises only `access: full` and refuses `access: read-only` with `invalid_request`
+  before dispatch. Replies resume only by explicit `-S <id>` (never `--continue` / `-c`) and repeat
+  `cwd`. Proxenos ignores non-string or blank `assistant` messages (such as tool-call steps) and
+  joins multiple non-empty `assistant` messages with `"\n\n"`. Because `session.resume_hint` shows
+  only that a session exists and is not a turn-completed event, Proxenos treats a run as completed
+  only when exit status is `0` and `session.resume_hint` is present alongside non-empty assistant
+  content; on any non-zero exit it always classifies stderr and reports no completed content. It
+  also fails without returning or archiving content if `session.resume_hint` records disagree on
+  `session_id` or if a reply's reported `session_id` does not match the requested ID. If Kimi exits
+  `0` on an interrupted or step-limited turn after printing assistant text and
+  `session.resume_hint`, Proxenos has no wire evidence to distinguish that from a completed turn.
 
 ### D6. Children are supervised to the end
 

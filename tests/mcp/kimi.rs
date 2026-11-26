@@ -9,6 +9,7 @@ use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_fa
 
 const CAPTURED_START: &str = include_str!("../fixtures/kimi/captured-start.stdout.jsonl");
 const CAPTURED_REPLY: &str = include_str!("../fixtures/kimi/captured-reply.stdout.jsonl");
+const CAPTURED_TOOL_TURN: &str = include_str!("../fixtures/kimi/captured-tool-turn.stdout.jsonl");
 const CAPTURED_UNKNOWN_MODEL_OUT: &str =
     include_str!("../fixtures/kimi/captured-unknown-model.stdout.jsonl");
 const CAPTURED_UNKNOWN_MODEL_ERR: &str =
@@ -23,8 +24,8 @@ const CAPTURED_MISSING_LOGIN_ERR: &str =
     include_str!("../fixtures/kimi/captured-missing-login.stderr.txt");
 const CAPTURED_PLAN_REJECTED_ERR: &str =
     include_str!("../fixtures/kimi/captured-plan-rejected.stderr.txt");
-const SYNTHETIC_MULTI_CHUNK: &str =
-    include_str!("../fixtures/kimi/synthetic-multi-chunk.stdout.jsonl");
+const SYNTHETIC_MULTI_MESSAGE: &str =
+    include_str!("../fixtures/kimi/synthetic-multi-message.stdout.jsonl");
 const SYNTHETIC_NO_ASSISTANT: &str =
     include_str!("../fixtures/kimi/synthetic-no-assistant.stdout.jsonl");
 const SYNTHETIC_NO_COMPLETION: &str =
@@ -33,6 +34,7 @@ const SYNTHETIC_WRONG_DIRECTORY_ERR: &str =
     include_str!("../fixtures/kimi/synthetic-wrong-directory.stderr.txt");
 
 const CAPTURED_ID: &str = "session_4d58d263-d61a-48ac-88fe-62125c2b86b8";
+const CAPTURED_TOOL_ID: &str = "session_c424299a-1180-4987-a6d2-b69c88835308";
 const SYNTHETIC_ID: &str = "session_11111111-2222-4333-8444-555555555555";
 
 fn argument<'a>(record: &'a Value, flag: &str) -> Option<&'a str> {
@@ -202,8 +204,9 @@ fn kimi_start_and_reply_replay_captured_fixtures_and_enforce_argv_rules() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item.as_str().is_some_and(|s| s.contains("AGENTS.md"))),
-        "missing AGENTS.md caveat in not_claimed: {start}"
+            .any(|item| item.as_str().is_some_and(|s| s
+                .starts_with("That the delegation was free of the working directory's AGENTS.md"))),
+        "missing AGENTS.md non-claim in not_claimed: {start}"
     );
     fleet.assert_steps_remaining("kimi", 2);
 
@@ -581,7 +584,7 @@ fn kimi_reply_after_server_restart_uses_session_file_and_supports_model_less_rep
 }
 
 #[test]
-fn kimi_streams_chunks_requires_completion_and_confirms_session_id() {
+fn kimi_joins_messages_requires_completion_and_confirms_session_id() {
     let fleet = Fleet::new(&["kimi"]);
     let foreign_long = kimi_turn("session_other", &"f".repeat((16 << 10) + 64));
     let missing_id_hint = json!({
@@ -592,30 +595,48 @@ fn kimi_streams_chunks_requires_completion_and_confirms_session_id() {
             json!({"role": "meta", "type": "session.resume_hint"})
         )
     });
+    let conflicting_hints = json!({
+        "stdout": format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({"role": "meta", "type": "system.version", "version": "2.8.0"}),
+            json!({"role": "assistant", "content": "c".repeat((16 << 10) + 64)}),
+            json!({"role": "meta", "type": "session.resume_hint", "session_id": "session_first"}),
+            json!({"role": "meta", "type": "session.resume_hint", "session_id": "session_second"})
+        )
+    });
     let invalid_id_start = kimi_turn("../escape", "valid answer with bad id");
     let oversized_id_start = kimi_turn(&"s".repeat(200), "valid answer with long id");
 
     fleet.script(
         "kimi",
         json!([
-            {"stdout": SYNTHETIC_MULTI_CHUNK},
+            {"stdout": CAPTURED_TOOL_TURN},
+            {"stdout": SYNTHETIC_MULTI_MESSAGE},
             {"stdout": SYNTHETIC_NO_COMPLETION},
             {"stdout": SYNTHETIC_NO_ASSISTANT},
             {"stdout": SYNTHETIC_NO_ASSISTANT, "stderr": "401 Unauthorized"},
             foreign_long,
             missing_id_hint,
+            conflicting_hints,
             invalid_id_start,
             oversized_id_start
         ]),
     );
     let mut server = fleet.server("claude");
 
-    // Multiple assistant chunks past non-JSON noise concatenate cleanly.
+    // Captured multi-step tool turn ignores tool_calls / tool messages and extracts final answer.
+    let tool_turn = call(&mut server, "kimi", json!({"prompt": "read notes.txt"}));
+    assert_eq!(tool_turn["observed"]["state"], "finished", "{tool_turn}");
+    assert_eq!(tool_turn["reported"]["thread_id"], CAPTURED_TOOL_ID);
+    assert_eq!(tool_turn["reported"]["content"], "alpha");
+    fleet.assert_steps_remaining("kimi", 9);
+
+    // Multiple whole assistant messages past noise/blank steps join with "\n\n".
     let multi = call(&mut server, "kimi", json!({"prompt": "multi"}));
     assert_eq!(multi["observed"]["state"], "finished", "{multi}");
     assert_eq!(multi["reported"]["thread_id"], SYNTHETIC_ID);
-    assert_eq!(multi["reported"]["content"], "First part and second part.");
-    fleet.assert_steps_remaining("kimi", 7);
+    assert_eq!(multi["reported"]["content"], "First step.\n\nSecond step.");
+    fleet.assert_steps_remaining("kimi", 8);
 
     // Zero exit without session.resume_hint fails as missing completion evidence.
     let incomplete = call(&mut server, "kimi", json!({"prompt": "truncated"}));
@@ -625,16 +646,16 @@ fn kimi_streams_chunks_requires_completion_and_confirms_session_id() {
         "without evidence of a completed turn",
     );
     assert!(incomplete["reported"]["content"].is_null());
-    fleet.assert_steps_remaining("kimi", 6);
+    fleet.assert_steps_remaining("kimi", 7);
 
     // session.resume_hint with no assistant content fails cleanly (unclassified, then classified).
     let no_answer = call(&mut server, "kimi", json!({"prompt": "silent"}));
     assert_reported_failure(&no_answer, None, "unknown", "without an assistant answer");
-    fleet.assert_steps_remaining("kimi", 5);
+    fleet.assert_steps_remaining("kimi", 6);
 
     let no_answer_auth = call(&mut server, "kimi", json!({"prompt": "silent auth"}));
     assert_reported_failure(&no_answer_auth, None, "authentication", "401 Unauthorized");
-    fleet.assert_steps_remaining("kimi", 4);
+    fleet.assert_steps_remaining("kimi", 5);
 
     // Reply receiving a foreign session ID or missing session ID fails and never leaks or archives content.
     for (index, expected_reported_id) in [Some("session_other"), None].into_iter().enumerate() {
@@ -662,8 +683,19 @@ fn kimi_streams_chunks_requires_completion_and_confirms_session_id() {
             mismatch["observed"]["content_file"].is_null(),
             "foreign content archived: {mismatch}"
         );
-        fleet.assert_steps_remaining("kimi", 3 - index);
+        fleet.assert_steps_remaining("kimi", 4 - index);
     }
+
+    // Disagreeing session.resume_hint IDs fail instead of letting the last one win.
+    let disagreed = call(&mut server, "kimi", json!({"prompt": "conflicting hints"}));
+    assert_reported_failure(&disagreed, None, "unknown", "conflicting session IDs");
+    assert!(disagreed["reported"]["thread_id"].is_null(), "{disagreed}");
+    assert!(disagreed["reported"]["content"].is_null(), "{disagreed}");
+    assert!(
+        disagreed["observed"]["content_file"].is_null(),
+        "{disagreed}"
+    );
+    fleet.assert_steps_remaining("kimi", 2);
 
     // Invalid or oversized session IDs on start are dropped rather than returned or persisted.
     for index in 0..2 {
@@ -672,7 +704,7 @@ fn kimi_streams_chunks_requires_completion_and_confirms_session_id() {
         assert!(done["reported"]["thread_id"].is_null(), "{done}");
         fleet.assert_steps_remaining("kimi", 1 - index);
     }
-    assert_eq!(delegated(&fleet).len(), 8);
+    assert_eq!(delegated(&fleet).len(), 10);
 }
 
 #[test]
@@ -682,6 +714,16 @@ fn kimi_classifies_captured_and_synthetic_errors_without_misclassifying_answers(
         CAPTURED_ID,
         "Model \"x\" is not configured in config.toml. Quota exhausted.",
     );
+    let partial_quota_exit = json!({
+        "stdout": format!(
+            "{}\n{}\n{}\n",
+            json!({"role": "meta", "type": "system.version", "version": "2.8.0"}),
+            json!({"role": "assistant", "content": "Partial narration before quota failure."}),
+            json!({"role": "meta", "type": "session.resume_hint", "session_id": "session_partial_quota"})
+        ),
+        "stderr": "error: failed to run prompt: Quota exhausted. Resets at 2030-06-01T09:00:00Z.\n",
+        "code": 1
+    });
     fleet.script(
         "kimi",
         json!([
@@ -725,6 +767,7 @@ fn kimi_classifies_captured_and_synthetic_errors_without_misclassifying_answers(
                 "stderr": "error: failed to run prompt: content_policy_violation\n",
                 "code": 1
             },
+            partial_quota_exit,
             {
                 "stderr": "worker died",
                 "code": 37
@@ -828,8 +871,37 @@ fn kimi_classifies_captured_and_synthetic_errors_without_misclassifying_answers(
             *reset_at,
             "{result}"
         );
-        fleet.assert_steps_remaining("kimi", 11 - index);
+        fleet.assert_steps_remaining("kimi", 12 - index);
     }
+
+    // Non-zero exit WITH session.resume_hint and partial assistant narration still classifies
+    // stderr as quota (preserving reset_at), reports no completed content, and does not remember start.
+    let partial_quota = call(&mut server, "kimi", json!({"prompt": "partial quota"}));
+    assert_reported_failure(
+        &partial_quota,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        "Quota exhausted",
+    );
+    assert_eq!(
+        partial_quota["reported"]["failure"]["reset_at"],
+        "2030-06-01T09:00:00Z"
+    );
+    assert!(
+        partial_quota["reported"]["content"].is_null(),
+        "non-zero exit must not report partial text as content: {partial_quota}"
+    );
+    assert_eq!(
+        partial_quota["reported"]["thread_id"],
+        "session_partial_quota"
+    );
+    let unremembered = call(
+        &mut server,
+        "kimi-reply",
+        json!({"thread_id": "session_partial_quota", "prompt": "retry"}),
+    );
+    assert_observed_failure(&unremembered, "invalid_request", "no settings");
+    fleet.assert_steps_remaining("kimi", 3);
 
     // Unrecognized stderr stays in reported.diagnostic without a classified reported.failure.
     let unknown_exit = call(&mut server, "kimi", json!({"prompt": "worker died"}));

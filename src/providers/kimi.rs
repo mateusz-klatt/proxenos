@@ -26,7 +26,7 @@ pub(super) const SPEC: Provider = Provider {
         "Kimi print mode has no permission tier (it rejects --plan, --yolo and --auto with -p) and runs tools unattended; read-only is unsupported. Kimi auto-loads AGENTS.md from the working directory with no disable switch.",
     )],
     not_claimed: &[
-        "Kimi Code auto-loads AGENTS.md from the working directory with no switch to disable it.",
+        "That the delegation was free of the working directory's AGENTS.md; Kimi Code auto-loads it and has no switch to disable it.",
     ],
     fixed_instructions: false,
     reply_model: false,
@@ -145,8 +145,9 @@ fn classify(stderr: &str) -> Option<Failure> {
 
 fn parse(finished: &Finished, _output: &str, expected: Option<&str>) -> Report {
     let mut report = Report::default();
-    let mut chunks = String::new();
+    let mut messages = Vec::new();
     let mut raw_id: Option<String> = None;
+    let mut conflicting_hints = false;
     let mut saw_resume_hint = false;
 
     for event in finished
@@ -156,17 +157,32 @@ fn parse(finished: &Finished, _output: &str, expected: Option<&str>) -> Report {
         .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
     {
         match (event["role"].as_str(), event["content"].as_str()) {
-            (Some("assistant"), Some(text)) => chunks.push_str(text),
+            (Some("assistant"), Some(text)) if !text.trim().is_empty() => {
+                messages.push(text.to_owned());
+            }
             (Some("meta"), _) if event["type"] == "session.resume_hint" => {
-                saw_resume_hint = true;
-                raw_id = event["session_id"]
+                let next_id = event["session_id"]
                     .as_str()
                     .map(str::trim)
                     .filter(|id| !id.is_empty())
                     .map(str::to_owned);
+                if saw_resume_hint && raw_id != next_id {
+                    conflicting_hints = true;
+                } else {
+                    raw_id = next_id;
+                }
+                saw_resume_hint = true;
             }
             _ => {}
         }
+    }
+
+    if conflicting_hints {
+        report.failure = Some(Failure::new(
+            FailureKind::Unknown,
+            "Kimi emitted conflicting session IDs.",
+        ));
+        return report;
     }
 
     report.thread_id = raw_id
@@ -176,7 +192,7 @@ fn parse(finished: &Finished, _output: &str, expected: Option<&str>) -> Report {
 
     let id_matches = expected.is_none() || expected == report.thread_id.as_deref();
     let foreign_id = expected.is_some() && raw_id.is_some() && expected != raw_id.as_deref();
-    if foreign_id || (saw_resume_hint && !id_matches) {
+    if foreign_id || (finished.code == Some(0) && saw_resume_hint && !id_matches) {
         report.failure = Some(Failure::new(
             FailureKind::Unknown,
             "Kimi did not confirm the requested session ID.",
@@ -185,8 +201,8 @@ fn parse(finished: &Finished, _output: &str, expected: Option<&str>) -> Report {
     }
 
     let stderr = String::from_utf8_lossy(&finished.stderr.bytes);
-    if saw_resume_hint {
-        if chunks.trim().is_empty() {
+    if finished.code == Some(0) && saw_resume_hint {
+        if messages.is_empty() {
             report.failure = Some(classify(&stderr).unwrap_or_else(|| {
                 Failure::new(
                     FailureKind::Unknown,
@@ -194,7 +210,7 @@ fn parse(finished: &Finished, _output: &str, expected: Option<&str>) -> Report {
                 )
             }));
         } else {
-            report.content = Some(chunks);
+            report.content = Some(messages.join("\n\n"));
             report.completed = true;
         }
     } else {
