@@ -82,6 +82,9 @@ fn sole_model(usage: &Value) -> Option<String> {
 
 fn parse(run: &Finished, _output: &str, expected: Option<&str>) -> Report {
     let mut report = Report::default();
+    if run.stdout.total > run.stdout.bytes.len() as u64 {
+        return report;
+    }
     let Ok(value) = serde_json::from_slice::<Value>(&run.stdout.bytes) else {
         return report;
     };

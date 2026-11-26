@@ -159,6 +159,27 @@ fn altered(field: &str, replacement: Value) -> String {
 }
 
 #[test]
+fn a_json_object_in_a_truncated_stream_cannot_confirm_a_turn() {
+    let fleet = Fleet::new(&["grok"]);
+    let stdout = format!("{START}{}\n{{}}\n", " ".repeat(4 << 20));
+    fleet.script(
+        "grok",
+        json!([{"stdout":stdout},{"code":9,"stdout":stdout}]),
+    );
+    let mut server = fleet.server("codex");
+    let result = call(&mut server, "grok", json!({"prompt":"check"}));
+    assert_observed_failure(&result, "capture", "capture limit");
+    let attempt = &result["observed"]["attempts"][0];
+    assert_eq!(attempt["stdout_bytes"], stdout.len());
+    assert_eq!(attempt["stdout_captured"], 4 << 20);
+    assert!(result["reported"]["content"].is_null());
+    assert!(result["reported"]["thread_id"].is_null());
+    let failed = call(&mut server, "grok", json!({"prompt":"check"}));
+    assert_observed_failure(&failed, "abnormal_exit", "exit code 9");
+    assert!(failed["reported"]["content"].is_null());
+}
+
+#[test]
 fn incomplete_foreign_and_nonzero_results_never_return_candidate_answer_bytes() {
     let fleet = Fleet::new(&["grok"]);
     fleet.script(
