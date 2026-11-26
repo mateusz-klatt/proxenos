@@ -1,61 +1,31 @@
 //! Grok Build writes one JSON object for a headless turn.
-use std::path::Path;
 
 use serde_json::Value;
 
 use super::{
-    CommandLine, Failure, Provider, Report, Turn, is_canonical_uuid, is_valid_model, token_usage,
+    CommandLine, Failure, Provider, Report, is_canonical_uuid, is_valid_model, token_usage,
 };
 use crate::envelope::FailureKind;
 use crate::supervise::Finished;
 
-const SETTINGS: &[&str] = &["model", "effort", "cwd", "access", "mode", "instructions"];
-
-pub(super) const SPEC: Provider = Provider {
-    name: "grok",
-    cli: "grok",
-    #[cfg(unix)]
-    install_dirs: &[("HOME", ".local/bin"), ("HOME", ".grok/bin")],
-    #[cfg(windows)]
-    install_dirs: &[],
-    efforts: &["low", "medium", "high", "xhigh"],
-    start_settings: SETTINGS,
-    reply_settings: SETTINGS,
-    access: &[(
+pub(super) const SPEC: Provider = Provider::full_access_print(
+    "grok",
+    &[("HOME", ".local/bin"), ("HOME", ".grok/bin")],
+    &["low", "medium", "high", "xhigh"],
+    &[(
         "full",
         "Grok auto-approves tool executions with --always-approve. We have not verified a read-only configuration across its tools.",
     )],
-    fixed_instructions: false,
-    reply_model: false,
-    not_claimed: &[],
-    read_only_not_claimed: &[],
-    prepare,
-    argv,
+    |turn| turn.require_session_uuid("Grok"),
+    |turn, _| {
+        let resume = turn
+            .thread_id
+            .iter()
+            .flat_map(|id| ["--resume".into(), id.into()]);
+        CommandLine::for_print_turn(turn, &["--always-approve"], resume)
+    },
     parse,
-};
-
-fn prepare(turn: &mut Turn) -> Result<(), String> {
-    if turn
-        .thread_id
-        .as_deref()
-        .is_some_and(|id| !is_canonical_uuid(id))
-    {
-        return Err("Grok thread_id must be a canonical session UUID.".into());
-    }
-    Ok(())
-}
-
-fn argv(turn: &Turn, _output: &Path) -> CommandLine {
-    let mut args = vec![
-        "--output-format".into(),
-        "json".into(),
-        "--always-approve".into(),
-    ];
-    if let Some(id) = &turn.thread_id {
-        args.extend(["--resume".into(), id.into()]);
-    }
-    CommandLine::for_print_turn(args, turn)
-}
+);
 
 // A model usage entry records model calls. Multiple entries do not identify one answer model.
 fn sole_model(usage: &Value) -> Option<String> {

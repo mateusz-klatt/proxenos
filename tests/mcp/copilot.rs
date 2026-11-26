@@ -118,7 +118,11 @@ fn listing_and_access_validation_match_copilots_available_interface() {
             "copilot-reply",
             json!({"prompt":"resume","thread_id":id,"cwd":fleet.root,"mode":"advisory","access":"full"}),
         );
-        assert_observed_failure(&result, "invalid_request", "canonical");
+        assert_observed_failure(
+            &result,
+            "invalid_request",
+            "Copilot thread_id must be a canonical session UUID.",
+        );
     }
     let denied = call(
         &mut server,

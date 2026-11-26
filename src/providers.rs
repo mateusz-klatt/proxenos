@@ -54,8 +54,15 @@ pub struct CommandLine {
 }
 
 impl CommandLine {
-    /// Finish a print invocation with the model, reasoning effort and guided prompt.
-    fn for_print_turn(mut args: Vec<OsString>, turn: &Turn) -> Self {
+    /// Build a JSON print invocation around the CLI's own access and resume switches.
+    fn for_print_turn(
+        turn: &Turn,
+        flags: &[&str],
+        resume: impl IntoIterator<Item = OsString>,
+    ) -> Self {
+        let mut args = vec![OsString::from("--output-format"), "json".into()];
+        args.extend(flags.iter().copied().map(OsString::from));
+        args.extend(resume);
         if let Some(model) = &turn.settings.model {
             args.extend(["--model".into(), model.into()]);
         }
@@ -128,6 +135,21 @@ pub struct Turn {
     pub denied_tools: Vec<String>,
 }
 
+impl Turn {
+    fn require_session_uuid(&self, provider: &str) -> Result<(), String> {
+        if self
+            .thread_id
+            .as_deref()
+            .is_some_and(|id| !is_canonical_uuid(id))
+        {
+            return Err(format!(
+                "{provider} thread_id must be a canonical session UUID."
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default, Serialize)]
 pub struct Report {
     pub thread_id: Option<String>,
@@ -145,6 +167,35 @@ pub struct Report {
 }
 
 impl Provider {
+    /// Both full-access print CLIs accept the same start and reply settings.
+    const fn full_access_print(
+        name: &'static str,
+        unix_dirs: &'static [(&'static str, &'static str)],
+        efforts: &'static [&'static str],
+        access: &'static [(&'static str, &'static str)],
+        prepare: fn(&mut Turn) -> Result<(), String>,
+        argv: fn(&Turn, &Path) -> CommandLine,
+        parse: fn(&Finished, &str, Option<&str>) -> Report,
+    ) -> Self {
+        const SETTINGS: &[&str] = &["model", "effort", "cwd", "access", "mode", "instructions"];
+        Self {
+            name,
+            cli: name,
+            install_dirs: if cfg!(unix) { unix_dirs } else { &[] },
+            efforts,
+            start_settings: SETTINGS,
+            reply_settings: SETTINGS,
+            access,
+            fixed_instructions: false,
+            reply_model: false,
+            not_claimed: &[],
+            read_only_not_claimed: &[],
+            prepare,
+            argv,
+            parse,
+        }
+    }
+
     pub fn supported_settings(&self, reply: bool) -> &'static [&'static str] {
         if reply {
             self.reply_settings

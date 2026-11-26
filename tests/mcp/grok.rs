@@ -114,7 +114,11 @@ fn grok_is_hidden_from_itself_and_validates_access_and_session_before_dispatch()
             "grok-reply",
             json!({"prompt":"inspect","thread_id":id,"cwd":fleet.root,"access":"full","mode":"advisory"}),
         );
-        assert_observed_failure(&denied, "invalid_request", "canonical");
+        assert_observed_failure(
+            &denied,
+            "invalid_request",
+            "Grok thread_id must be a canonical session UUID.",
+        );
     }
     assert!(
         fleet
