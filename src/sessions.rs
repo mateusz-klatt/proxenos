@@ -231,25 +231,9 @@ impl Drop for Staging {
     }
 }
 
-fn is_private_dir(meta: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.file_type().is_dir()
-            && meta.uid() == crate::platform::current_uid()
-            && (meta.mode() & 0o777) == 0o700
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        meta.file_type().is_dir() && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
-    }
-}
-
 fn verify_existing_dir(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
-    if !is_private_dir(&meta) {
+    if !state::is_private_dir(&meta) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(

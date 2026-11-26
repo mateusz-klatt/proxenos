@@ -277,14 +277,7 @@ fn check_state_dir() -> Check {
         Ok(path) => path,
         Err(message) => return Check::new("state_dir.permissions", Status::Fail, message, None),
     };
-    check_state_dir_platform(&dir)
-}
-
-#[cfg(unix)]
-fn check_state_dir_platform(dir: &Path) -> Check {
-    use std::os::unix::fs::PermissionsExt;
-
-    match fs::symlink_metadata(dir) {
+    match fs::symlink_metadata(&dir) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Check::new(
             "state_dir.permissions",
             Status::Warn,
@@ -297,47 +290,26 @@ fn check_state_dir_platform(dir: &Path) -> Check {
             format!("Could not inspect state directory {}: {err}", dir.display()),
             None,
         ),
-        Ok(meta) => {
-            let mode = meta.permissions().mode() & 0o777;
-            let mode_text = format!("{mode:04o}");
-            let details = Some(json!({
-                "path": dir.display().to_string(),
-                "mode": mode_text,
-            }));
-            if !meta.is_dir() || (mode & 0o077) != 0 {
-                Check::new(
-                    "state_dir.permissions",
-                    Status::Fail,
-                    format!(
-                        "State directory {} is not a private directory (mode {mode_text}; expected 0700).",
-                        dir.display()
-                    ),
-                    details,
-                )
-            } else {
-                Check::new(
-                    "state_dir.permissions",
-                    Status::Ok,
-                    format!(
-                        "State directory {} has private permissions ({mode_text}).",
-                        dir.display()
-                    ),
-                    details,
-                )
-            }
-        }
+        Ok(meta) => check_state_dir_metadata(&dir, &meta),
     }
 }
 
-#[cfg(not(unix))]
-fn check_state_dir_platform(dir: &Path) -> Check {
-    let details = Some(json!({ "path": dir.display().to_string() }));
-    if dir.is_dir() {
+#[cfg(unix)]
+fn check_state_dir_metadata(dir: &Path, meta: &fs::Metadata) -> Check {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = meta.permissions().mode() & 0o777;
+    let mode_text = format!("{mode:04o}");
+    let details = Some(json!({
+        "path": dir.display().to_string(),
+        "mode": mode_text,
+    }));
+    if !state::is_private_dir(meta) {
         Check::new(
             "state_dir.permissions",
-            Status::Ok,
+            Status::Fail,
             format!(
-                "State directory {} exists (Unix permission bits do not apply on this platform).",
+                "State directory {} is not a private directory (mode {mode_text}; expected 0700 owned by the current user, not a symlink).",
                 dir.display()
             ),
             details,
@@ -345,8 +317,37 @@ fn check_state_dir_platform(dir: &Path) -> Check {
     } else {
         Check::new(
             "state_dir.permissions",
-            Status::Warn,
-            format!("State directory {} does not exist yet.", dir.display()),
+            Status::Ok,
+            format!(
+                "State directory {} has private permissions ({mode_text}).",
+                dir.display()
+            ),
+            details,
+        )
+    }
+}
+
+#[cfg(not(unix))]
+fn check_state_dir_metadata(dir: &Path, meta: &fs::Metadata) -> Check {
+    let details = Some(json!({ "path": dir.display().to_string() }));
+    if !state::is_private_dir(meta) {
+        Check::new(
+            "state_dir.permissions",
+            Status::Fail,
+            format!(
+                "State directory {} is not a real directory (must not be a file, symlink, or reparse point).",
+                dir.display()
+            ),
+            details,
+        )
+    } else {
+        Check::new(
+            "state_dir.permissions",
+            Status::Ok,
+            format!(
+                "State directory {} exists (Unix permission bits do not apply on this platform).",
+                dir.display()
+            ),
             details,
         )
     }

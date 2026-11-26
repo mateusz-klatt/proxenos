@@ -124,6 +124,19 @@ fn resolve_settings_target(path: &Path) -> Result<ResolvedSettingsPath, Integrat
     })
 }
 
+fn check_settings_path_unchanged(
+    record: &ClientRecord,
+    current_settings_path: &str,
+) -> Result<(), IntegrateError> {
+    if record.settings_path != current_settings_path {
+        return Err(IntegrateError::Message(format!(
+            "Refusing to modify Claude Code integration: settings path changed since integrate (recorded {}, current {}).",
+            record.settings_path, current_settings_path
+        )));
+    }
+    Ok(())
+}
+
 fn check_settings_target_unchanged(
     record: &ClientRecord,
     resolved: &ResolvedSettingsPath,
@@ -292,6 +305,9 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
         )));
     }
 
+    if let Some(record) = &existing {
+        check_settings_path_unchanged(record, &settings_str)?;
+    }
     let resolved_settings = resolve_settings_target(&settings_path)?;
     if let Some(record) = &existing {
         check_settings_target_unchanged(record, &resolved_settings, &settings_path)?;
@@ -333,50 +349,47 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
     });
     let desired_enabled = Value::Bool(true);
 
+    let claude_dir = settings_path
+        .parent()
+        .expect("settings path has a parent directory");
+    let integrate_dir = state_dir.join("integrate");
+    let backups_dir = integrate_dir.join("backups");
+    let marketplace_meta_dir = marketplace_path.join(".claude-plugin");
+    let plugin_dir = marketplace_path.join("plugins").join(PLUGIN_NAME);
+    let plugin_meta_dir = plugin_dir.join(".claude-plugin");
+
+    let bfile = backup_path(&state_dir);
+    let bfile_exists = bfile.exists();
+    let need_backup = !bfile_exists
+        && existing
+            .as_ref()
+            .is_none_or(|record| record.pending && !record.settings_created)
+        && orig_bytes.is_some();
+    let backup = if bfile_exists || need_backup {
+        Some(state::path_string(&bfile).map_err(io_err(&bfile))?)
+    } else {
+        None
+    };
+
     let mut created_dirs = existing
         .as_ref()
         .map(|record| record.created_dirs.clone())
         .unwrap_or_default();
 
-    let claude_dir = settings_path
-        .parent()
-        .expect("settings path has a parent directory");
-    state::ensure_private_dir_tree(claude_dir, claude_dir, &mut created_dirs)
-        .map_err(io_err(claude_dir))?;
-
-    let integrate_dir = state_dir.join("integrate");
-    state::ensure_private_dir_tree(&state_dir, &integrate_dir, &mut created_dirs)
+    // Record every directory about to be created before persisting the pending manifest so a
+    // failure during manifest write, backup, or directory creation never orphans unowned dirs.
+    state::plan_private_dir_tree(&state_dir, &integrate_dir, &mut created_dirs)
         .map_err(io_err(&integrate_dir))?;
-
-    let marketplace_meta_dir = marketplace_path.join(".claude-plugin");
-    state::ensure_private_dir_tree(&state_dir, &marketplace_meta_dir, &mut created_dirs)
+    state::plan_private_dir_tree(claude_dir, claude_dir, &mut created_dirs)
+        .map_err(io_err(claude_dir))?;
+    state::plan_private_dir_tree(&state_dir, &marketplace_meta_dir, &mut created_dirs)
         .map_err(io_err(&marketplace_meta_dir))?;
-
-    let plugin_dir = marketplace_path.join("plugins").join(PLUGIN_NAME);
-    let plugin_meta_dir = plugin_dir.join(".claude-plugin");
-    state::ensure_private_dir_tree(&state_dir, &plugin_meta_dir, &mut created_dirs)
+    state::plan_private_dir_tree(&state_dir, &plugin_meta_dir, &mut created_dirs)
         .map_err(io_err(&plugin_meta_dir))?;
-
-    let bfile = backup_path(&state_dir);
-    let (backup, took_backup) = if bfile.exists() {
-        (
-            Some(state::path_string(&bfile).map_err(io_err(&bfile))?),
-            false,
-        )
-    } else if existing.is_none()
-        && let Some(bytes) = orig_bytes.as_deref()
-    {
-        let backups_dir = integrate_dir.join("backups");
-        state::ensure_private_dir_tree(&state_dir, &backups_dir, &mut created_dirs)
+    if need_backup {
+        state::plan_private_dir_tree(&state_dir, &backups_dir, &mut created_dirs)
             .map_err(io_err(&backups_dir))?;
-        state::write_atomic(&bfile, bytes, None).map_err(io_err(&bfile))?;
-        (
-            Some(state::path_string(&bfile).map_err(io_err(&bfile))?),
-            true,
-        )
-    } else {
-        (None, false)
-    };
+    }
 
     let marketplace_json_path = marketplace_meta_dir.join("marketplace.json");
     let plugin_json_path = plugin_meta_dir.join("plugin.json");
@@ -441,14 +454,33 @@ pub fn integrate_claude_code() -> Result<String, IntegrateError> {
         created_dirs,
     };
 
-    // Persist an intent manifest before modifying plugin files or settings.json so an interrupted
-    // write never strands entries as foreign or hides them from `--remove`.
+    // Ensure only `<state_dir>/integrate` for the manifest and persist the pending manifest
+    // before taking backups or creating the settings or marketplace directories, so an
+    // interrupted write never strands directories or entries as foreign.
+    state::ensure_private_dir_tree(&state_dir, &integrate_dir).map_err(io_err(&integrate_dir))?;
     manifest.schema_version = MANIFEST_SCHEMA_VERSION;
     manifest
         .clients
         .insert(CLIENT_CLAUDE_CODE.to_owned(), record.clone());
     let pending_value = serde_json::to_value(&manifest).expect("manifest serializes");
     write_json_atomic(&manifest_file, &pending_value, None)?;
+
+    let took_backup = if need_backup {
+        state::ensure_private_dir_tree(&state_dir, &backups_dir).map_err(io_err(&backups_dir))?;
+        let bytes = orig_bytes
+            .as_deref()
+            .expect("backup requires existing settings");
+        state::write_atomic(&bfile, bytes, None).map_err(io_err(&bfile))?;
+        true
+    } else {
+        false
+    };
+
+    state::ensure_private_dir_tree(claude_dir, claude_dir).map_err(io_err(claude_dir))?;
+    state::ensure_private_dir_tree(&state_dir, &marketplace_meta_dir)
+        .map_err(io_err(&marketplace_meta_dir))?;
+    state::ensure_private_dir_tree(&state_dir, &plugin_meta_dir)
+        .map_err(io_err(&plugin_meta_dir))?;
 
     let marketplace_json = json!({
         "name": MARKETPLACE_NAME,
@@ -568,12 +600,16 @@ fn remove_managed_entry(
 
 pub fn remove_claude_code() -> Result<String, IntegrateError> {
     let state_dir = state::require_state_dir().map_err(IntegrateError::Message)?;
+    let current_settings_path = state::claude_settings_path().map_err(IntegrateError::Message)?;
+    let current_settings_str =
+        state::path_string(&current_settings_path).map_err(io_err(&current_settings_path))?;
     let manifest_file = manifest_path(&state_dir);
     let mut manifest = load_manifest(&manifest_file)?;
     let Some(record) = manifest.clients.get(CLIENT_CLAUDE_CODE).cloned() else {
         return Ok("Claude Code integration is not installed; nothing to remove.\n".to_owned());
     };
 
+    check_settings_path_unchanged(&record, &current_settings_str)?;
     let settings_path = Path::new(&record.settings_path);
     let resolved_settings = resolve_settings_target(settings_path)?;
     check_settings_target_unchanged(&record, &resolved_settings, settings_path)?;

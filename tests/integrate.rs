@@ -92,6 +92,7 @@ impl Sandbox {
         }
         command
             .env_remove("XDG_STATE_HOME")
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("LOCALAPPDATA", &self.local_app_data)
@@ -1726,6 +1727,37 @@ fn doctor_checks_unix_state_directory_permissions() {
     assert_eq!(wide_check["status"], "fail");
     assert_eq!(wide_check["details"]["mode"], "0755");
 
+    // Narrowing permissions to 0500 (not exact 0700 per D19) must also fail doctor.
+    fs::set_permissions(sb.state_dir(), fs::Permissions::from_mode(0o500)).unwrap();
+    let ro_out = sb.run(&["doctor", "--json"]);
+    fs::set_permissions(sb.state_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(ro_out.status.code(), Some(1));
+    let ro_report: Value = serde_json::from_slice(&ro_out.stdout).unwrap();
+    let ro_check = find_check(&ro_report, "state_dir.permissions");
+    assert_eq!(ro_check["status"], "fail", "{ro_report}");
+    assert_eq!(ro_check["details"]["mode"], "0500", "{ro_report}");
+
+    // A symlinked state directory (even pointing to a 0700 directory) must fail doctor.
+    // Note: testing a root-owned 0700 directory is not feasible in unprivileged tests.
+    let sb_link = Sandbox::new();
+    let real_state = sb_link.root.join("real-state");
+    fs::create_dir_all(&real_state).unwrap();
+    fs::set_permissions(&real_state, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir_all(sb_link.state_dir().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real_state, sb_link.state_dir()).unwrap();
+    let link_out = sb_link.run(&["doctor", "--json"]);
+    assert_eq!(link_out.status.code(), Some(1));
+    let link_report: Value = serde_json::from_slice(&link_out.stdout).unwrap();
+    let link_check = find_check(&link_report, "state_dir.permissions");
+    assert_eq!(link_check["status"], "fail", "{link_report}");
+    assert!(
+        link_check["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a private directory"),
+        "{link_report}"
+    );
+
     // Non-directory parent for the platform state-directory env var exercises non-NotFound
     // symlink_metadata error (ENOTDIR).
     let file_parent = sb.root.join("not-a-dir");
@@ -1746,6 +1778,495 @@ fn doctor_checks_unix_state_directory_permissions() {
             .unwrap()
             .contains("Could not inspect state directory"),
         "{err_report}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn doctor_checks_windows_state_directory_reparse_point_and_errors() {
+    let sb = Sandbox::new();
+    let real_state = sb.root.join("real-state");
+    fs::create_dir_all(&real_state).unwrap();
+    fs::create_dir_all(sb.state_dir().parent().unwrap()).unwrap();
+    let status = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(sb.state_dir())
+        .arg(&real_state)
+        .status()
+        .expect("cmd mklink /J runs");
+    assert!(status.success(), "mklink /J failed: {status}");
+
+    let junction_out = sb.run(&["doctor", "--json"]);
+    assert_eq!(junction_out.status.code(), Some(1));
+    let junction_report: Value = serde_json::from_slice(&junction_out.stdout).unwrap();
+    let junction_check = find_check(&junction_report, "state_dir.permissions");
+    assert_eq!(junction_check["status"], "fail", "{junction_report}");
+    assert!(
+        junction_check["message"]
+            .as_str()
+            .unwrap()
+            .contains("reparse point"),
+        "{junction_report}"
+    );
+
+    let mut invalid_cmd = sb.command(&["doctor", "--json"]);
+    invalid_cmd.env("LOCALAPPDATA", sb.root.join("bad<name"));
+    let invalid_out = invalid_cmd.output().unwrap();
+    assert_eq!(invalid_out.status.code(), Some(1));
+    let invalid_report: Value = serde_json::from_slice(&invalid_out.stdout).unwrap();
+    let invalid_check = find_check(&invalid_report, "state_dir.permissions");
+    assert_eq!(invalid_check["status"], "fail", "{invalid_report}");
+    assert!(
+        invalid_check["message"]
+            .as_str()
+            .unwrap()
+            .contains("Could not inspect state directory"),
+        "{invalid_report}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_integrate_on_unwritable_integrate_dir_recovers_on_rerun_and_remove() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Variant 1: existing settings.json + unwritable <state>/integrate (mode 0500).
+    let sb = Sandbox::new();
+    let original = "{\n  \"theme\": \"dark\"\n}\n";
+    fs::create_dir_all(sb.settings_path().parent().unwrap()).unwrap();
+    fs::write(sb.settings_path(), original).unwrap();
+    let integrate_dir = sb.state_dir().join("integrate");
+    fs::create_dir_all(&integrate_dir).unwrap();
+    fs::set_permissions(&integrate_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let failed = sb.run(&["integrate", "claude-code"]);
+    fs::set_permissions(&integrate_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(
+        !sb.marketplace_dir().exists(),
+        "failed integrate must not leave an unowned marketplace directory"
+    );
+    assert!(!sb.manifest_path().exists());
+    assert!(!sb.backup_path().exists());
+    assert_eq!(fs::read_to_string(sb.settings_path()).unwrap(), original);
+
+    let rerun = sb.run(&["integrate", "claude-code"]);
+    assert!(
+        rerun.status.success(),
+        "rerun after restoring permissions failed: {}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    assert_eq!(fs::read_to_string(sb.backup_path()).unwrap(), original);
+    assert!(
+        read_json(&sb.manifest_path())["clients"]["claude-code"]
+            .get("pending")
+            .is_none()
+    );
+
+    let rm = sb.run(&["integrate", "claude-code", "--remove"]);
+    assert!(
+        rm.status.success(),
+        "remove failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(fs::read_to_string(sb.settings_path()).unwrap(), original);
+    assert!(!sb.marketplace_dir().exists());
+    assert!(!sb.manifest_path().exists());
+    assert!(!sb.backup_path().exists());
+
+    // Variant 2: absent ~/.claude + unwritable <state>/integrate (mode 0500) must not orphan
+    // ~/.claude or claude-marketplace.
+    let sb2 = Sandbox::new();
+    let integrate_dir2 = sb2.state_dir().join("integrate");
+    fs::create_dir_all(&integrate_dir2).unwrap();
+    fs::set_permissions(&integrate_dir2, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let failed2 = sb2.run(&["integrate", "claude-code"]);
+    fs::set_permissions(&integrate_dir2, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(failed2.status.code(), Some(1));
+    assert!(!sb2.home.join(".claude").exists());
+    assert!(!sb2.marketplace_dir().exists());
+    assert!(!sb2.manifest_path().exists());
+
+    assert!(sb2.run(&["integrate", "claude-code"]).status.success());
+    assert!(
+        sb2.run(&["integrate", "claude-code", "--remove"])
+            .status
+            .success()
+    );
+    assert!(!sb2.home.join(".claude").exists());
+    assert!(!sb2.marketplace_dir().exists());
+    assert!(!sb2.manifest_path().exists());
+}
+
+#[test]
+fn failed_backup_after_pending_manifest_recovers_on_rerun_and_remove() {
+    // Variant 1: pending manifest succeeds, backup dir creation fails because a file occupies
+    // <state>/integrate/backups. Clearing the blocker lets rerun take the backup and succeed.
+    let sb = Sandbox::new();
+    let original = "{\n  \"theme\": \"dark\"\n}\n";
+    fs::create_dir_all(sb.settings_path().parent().unwrap()).unwrap();
+    fs::write(sb.settings_path(), original).unwrap();
+    let integrate_dir = sb.state_dir().join("integrate");
+    fs::create_dir_all(&integrate_dir).unwrap();
+    let backups_blocker = integrate_dir.join("backups");
+    fs::write(&backups_blocker, "blocker").unwrap();
+
+    let failed = sb.run(&["integrate", "claude-code"]);
+    assert_eq!(failed.status.code(), Some(1));
+    let pending_manifest = read_json(&sb.manifest_path());
+    assert_eq!(pending_manifest["clients"]["claude-code"]["pending"], true);
+    assert!(!sb.marketplace_dir().exists());
+    assert_eq!(fs::read_to_string(sb.settings_path()).unwrap(), original);
+
+    fs::remove_file(&backups_blocker).unwrap();
+    let rerun = sb.run(&["integrate", "claude-code"]);
+    assert!(
+        rerun.status.success(),
+        "rerun after clearing backup blocker failed: {}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    assert_eq!(fs::read_to_string(sb.backup_path()).unwrap(), original);
+    let committed = read_json(&sb.manifest_path());
+    assert!(committed["clients"]["claude-code"].get("pending").is_none());
+    assert!(
+        committed["clients"]["claude-code"]["settings_written_sha256"]
+            .as_str()
+            .is_some_and(|hex| hex.len() == 64)
+    );
+
+    let rm = sb.run(&["integrate", "claude-code", "--remove"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(fs::read_to_string(sb.settings_path()).unwrap(), original);
+    assert!(!sb.marketplace_dir().exists());
+    assert!(!sb.manifest_path().exists());
+    assert!(!sb.backup_path().exists());
+
+    // Variant 2: --remove directly after a failed backup cleans up the pending manifest cleanly.
+    let sb2 = Sandbox::new();
+    fs::create_dir_all(sb2.settings_path().parent().unwrap()).unwrap();
+    fs::write(sb2.settings_path(), original).unwrap();
+    let integrate_dir2 = sb2.state_dir().join("integrate");
+    fs::create_dir_all(&integrate_dir2).unwrap();
+    let backups_blocker2 = integrate_dir2.join("backups");
+    fs::write(&backups_blocker2, "blocker").unwrap();
+
+    assert_eq!(
+        sb2.run(&["integrate", "claude-code"]).status.code(),
+        Some(1)
+    );
+    assert_eq!(
+        read_json(&sb2.manifest_path())["clients"]["claude-code"]["pending"],
+        true
+    );
+
+    fs::remove_file(&backups_blocker2).unwrap();
+    let rm2 = sb2.run(&["integrate", "claude-code", "--remove"]);
+    assert!(
+        rm2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm2.stderr)
+    );
+    assert_eq!(fs::read_to_string(sb2.settings_path()).unwrap(), original);
+    assert!(!sb2.manifest_path().exists());
+    assert!(!sb2.marketplace_dir().exists());
+}
+
+#[test]
+fn changed_settings_path_under_same_state_dir_is_refused_on_rerun_and_remove() {
+    // Part 1: On Linux (shared XDG_STATE_HOME with different HOME) and Windows (shared
+    // LOCALAPPDATA with different USERPROFILE), switching homes under the same state directory
+    // must be refused on both rerun and --remove without modifying either file or the manifest.
+    // On macOS, state_dir derives from HOME, so a home switch cannot share state_dir; Part 2
+    // exercises the same path-mismatch refusal via CLAUDE_CONFIG_DIR on every platform including
+    // macOS.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let sb = Sandbox::new();
+        let shared_state = sb.root.join("shared-state");
+        let h1 = sb.root.join("h1");
+        let h2 = sb.root.join("h2");
+        let s1 = h1.join(".claude").join("settings.json");
+        let s2 = h2.join(".claude").join("settings.json");
+        let orig1 = "{\n  \"profile\": \"h1\"\n}\n";
+        let orig2 = "{\n  \"profile\": \"h2\"\n}\n";
+        fs::create_dir_all(s1.parent().unwrap()).unwrap();
+        fs::create_dir_all(s2.parent().unwrap()).unwrap();
+        fs::write(&s1, orig1).unwrap();
+        fs::write(&s2, orig2).unwrap();
+
+        let run_home = |home: &Path, args: &[&str]| {
+            let mut cmd = sb.command(args);
+            cmd.env("HOME", home).env("USERPROFILE", home);
+            #[cfg(all(unix, not(target_os = "macos")))]
+            cmd.env("XDG_STATE_HOME", &shared_state);
+            #[cfg(windows)]
+            cmd.env("LOCALAPPDATA", &shared_state);
+            cmd.output().expect("proxenos binary runs")
+        };
+
+        let first = run_home(&h1, &["integrate", "claude-code"]);
+        assert!(
+            first.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let s1_after = fs::read_to_string(&s1).unwrap();
+        let manifest_path = shared_state
+            .join("proxenos")
+            .join("integrate")
+            .join("manifest.json");
+        let backup_path = shared_state
+            .join("proxenos")
+            .join("integrate")
+            .join("backups")
+            .join("claude-code-settings.json");
+        let manifest_before = fs::read_to_string(&manifest_path).unwrap();
+
+        let rerun = run_home(&h2, &["integrate", "claude-code"]);
+        assert_eq!(rerun.status.code(), Some(1));
+        let rerun_err = String::from_utf8_lossy(&rerun.stderr);
+        assert!(
+            rerun_err.contains("settings path changed"),
+            "stderr: {rerun_err}"
+        );
+        assert_eq!(fs::read_to_string(&s1).unwrap(), s1_after);
+        assert_eq!(fs::read_to_string(&s2).unwrap(), orig2);
+        assert_eq!(fs::read_to_string(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), orig1);
+
+        let rm_wrong = run_home(&h2, &["integrate", "claude-code", "--remove"]);
+        assert_eq!(rm_wrong.status.code(), Some(1));
+        let rm_err = String::from_utf8_lossy(&rm_wrong.stderr);
+        assert!(rm_err.contains("settings path changed"), "stderr: {rm_err}");
+        assert_eq!(fs::read_to_string(&s1).unwrap(), s1_after);
+        assert_eq!(fs::read_to_string(&s2).unwrap(), orig2);
+        assert_eq!(fs::read_to_string(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), orig1);
+
+        let rm_right = run_home(&h1, &["integrate", "claude-code", "--remove"]);
+        assert!(
+            rm_right.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&rm_right.stderr)
+        );
+        assert_eq!(fs::read_to_string(&s1).unwrap(), orig1);
+        assert_eq!(fs::read_to_string(&s2).unwrap(), orig2);
+        assert!(!manifest_path.exists());
+    }
+
+    // Part 2: Changing CLAUDE_CONFIG_DIR under the same state directory is refused on every
+    // platform (including macOS).
+    let sb = Sandbox::new();
+    let cfg_a = sb.root.join("cfg-a");
+    let cfg_b = sb.root.join("cfg-b");
+    let sa = cfg_a.join("settings.json");
+    let sb_file = cfg_b.join("settings.json");
+    let orig_a = "{\n  \"profile\": \"A\"\n}\n";
+    let orig_b = "{\n  \"profile\": \"B\"\n}\n";
+    fs::create_dir_all(&cfg_a).unwrap();
+    fs::create_dir_all(&cfg_b).unwrap();
+    fs::write(&sa, orig_a).unwrap();
+    fs::write(&sb_file, orig_b).unwrap();
+
+    let run_cfg = |cfg: &Path, args: &[&str]| {
+        let mut cmd = sb.command(args);
+        cmd.env("CLAUDE_CONFIG_DIR", cfg);
+        cmd.output().expect("proxenos binary runs")
+    };
+
+    assert!(
+        run_cfg(&cfg_a, &["integrate", "claude-code"])
+            .status
+            .success()
+    );
+    let sa_after = fs::read_to_string(&sa).unwrap();
+    let manifest_before = fs::read_to_string(sb.manifest_path()).unwrap();
+
+    let rerun_b = run_cfg(&cfg_b, &["integrate", "claude-code"]);
+    assert_eq!(rerun_b.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&rerun_b.stderr).contains("settings path changed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&rerun_b.stderr)
+    );
+    assert_eq!(fs::read_to_string(&sa).unwrap(), sa_after);
+    assert_eq!(fs::read_to_string(&sb_file).unwrap(), orig_b);
+    assert_eq!(
+        fs::read_to_string(sb.manifest_path()).unwrap(),
+        manifest_before
+    );
+
+    let rm_b = run_cfg(&cfg_b, &["integrate", "claude-code", "--remove"]);
+    assert_eq!(rm_b.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&rm_b.stderr).contains("settings path changed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm_b.stderr)
+    );
+    assert_eq!(fs::read_to_string(&sa).unwrap(), sa_after);
+    assert_eq!(fs::read_to_string(&sb_file).unwrap(), orig_b);
+    assert_eq!(
+        fs::read_to_string(sb.manifest_path()).unwrap(),
+        manifest_before
+    );
+
+    assert!(
+        run_cfg(&cfg_a, &["integrate", "claude-code", "--remove"])
+            .status
+            .success()
+    );
+    assert_eq!(fs::read_to_string(&sa).unwrap(), orig_a);
+    assert_eq!(fs::read_to_string(&sb_file).unwrap(), orig_b);
+    assert!(!sb.manifest_path().exists());
+}
+
+#[test]
+fn claude_config_dir_controls_settings_location_for_integrate_and_doctor() {
+    let sb = Sandbox::new();
+    let default_original = "{\n  \"scope\": \"default\"\n}\n";
+    fs::create_dir_all(sb.settings_path().parent().unwrap()).unwrap();
+    fs::write(sb.settings_path(), default_original).unwrap();
+
+    // 1. Set CLAUDE_CONFIG_DIR to an absolute path: integrate writes <CLAUDE_CONFIG_DIR>/settings.json
+    // directly and leaves ~/.claude/settings.json untouched.
+    let custom_dir = sb.root.join("claude-work");
+    let custom_settings = custom_dir.join("settings.json");
+    let custom_original = "{\n  \"scope\": \"work\"\n}\n";
+    fs::create_dir_all(&custom_dir).unwrap();
+    fs::write(&custom_settings, custom_original).unwrap();
+
+    let mut int_custom = sb.command(&["integrate", "claude-code"]);
+    int_custom.env("CLAUDE_CONFIG_DIR", &custom_dir);
+    let int_out = int_custom.output().unwrap();
+    assert!(
+        int_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&int_out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(sb.settings_path()).unwrap(),
+        default_original,
+        "default ~/.claude/settings.json must stay untouched when CLAUDE_CONFIG_DIR is set"
+    );
+    let written_custom = read_json(&custom_settings);
+    assert_eq!(written_custom["scope"], "work");
+    assert_eq!(written_custom["enabledPlugins"]["proxenos@proxenos"], true);
+    assert_eq!(
+        written_custom["extraKnownMarketplaces"]["proxenos"]["source"]["path"],
+        sb.marketplace_dir().to_str().unwrap()
+    );
+    assert_eq!(
+        read_json(&sb.manifest_path())["clients"]["claude-code"]["settings_path"],
+        custom_settings.to_str().unwrap()
+    );
+
+    // Doctor honours CLAUDE_CONFIG_DIR when set...
+    let mut doc_custom = sb.command(&["doctor", "--json"]);
+    doc_custom.env("CLAUDE_CONFIG_DIR", &custom_dir);
+    let doc_custom_out = doc_custom.output().unwrap();
+    let doc_custom_report: Value = serde_json::from_slice(&doc_custom_out.stdout).unwrap();
+    assert!(doc_custom_out.status.success(), "{doc_custom_report}");
+    let reg = find_check(&doc_custom_report, "claude-code.registration");
+    assert_eq!(reg["status"], "ok", "{doc_custom_report}");
+    assert_eq!(
+        reg["details"]["settings_path"],
+        custom_settings.to_str().unwrap()
+    );
+
+    // ...and looks in ~/.claude/settings.json when unset, failing because it is not registered there.
+    let doc_unset_out = sb.run(&["doctor", "--json"]);
+    assert_eq!(doc_unset_out.status.code(), Some(1));
+    let doc_unset_report: Value = serde_json::from_slice(&doc_unset_out.stdout).unwrap();
+    assert_eq!(
+        find_check(&doc_unset_report, "claude-code.registration")["status"],
+        "fail",
+        "{doc_unset_report}"
+    );
+
+    // Removing with CLAUDE_CONFIG_DIR restores <CLAUDE_CONFIG_DIR>/settings.json cleanly.
+    let mut rm_custom = sb.command(&["integrate", "claude-code", "--remove"]);
+    rm_custom.env("CLAUDE_CONFIG_DIR", &custom_dir);
+    let rm_custom_out = rm_custom.output().unwrap();
+    assert!(
+        rm_custom_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm_custom_out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&custom_settings).unwrap(),
+        custom_original
+    );
+    assert_eq!(
+        fs::read_to_string(sb.settings_path()).unwrap(),
+        default_original
+    );
+
+    // 2. Empty CLAUDE_CONFIG_DIR is treated as unset and uses ~/.claude/settings.json.
+    let mut int_empty = sb.command(&["integrate", "claude-code"]);
+    int_empty.env("CLAUDE_CONFIG_DIR", "");
+    assert!(int_empty.output().unwrap().status.success());
+    assert_eq!(
+        read_json(&sb.settings_path())["enabledPlugins"]["proxenos@proxenos"],
+        true
+    );
+    let doc_default = sb.run(&["doctor", "--json"]);
+    assert!(doc_default.status.success());
+    let doc_default_report: Value = serde_json::from_slice(&doc_default.stdout).unwrap();
+    assert_eq!(
+        find_check(&doc_default_report, "claude-code.registration")["details"]["settings_path"],
+        sb.settings_path().to_str().unwrap()
+    );
+    assert!(
+        sb.run(&["integrate", "claude-code", "--remove"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::read_to_string(sb.settings_path()).unwrap(),
+        default_original
+    );
+
+    // 3. Relative or `..`-containing CLAUDE_CONFIG_DIR is refused by integrate, --remove, and doctor.
+    let dotdot = sb.root.join("sub").join("..").join("cfg");
+    let invalid_values = [PathBuf::from("relative/claude"), dotdot];
+    for invalid in &invalid_values {
+        for args in [
+            &["integrate", "claude-code"][..],
+            &["integrate", "claude-code", "--remove"][..],
+        ] {
+            let mut cmd = sb.command(args);
+            cmd.env("CLAUDE_CONFIG_DIR", invalid);
+            let out = cmd.output().unwrap();
+            assert_eq!(out.status.code(), Some(1), "invalid: {invalid:?}, {args:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("CLAUDE_CONFIG_DIR"),
+                "stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let mut doc_bad = sb.command(&["doctor", "--json"]);
+        doc_bad.env("CLAUDE_CONFIG_DIR", invalid);
+        let doc_bad_out = doc_bad.output().unwrap();
+        assert_eq!(doc_bad_out.status.code(), Some(1));
+        let doc_bad_report: Value = serde_json::from_slice(&doc_bad_out.stdout).unwrap();
+        let reg = find_check(&doc_bad_report, "claude-code.registration");
+        assert_eq!(reg["status"], "fail", "{doc_bad_report}");
+        assert!(
+            reg["message"]
+                .as_str()
+                .unwrap()
+                .contains("CLAUDE_CONFIG_DIR"),
+            "{doc_bad_report}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(sb.settings_path()).unwrap(),
+        default_original
     );
 }
 
