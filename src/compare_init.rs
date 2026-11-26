@@ -63,11 +63,41 @@ impl Artifact {
     }
 }
 
+// Rust reports extended-length paths on Windows. Node 22.23.5 rejects that spelling
+// for its entry script, even when both the executable and the script exist.
+#[cfg(windows)]
+fn ordinary_windows_path(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+
+    let remove = match path.components().next() {
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::VerbatimDisk(_)) => 0..4,
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::VerbatimUNC(_, _)) => 1..7,
+        _ => return path.to_owned(),
+    };
+    // Strip \\?\ from a drive path or retain two slashes from \\?\UNC\.
+    let mut units: Vec<_> = path.as_os_str().encode_wide().collect();
+    drop(units.drain(remove));
+    OsString::from_wide(&units).into()
+}
+
+#[cfg(windows)]
+fn verified_node_entry(canonical: &Path, ordinary: PathBuf) -> PathBuf {
+    if ordinary.canonicalize().is_ok_and(|path| path == canonical) {
+        ordinary
+    } else {
+        canonical.to_owned()
+    }
+}
+
 #[derive(Serialize)]
 struct Inputs {
     proxenos: Artifact,
     node: Artifact,
     bridge: Artifact,
+    #[serde(skip)]
+    bridge_entry: PathBuf,
     stub: Artifact,
     package: Artifact,
     baseline_version: String,
@@ -91,10 +121,18 @@ impl Inputs {
             .as_str()
             .filter(|v| !v.is_empty())
             .ok_or("baseline package.json needs a version")?;
+        let proxenos = Artifact::open(Path::new(proxenos))?;
+        let node = Artifact::open(Path::new(node))?;
+        let bridge = Artifact::open(&root.join("server/codex/index.js"))?;
+        #[cfg(windows)]
+        let bridge_entry = verified_node_entry(&bridge.path, ordinary_windows_path(&bridge.path));
+        #[cfg(not(windows))]
+        let bridge_entry = bridge.path.clone();
         Ok(Self {
-            proxenos: Artifact::open(Path::new(proxenos))?,
-            node: Artifact::open(Path::new(node))?,
-            bridge: Artifact::open(&root.join("server/codex/index.js"))?,
+            proxenos,
+            node,
+            bridge,
+            bridge_entry,
             stub: Artifact::open(Path::new(stub))?,
             package,
             baseline_version: version.to_owned(),
@@ -168,7 +206,7 @@ impl Target {
             }
             Self::ClaudeDelegator => {
                 let mut cmd = Command::new(&inputs.node.path);
-                cmd.arg(&inputs.bridge.path);
+                cmd.arg(&inputs.bridge_entry);
                 cmd
             }
         }
@@ -359,6 +397,49 @@ async fn main() -> ExitCode {
         Err(err) => {
             eprintln!("{err}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn node_entry_supports_drive_and_unc_paths_and_preserves_other_namespaces() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        for (input, expected) in [
+            (r"\\?\C:\bench dir\index.js", r"C:\bench dir\index.js"),
+            (r"\\?\UNC\host\share\index.js", r"\\host\share\index.js"),
+            (r"\\?\Volume{abc}\index.js", r"\\?\Volume{abc}\index.js"),
+            (r"C:\plain\index.js", r"C:\plain\index.js"),
+        ] {
+            assert_eq!(ordinary_windows_path(Path::new(input)), Path::new(expected));
+        }
+        // A path need not have a UTF-8 representation. Preserve its native code units.
+        let mut units: Vec<u16> = r"\\?\D:\folder\".encode_utf16().collect();
+        units.push(0xd800);
+        let path = PathBuf::from(OsString::from_wide(&units));
+        let ordinary = ordinary_windows_path(&path);
+        assert!(
+            ordinary
+                .as_os_str()
+                .encode_wide()
+                .eq(units[4..].iter().copied())
+        );
+    }
+
+    #[test]
+    fn a_missing_or_different_alias_preserves_the_fingerprinted_entry() {
+        let file = env::current_exe().unwrap().canonicalize().unwrap();
+        let directory = file.parent().unwrap();
+        for alias in [
+            directory.to_owned(),
+            directory.join(Uuid::new_v4().to_string()),
+        ] {
+            assert_eq!(verified_node_entry(&file, alias), file);
         }
     }
 }

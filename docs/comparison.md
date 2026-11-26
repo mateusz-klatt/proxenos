@@ -63,8 +63,13 @@ failure. Summary medians use successful trials only. A failed trial also makes t
 exit unsuccessfully after writing its report. Compare failure counts alongside latencies.
 
 The report identifies the Proxenos binary, stub, Node binary, baseline entry file and package
-manifest by SHA-256. It records operating system and architecture. For publication, retain
-the raw JSON privately and share a copy with machine-specific paths removed as appropriate.
+manifest by SHA-256 and records the operating system and architecture. On Windows, Node receives
+the ordinary drive or UNC spelling of the bridge path when it resolves to the fingerprinted file.
+The report retains the canonical path. If the ordinary spelling resolves elsewhere or is unavailable,
+Node receives the canonical path.
+
+For publication, retain the raw JSON privately and share a copy with machine-specific paths
+removed as appropriate.
 Record the machine and OS release, the Proxenos build commit and toolchain, the baseline
 checkout commit and dependency lock, and the Node version alongside it. A launcher hash alone
 does not identify all installed JavaScript dependencies.

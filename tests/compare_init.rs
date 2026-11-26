@@ -131,6 +131,17 @@ fn paired_run_records_order_artifacts_and_the_initialize_only_conversation() {
     assert_eq!(log.len(), 2);
     assert_ne!(log[0]["cwd"], log[1]["cwd"]);
     for record in log {
+        let script = Path::new(record["script"].as_str().unwrap());
+        let fingerprinted = Path::new(report["inputs"]["bridge"]["path"].as_str().unwrap());
+        assert_eq!(script.canonicalize().unwrap(), fingerprinted);
+        #[cfg(windows)]
+        assert!(matches!(
+            script.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::UNC(_, _))
+        ));
+        #[cfg(not(windows))]
+        assert_eq!(script, fingerprinted);
         let cwd = Path::new(record["cwd"].as_str().unwrap());
         let home = Path::new(record["home"].as_str().unwrap());
         assert_eq!(cwd.file_name(), home.file_name());

@@ -120,7 +120,8 @@ fn initialize_peer(script: &Path) -> Result<ExitCode, Box<dyn Error>> {
     input.read_to_string(&mut transcript)?;
     let cwd = std::env::current_dir()?;
     let record = serde_json::json!({
-        "input": transcript, "cwd": cwd, "home": std::env::var("HOME").ok(),
+        "input": transcript, "script": script.display().to_string(),
+        "cwd": cwd, "home": std::env::var("HOME").ok(),
         "codex": cwd.join("bin").join(format!("codex{}", std::env::consts::EXE_SUFFIX)).is_file()
     });
     let mut log = File::options()
