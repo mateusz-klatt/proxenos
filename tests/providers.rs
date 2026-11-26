@@ -7,6 +7,8 @@ mod accounting;
 mod antigravity;
 #[path = "mcp/background.rs"]
 mod background;
+#[path = "mcp/claude.rs"]
+mod claude;
 #[path = "mcp/codex.rs"]
 mod codex;
 #[allow(dead_code)]

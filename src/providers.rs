@@ -2,6 +2,7 @@
 //! A provider has no process handle and no access to the transport.
 
 mod antigravity;
+mod claude;
 mod codex;
 mod kimi;
 
@@ -15,7 +16,7 @@ use crate::envelope::Failure;
 use crate::mcp::ToolSpec;
 use crate::supervise::Finished;
 
-pub const ALL: &[Provider] = &[codex::SPEC, antigravity::SPEC, kimi::SPEC];
+pub const ALL: &[Provider] = &[codex::SPEC, antigravity::SPEC, kimi::SPEC, claude::SPEC];
 pub const DEFAULT_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_MODEL_LEN: usize = 256;
 
@@ -29,9 +30,9 @@ pub struct Provider {
     pub start_settings: &'static [&'static str],
     pub reply_settings: &'static [&'static str],
     pub access: &'static [(&'static str, &'static str)],
-    pub not_claimed: &'static [&'static str],
     pub fixed_instructions: bool,
     pub reply_model: bool,
+    pub not_claimed: &'static [&'static str],
     pub prepare: fn(&Turn) -> Result<(), String>,
     pub argv: fn(&Turn, &Path) -> CommandLine,
     pub parse: fn(&Finished, &str, Option<&str>) -> Report,
@@ -90,6 +91,8 @@ pub struct Report {
     pub content: Option<String>,
     pub model: Option<String>,
     pub usage: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     pub failure: Option<Failure>,
     pub diagnostic: Option<String>,
     #[serde(skip)]

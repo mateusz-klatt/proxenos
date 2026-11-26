@@ -1,0 +1,1 @@
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"8a4d2c10-6f3b-4c9a-9e21-1f5b7c8d9e0a","result":"","total_cost_usd":0.002,"usage":{"input_tokens":15,"output_tokens":0},"modelUsage":{"claude-haiku-4-5":{"inputTokens":15,"outputTokens":0,"costUSD":0.002}},"permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_01synthetic"}]}
