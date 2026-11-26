@@ -142,6 +142,7 @@ fn parse_usage(value: Option<&Value>) -> Option<Value> {
     let filtered: serde_json::Map<String, Value> = [
         "input_tokens",
         "cached_input_tokens",
+        "cache_write_input_tokens",
         "output_tokens",
         "reasoning_output_tokens",
         "total_tokens",

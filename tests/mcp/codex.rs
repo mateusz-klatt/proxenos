@@ -202,6 +202,60 @@ fn failed(message: &str) -> String {
 }
 
 #[test]
+fn captured_start_and_resume_report_distinct_answers_and_thread_usage() {
+    let start_stdout = include_str!("../fixtures/codex/captured-start-ok.stdout.jsonl");
+    let start_stderr = include_str!("../fixtures/codex/captured-start-ok.stderr.txt");
+    let start_file = include_str!("../fixtures/codex/captured-start-ok.last-message.txt");
+    let resume_stdout = include_str!("../fixtures/codex/captured-resume-ok.stdout.jsonl");
+    let resume_stderr = include_str!("../fixtures/codex/captured-resume-ok.stderr.txt");
+    let resume_file = include_str!("../fixtures/codex/captured-resume-ok.last-message.txt");
+    let fleet = Fleet::new(&["codex"]);
+    fleet.script(
+        "codex",
+        json!([
+            {"stdout":start_stdout,"stderr":start_stderr,"final_message":start_file},
+            {"stdout":resume_stdout,"stderr":resume_stderr,"final_message":resume_file}
+        ]),
+    );
+    let mut server = fleet.server("claude");
+    let start = call(
+        &mut server,
+        "codex",
+        json!({"prompt":"Return the first fixture answer.","model":"proxenos-local","access":"read-only"}),
+    );
+    let thread = start["reported"]["thread_id"].as_str().unwrap();
+    assert_eq!(thread, "01a21913-d6f6-7432-81cc-171517698e9e");
+    let reply = call(
+        &mut server,
+        "codex-reply",
+        json!({"thread_id":thread,"prompt":"Return the second fixture answer."}),
+    );
+    for (result, answer, stderr, input, output, cached, reasoning) in [
+        (&start, start_file, start_stderr, 10, 3, 2, 1),
+        (&reply, resume_file, resume_stderr, 30, 9, 6, 3),
+    ] {
+        assert_eq!(result["observed"]["state"], "finished", "{result}");
+        assert_eq!(
+            result["observed"]["attempts"][0]["stderr_bytes"],
+            stderr.len()
+        );
+        assert_eq!(result["reported"]["thread_id"], thread);
+        assert_eq!(result["reported"]["content"], answer);
+        assert!(result["reported"]["model"].is_null());
+        assert_eq!(
+            result["reported"]["usage"],
+            json!({
+                "input_tokens":input, "output_tokens":output,"cached_input_tokens":cached,
+                "cache_write_input_tokens":0, "reasoning_output_tokens":reasoning
+            })
+        );
+    }
+    let records = invocations(&fleet);
+    assert_eq!(records.len(), 2);
+    assert!(argv(&records[1]).ends_with(&["--", thread, "Return the second fixture answer."]));
+}
+
+#[test]
 fn captured_missing_provider_key_reports_the_terminal_error_without_an_answer() {
     let stdout = include_str!("../fixtures/codex/captured-missing-provider-key.stdout.jsonl");
     let stderr = include_str!("../fixtures/codex/captured-missing-provider-key.stderr.txt");

@@ -1,5 +1,40 @@
 # Codex streams
 
+## Captured start and resume
+
+On 2026-11-26, the Linux x86_64 Codex CLI 0.172.0 ran twice in the same disposable working
+directory and profile. A local HTTP server implemented the streaming Responses API and
+returned two fixed answers. The CLI had no credentials. Its processes could connect only
+to the fixture's IPv4 loopback socket. The fixture received two POSTs to `/v1/responses`.
+It checked that the second request contained both user messages and the first answer.
+The request bodies and the disposable profile were discarded.
+
+The profile selected a provider named `proxenos-measurement` with `wire_api = "responses"`,
+`base_url = "http://127.0.0.1:<port>/v1"` and zero request and stream retries.
+[Codex custom provider configuration](https://developers.openai.com/codex/config-advanced/)
+
+```sh
+codex exec --json --skip-git-repo-check -c 'sandbox_mode="read-only"' \
+  -c 'approval_policy="never"' -m proxenos-local \
+  -c 'developer_instructions="Return the requested fixture answer."' \
+  -o start.txt -- 'Return the first fixture answer.'
+codex exec resume --json --skip-git-repo-check -c 'sandbox_mode="read-only"' \
+  -c 'approval_policy="never"' -m proxenos-local -o reply.txt -- \
+  01a21913-d6f6-7432-81cc-171517698e9e 'Return the second fixture answer.'
+```
+
+Each command exited 0. Both printed the same `thread.started` UUID, a model metadata warning,
+`turn.started`, a distinct assistant message and `turn.completed`. Each `-o` file contained
+the corresponding answer without a trailing newline. The stub replays the original bytes in
+`captured-start-ok.*` and `captured-resume-ok.*`. The three files for each command hold stdout
+(`.stdout.jsonl`), stderr (`.stderr.txt`) and the answer written by `-o` (`.last-message.txt`).
+The start emitted the stdin notice on stderr. Resume stderr was empty.
+
+The fixture supplied 10 input and 3 output tokens on the first request, then 20 input and
+6 output tokens on the second. Codex reported 10 and 3 on start, then 30 and 9 on resume.
+The cached-input and reasoning-output counts also accumulated across both turns. Both CLI
+results included `cache_write_input_tokens: 0`. Neither identified the model that answered.
+
 ## Captured failures
 
 Codex CLI 0.172.0 produced these streams on Linux x86_64 on 2026-11-26. Each command ran in
