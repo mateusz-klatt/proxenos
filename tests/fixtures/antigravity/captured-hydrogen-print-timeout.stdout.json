@@ -1,0 +1,1 @@
+{"conversation_id":"fa4b0c06-9011-4f6e-8142-056e48d462ff","status":"ERROR","response":"","error":"print timeout after 1s with the turn still in progress; the response is partial","duration_seconds":0.175502678,"num_turns":1,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"finished_reason":"print_timeout"}

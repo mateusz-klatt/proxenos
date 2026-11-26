@@ -178,12 +178,27 @@ fn classify(message: &str, from_json: bool) -> Option<Failure> {
     Some(failure)
 }
 
-fn turn_failure(error: Option<&str>, stderr: &str) -> Option<Failure> {
+fn failure_reason<'a>(error: Option<&'a str>, stderr: &'a str, fallback: &'a str) -> &'a str {
+    let reason = error.unwrap_or_else(|| stderr.trim());
+    if reason.is_empty() { fallback } else { reason }
+}
+
+fn turn_failure(
+    error: Option<&str>,
+    finished_reason: Option<&str>,
+    stderr: &str,
+) -> Option<Failure> {
     if let Some(failure) = error.and_then(|message| classify(message, true)) {
         return Some(failure);
     }
     if stderr.lines().any(|line| line.starts_with(SIGN_IN_PROMPT)) {
         return Some(authentication_failure());
+    }
+    if finished_reason == Some("print_timeout") {
+        return Some(Failure::new(
+            FailureKind::Timeout,
+            failure_reason(error, stderr, "Antigravity print timeout"),
+        ));
     }
     if error.is_none() {
         return classify(stderr.trim(), false);
@@ -207,7 +222,7 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
 fn parse_report(value: Option<Value>, stderr: &str, expected: Option<&str>) -> Report {
     let Some(value) = value else {
         return Report {
-            failure: turn_failure(None, stderr),
+            failure: turn_failure(None, None, stderr),
             ..Report::default()
         };
     };
@@ -235,17 +250,17 @@ fn parse_report(value: Option<Value>, stderr: &str, expected: Option<&str>) -> R
     }
     if !success {
         let error = text("error");
-        report.failure = Some(turn_failure(error, stderr).unwrap_or_else(|| {
-            let reason = error.unwrap_or_else(|| stderr.trim());
-            let reason = if reason.is_empty() {
-                "Antigravity returned an unsuccessful status"
-            } else {
-                reason
-            };
-            Failure::new(FailureKind::Unknown, reason)
-        }));
+        let finished_reason = text("finished_reason").map(str::trim);
+        report.failure = Some(
+            turn_failure(error, finished_reason, stderr).unwrap_or_else(|| {
+                Failure::new(
+                    FailureKind::Unknown,
+                    failure_reason(error, stderr, "Antigravity returned an unsuccessful status"),
+                )
+            }),
+        );
     } else if report.content.is_none() {
-        report.failure = Some(turn_failure(None, stderr).unwrap_or_else(|| {
+        report.failure = Some(turn_failure(None, None, stderr).unwrap_or_else(|| {
             Failure::new(
                 FailureKind::Unknown,
                 "Antigravity returned an empty response",

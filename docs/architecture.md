@@ -315,12 +315,25 @@ URL) to standard error, and writes a single JSON object to standard output with 
 `num_turns`, `usage` (`input_tokens`, `output_tokens`, `thinking_tokens`, `cache_read_tokens`,
 `total_tokens`), and `finished_reason` (`"error"`).
 
+Measured on 2026-11-26 with `agy` 1.5.18 on Linux `x86_64` (`gemini-4-hydrogen-xhigh`, synthetic
+no-tools prompt in empty temporary directories; see the
+[Antigravity fixtures](../tests/fixtures/antigravity/README.md)):
+a completed turn (`--print-timeout 180s`) exited 0 with empty stderr and stdout JSON carrying
+`conversation_id`, `status: "SUCCESS"`, `response` (preserving its trailing newline),
+`duration_seconds`, `num_turns`, and `usage`, with no `model` field; a forced `--print-timeout 1s`
+exited 3 with 345 bytes of stderr diagnostics (`DEADLINE_EXCEEDED`, `reason: "print_timeout"`) and
+stdout JSON carrying `conversation_id`, `status: "ERROR"`, `response: ""`, `error`, and
+`finished_reason: "print_timeout"`.
+
 For a failed Antigravity turn, a classified top-level JSON `error` takes precedence. Standard
 error can establish an authentication failure when that field is absent, blank or unclassified
-and a line starts with the exact `agy` sign-in prompt above. When both the JSON error and the
-sign-in prompt are absent, Proxenos reads other failure kinds from standard error. It never
-classifies agent-authored `response` text. On a non-zero exit or incomplete turn, up to 2 KiB of
-standard error normally goes into `reported.diagnostic`. An authentication failure uses fixed
+and a line starts with the exact `agy` sign-in prompt above. Otherwise, when `finished_reason` is
+`"print_timeout"` on a failed turn, Proxenos classifies the failure as `timeout` while preserving
+any observed `abnormal_exit` (such as exit code 3) and keeping any non-empty partial `response`
+when conversation ID rules permit. When the JSON error, the sign-in prompt and `"print_timeout"`
+are all absent, Proxenos reads other failure kinds from standard error. It never classifies
+agent-authored `response` text. On a non-zero exit or incomplete turn, up to 2 KiB of standard
+error normally goes into `reported.diagnostic`. An authentication failure uses fixed
 `reported.failure.message` and `reported.diagnostic` text that omits the CLI's sign-in output.
 The diagnostic tells the caller to run `agy` to sign in. The observed byte counts still include
 the captured output.
@@ -331,7 +344,9 @@ credential for a local custom provider, `codex exec --json` emitted a thread ID 
 UUID in an empty profile, `codex exec resume --json` exited 1 with an empty stdout and a
 diagnostic on stderr. The [Codex fixtures](../tests/fixtures/codex/README.md) record the
 arguments and raw streams. Native Codex start and resume captures are recorded above.
-Live Antigravity successes and Antigravity print timeouts still use synthetic fixtures.
+Antigravity's explicit replies, non-empty partial timeout responses, quota and refusal failures
+still use synthetic fixtures; the native success and empty-response timeout captures are recorded
+above.
 
 Measured for Kimi (`kimi 2.8.0` on Linux x86_64, 2026-11-26):
 

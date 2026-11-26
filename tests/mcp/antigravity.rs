@@ -10,6 +10,14 @@ const FINISHED: &str = include_str!("../fixtures/antigravity/finished.json");
 const PRINT_TIMEOUT: &str = include_str!("../fixtures/antigravity/timeout.json");
 const CAPTURED_AUTH_FAILED: &str =
     include_str!("../fixtures/antigravity/captured-auth-failed.stdout.json");
+const CAPTURED_HYDROGEN_SUCCESS_OUT: &str =
+    include_str!("../fixtures/antigravity/captured-hydrogen-success.stdout.json");
+const CAPTURED_HYDROGEN_SUCCESS_ERR: &str =
+    include_str!("../fixtures/antigravity/captured-hydrogen-success.stderr.txt");
+const CAPTURED_HYDROGEN_PRINT_TIMEOUT_OUT: &str =
+    include_str!("../fixtures/antigravity/captured-hydrogen-print-timeout.stdout.json");
+const CAPTURED_HYDROGEN_PRINT_TIMEOUT_ERR: &str =
+    include_str!("../fixtures/antigravity/captured-hydrogen-print-timeout.stderr.txt");
 const ID: &str = "paper-crane";
 const SIGN_IN_PROMPT: &str = "Authentication required. Please visit the URL to log in:";
 const SIGN_IN_DIAGNOSTIC: &str = "agy is not signed in. Run `agy` to sign in. The CLI's sign-in output was omitted because it contains a one-time login URL.";
@@ -821,6 +829,336 @@ fn exact_sign_in_line_fills_in_an_unclassified_or_missing_json_error() {
     assert_eq!(
         quota["reported"]["failure"]["reset_at"], "2030-04-02T15:00:00Z",
         "{quota}"
+    );
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn captured_native_success_reports_exact_content_thread_id_and_byte_counts() {
+    let fleet = Fleet::new(&["agy"]);
+    fleet.script(
+        "agy",
+        json!([{
+            "stdout": CAPTURED_HYDROGEN_SUCCESS_OUT,
+            "stderr": CAPTURED_HYDROGEN_SUCCESS_ERR,
+            "code": 0
+        }]),
+    );
+    let mut server = fleet.server("claude");
+    let prompt = "Proxenos native CLI compatibility capture. Reply with exactly PROXENOS_NATIVE_AGY_SUCCESS. Do not use tools, access files, or modify anything.";
+    let result = call(
+        &mut server,
+        "antigravity",
+        json!({
+            "prompt": prompt,
+            "model": "gemini-4-hydrogen-xhigh",
+            "cwd": fleet.root,
+            "access": "read-only",
+            "timeout_ms": 210_000
+        }),
+    );
+
+    assert_eq!(result["observed"]["state"], "finished", "{result}");
+    assert_eq!(result["observed"]["provider"], "antigravity");
+    assert!(result["observed"]["failure"].is_null(), "{result}");
+    assert_eq!(
+        result["observed"]["passed"]["model"],
+        "gemini-4-hydrogen-xhigh"
+    );
+    let attempts = result["observed"]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1, "{result}");
+    let attempt = &attempts[0];
+    assert_eq!(attempt["exit_code"], 0, "{result}");
+    assert_eq!(attempt["cli_timeout_ms"], 180_000, "{result}");
+    assert_eq!(attempt["stdout_bytes"], 280, "{result}");
+    assert_eq!(
+        attempt["stdout_captured"],
+        CAPTURED_HYDROGEN_SUCCESS_OUT.len(),
+        "{result}"
+    );
+    assert_eq!(attempt["stderr_bytes"], 0, "{result}");
+    assert_eq!(
+        attempt["stderr_captured"],
+        CAPTURED_HYDROGEN_SUCCESS_ERR.len(),
+        "{result}"
+    );
+
+    assert_eq!(
+        result["reported"]["thread_id"],
+        "196f6bf7-3414-4596-ad1d-b8fc8369d24c"
+    );
+    assert_eq!(
+        result["reported"]["content"],
+        "PROXENOS_NATIVE_AGY_SUCCESS\n"
+    );
+    assert!(result["reported"]["model"].is_null(), "{result}");
+    assert!(result["reported"]["usage"].is_null(), "{result}");
+    assert!(result["reported"]["failure"].is_null(), "{result}");
+    assert!(result["reported"]["diagnostic"].is_null(), "{result}");
+
+    fleet.assert_steps_remaining("agy", 0);
+    let records = delegated(&fleet);
+    assert_eq!(records.len(), 1);
+    assert_eq!(argument(&records[0], "--output-format"), Some("json"));
+    assert_eq!(
+        argument(&records[0], "--model"),
+        Some("gemini-4-hydrogen-xhigh")
+    );
+    assert_eq!(argument(&records[0], "--print-timeout"), Some("180000ms"));
+    assert!(argument(&records[0], "--print").unwrap().ends_with(prompt));
+}
+
+#[test]
+fn captured_native_print_timeout_preserves_abnormal_exit_reported_timeout_and_diagnostic() {
+    let fleet = Fleet::new(&["agy"]);
+    fleet.script(
+        "agy",
+        json!([{
+            "stdout": CAPTURED_HYDROGEN_PRINT_TIMEOUT_OUT,
+            "stderr": CAPTURED_HYDROGEN_PRINT_TIMEOUT_ERR,
+            "code": 3
+        }]),
+    );
+    let mut server = fleet.server("claude");
+    let result = call(
+        &mut server,
+        "antigravity",
+        json!({
+            "prompt": "Proxenos native CLI compatibility capture. Reply with exactly PROXENOS_NATIVE_AGY_TIMEOUT. Do not use tools, access files, or modify anything.",
+            "model": "gemini-4-hydrogen-xhigh",
+            "cwd": fleet.root,
+            "access": "read-only"
+        }),
+    );
+
+    assert_reported_failure(
+        &result,
+        Some(("abnormal_exit", "exit code 3")),
+        "timeout",
+        "print timeout after 1s with the turn still in progress; the response is partial",
+    );
+    let attempts = result["observed"]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1, "{result}");
+    let attempt = &attempts[0];
+    assert_eq!(attempt["exit_code"], 3, "{result}");
+    assert_eq!(attempt["stdout_bytes"], 363, "{result}");
+    assert_eq!(
+        attempt["stdout_captured"],
+        CAPTURED_HYDROGEN_PRINT_TIMEOUT_OUT.len(),
+        "{result}"
+    );
+    assert_eq!(attempt["stderr_bytes"], 345, "{result}");
+    assert_eq!(
+        attempt["stderr_captured"],
+        CAPTURED_HYDROGEN_PRINT_TIMEOUT_ERR.len(),
+        "{result}"
+    );
+
+    assert_eq!(
+        result["reported"]["thread_id"],
+        "fa4b0c06-9011-4f6e-8142-056e48d462ff"
+    );
+    assert!(result["reported"]["content"].is_null(), "{result}");
+    assert!(result["reported"]["model"].is_null(), "{result}");
+    assert!(result["reported"]["usage"].is_null(), "{result}");
+    assert_eq!(
+        result["reported"]["diagnostic"],
+        CAPTURED_HYDROGEN_PRINT_TIMEOUT_ERR
+    );
+
+    fleet.assert_steps_remaining("agy", 0);
+    assert_eq!(delegated(&fleet).len(), 1);
+}
+
+#[test]
+fn print_timeout_preserves_partial_response_only_when_thread_id_is_permitted() {
+    let captured_id = "fa4b0c06-9011-4f6e-8142-056e48d462ff";
+    let timeout_error =
+        "print timeout after 1s with the turn still in progress; the response is partial";
+    let timeout_json = |id: &str, response: &str, error: &str| {
+        json!({
+            "conversation_id": id,
+            "status": "ERROR",
+            "response": response,
+            "error": error,
+            "finished_reason": "print_timeout"
+        })
+        .to_string()
+    };
+    let fleet = Fleet::new(&["agy"]);
+    let directory = store(&fleet);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join(format!("{captured_id}.db")), []).unwrap();
+    fs::write(directory.join("other-thread.db"), []).unwrap();
+
+    fleet.script(
+        "agy",
+        json!([
+            {
+                "stdout": timeout_json(captured_id, "Partial draft before deadline.", timeout_error),
+                "stderr": CAPTURED_HYDROGEN_PRINT_TIMEOUT_ERR,
+                "code": 3
+            },
+            {"stdout": timeout_json(captured_id, "Partial without error text.", ""), "code": 3},
+            {"stdout": timeout_json(captured_id, "Partial reply draft.", timeout_error), "code": 3},
+            {"stdout": timeout_json(captured_id, "Foreign partial text.", timeout_error), "code": 3},
+            {"stdout": timeout_json("", "Unconfirmed partial text.", timeout_error), "code": 3}
+        ]),
+    );
+    let mut server = fleet.server("claude");
+
+    let start = call(&mut server, "antigravity", json!({"prompt": "Draft."}));
+    assert_reported_failure(
+        &start,
+        Some(("abnormal_exit", "exit code 3")),
+        "timeout",
+        timeout_error,
+    );
+    assert_eq!(start["reported"]["thread_id"], captured_id, "{start}");
+    assert_eq!(
+        start["reported"]["content"], "Partial draft before deadline.",
+        "{start}"
+    );
+    assert_eq!(
+        start["reported"]["diagnostic"], CAPTURED_HYDROGEN_PRINT_TIMEOUT_ERR,
+        "{start}"
+    );
+
+    let without_error = call(&mut server, "antigravity", json!({"prompt": "Draft."}));
+    assert_reported_failure(
+        &without_error,
+        Some(("abnormal_exit", "exit code 3")),
+        "timeout",
+        "Antigravity print timeout",
+    );
+    assert_eq!(
+        without_error["reported"]["content"], "Partial without error text.",
+        "{without_error}"
+    );
+
+    let matched_reply = resume(&mut server, captured_id, &fleet.root);
+    assert_reported_failure(
+        &matched_reply,
+        Some(("abnormal_exit", "exit code 3")),
+        "timeout",
+        timeout_error,
+    );
+    assert_eq!(
+        matched_reply["reported"]["thread_id"], captured_id,
+        "{matched_reply}"
+    );
+    assert_eq!(
+        matched_reply["reported"]["content"], "Partial reply draft.",
+        "{matched_reply}"
+    );
+
+    let mismatched_reply = resume(&mut server, "other-thread", &fleet.root);
+    assert_reported_failure(
+        &mismatched_reply,
+        Some(("abnormal_exit", "exit code 3")),
+        "unknown",
+        "conversation ID",
+    );
+    assert_eq!(
+        mismatched_reply["reported"]["thread_id"], captured_id,
+        "{mismatched_reply}"
+    );
+    assert!(mismatched_reply["reported"]["content"].is_null());
+
+    let unconfirmed_reply = resume(&mut server, "other-thread", &fleet.root);
+    assert_reported_failure(
+        &unconfirmed_reply,
+        Some(("abnormal_exit", "exit code 3")),
+        "timeout",
+        timeout_error,
+    );
+    assert!(unconfirmed_reply["reported"]["thread_id"].is_null());
+    assert!(unconfirmed_reply["reported"]["content"].is_null());
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn unclassified_error_with_print_timeout_still_classifies_sign_in_and_omits_url() {
+    let fleet = Fleet::new(&["agy"]);
+    let stderr = format!("{SIGN_IN_PROMPT}\n  https://example.invalid/oauth?code=fake\n");
+    let step = |error: &str| {
+        json!({
+            "stdout": json!({
+                "conversation_id": "fa4b0c06-9011-4f6e-8142-056e48d462ff",
+                "status": "ERROR",
+                "response": "",
+                "error": error,
+                "finished_reason": "print_timeout"
+            }).to_string(),
+            "stderr": stderr,
+            "code": 1
+        })
+    };
+    fleet.script(
+        "agy",
+        json!([
+            step("print timeout after 1s with the turn still in progress; the response is partial"),
+            step("request aborted")
+        ]),
+    );
+    let mut server = fleet.server("claude");
+
+    for _ in 0..2 {
+        let result = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+        assert_sign_in_failure(&result);
+        let envelope = result.to_string();
+        assert!(
+            !envelope.contains("https://example.invalid") && !envelope.contains("code=fake"),
+            "sign-in URL leaked: {result}"
+        );
+    }
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn completed_success_with_timeout_words_does_not_force_timeout() {
+    let fleet = Fleet::new(&["agy"]);
+    let quoted_timeout = "The log recorded finished_reason print_timeout, print timeout after 1s with the turn still in progress; the response is partial, and timeout waiting for response.";
+    let success_with_words = json!({
+        "conversation_id": ID,
+        "status": "SUCCESS",
+        "response": quoted_timeout
+    })
+    .to_string();
+    let success_with_reason = json!({
+        "conversation_id": ID,
+        "status": "SUCCESS",
+        "response": "Completed despite finished_reason field.",
+        "finished_reason": "print_timeout"
+    })
+    .to_string();
+    fleet.script(
+        "agy",
+        json!([
+            {"stdout": success_with_words, "stderr": CAPTURED_HYDROGEN_PRINT_TIMEOUT_ERR, "code": 0},
+            {"stdout": success_with_reason, "code": 0}
+        ]),
+    );
+    let mut server = fleet.server("claude");
+
+    let quoted = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "Summarize the timeout diagnostic."}),
+    );
+    assert_eq!(quoted["observed"]["state"], "finished", "{quoted}");
+    assert!(quoted["reported"]["failure"].is_null(), "{quoted}");
+    assert!(quoted["reported"]["diagnostic"].is_null(), "{quoted}");
+    assert_eq!(quoted["reported"]["thread_id"], ID, "{quoted}");
+    assert_eq!(quoted["reported"]["content"], quoted_timeout, "{quoted}");
+
+    let completed = call(&mut server, "antigravity", json!({"prompt": "Finish."}));
+    assert_eq!(completed["observed"]["state"], "finished", "{completed}");
+    assert!(completed["reported"]["failure"].is_null(), "{completed}");
+    assert_eq!(completed["reported"]["thread_id"], ID, "{completed}");
+    assert_eq!(
+        completed["reported"]["content"], "Completed despite finished_reason field.",
+        "{completed}"
     );
     fleet.assert_steps_remaining("agy", 0);
 }
