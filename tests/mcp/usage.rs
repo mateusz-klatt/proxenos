@@ -221,12 +221,15 @@ fn codex_requires_a_matching_rpc_response_and_keeps_account_errors_private() {
 
 #[test]
 fn a_closed_connection_stops_each_running_account_read() {
-    for (source, cli) in [("codex", "codex"), ("cursor", "cursor-agent")] {
+    for (source, cli, next) in [
+        ("codex", "codex", "cursor"),
+        ("cursor", "cursor-agent", "codex"),
+    ] {
         let fleet = Fleet::new(&[cli]);
         let lock = fleet.root.join("holding");
         fleet.script(cli, json!([{"hold_file":lock,"sleep_ms":60_000}]));
         let mut server = fleet.server(source);
-        server.start_call(12, "usage", json!({"providers":[source]}));
+        server.start_call(12, "usage", json!({"providers":[source,next]}));
         let until = Instant::now() + WAIT;
         while !lock.with_extension("ready").is_file() {
             assert!(Instant::now() < until);
@@ -238,6 +241,7 @@ fn a_closed_connection_stops_each_running_account_read() {
             report["providers"][source]["reason"], "cancelled",
             "{report}"
         );
+        assert_eq!(report["providers"][next]["reason"], "cancelled", "{report}");
         assert!(server.finish().0.success());
         assert!(
             std::fs::File::options()

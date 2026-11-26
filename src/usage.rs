@@ -84,7 +84,13 @@ pub async fn call(
         };
         let deadline = Instant::now() + READ_TIMEOUT;
         let report = match discovery::locate_for_usage(cli, dirs, cancel, deadline).await {
-            Err(error) => json!({"status":"unavailable","reason":error.failure.kind}),
+            Err(error) => {
+                let reason = match error.failure.kind {
+                    crate::envelope::FailureKind::Cancellation => json!("cancelled"),
+                    other => json!(other),
+                };
+                json!({"status":"unavailable","reason":reason})
+            }
             Ok(exe) => {
                 let read = match source {
                     Source::Codex => codex::read(exe, deadline, cancel, activity.clone())
