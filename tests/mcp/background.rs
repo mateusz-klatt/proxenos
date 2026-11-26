@@ -474,6 +474,64 @@ fn retained_background_results_are_bounded_and_evict_the_oldest() {
 }
 
 #[test]
+fn retained_background_results_evict_the_oldest_when_they_exceed_the_byte_limit() {
+    const BYTE_LIMIT: usize = 1 << 20;
+    // Escaping the instructions in observed.requested and observed.passed makes the
+    // result JSON large while keeping the CLI argument below Windows' length limit.
+    let instructions = "\u{0001}".repeat(29 * 1024);
+    let answers = ["first answer", "second answer", "third answer"];
+    let fleet = Fleet::new(&["agy"]);
+    fleet.script("agy", json!(answers.map(turn)));
+
+    let mut server = fleet.server("claude");
+    let mut handles = Vec::new();
+    let mut result_bytes = [0; 3];
+    for (index, answer) in answers.into_iter().enumerate() {
+        let (started, is_error) = raw_call(
+            &mut server,
+            10 + index as i64,
+            "antigravity",
+            json!({"prompt": format!("item {index}"), "instructions": instructions, "wait": false}),
+        );
+        assert!(!is_error, "{started}");
+        assert_eq!(started["state"], "running", "{started}");
+        let handle = started["handle"].as_str().unwrap().to_owned();
+
+        // Finish each delegation before starting the next to fix the retention order.
+        let (done, is_error) = raw_call(
+            &mut server,
+            20 + index as i64,
+            "await",
+            json!({"handles": [handle]}),
+        );
+        assert!(!is_error, "result {index} failed to await");
+        let item = &done["results"][0];
+        assert_eq!(item["handle"], handle);
+        assert_eq!(item["state"], "finished");
+        let result = &item["result"];
+        assert_eq!(result["reported"]["content"], answer);
+        result_bytes[index] = result.to_string().len();
+        handles.push(handle);
+    }
+    assert!(result_bytes[..2].iter().sum::<usize>() <= BYTE_LIMIT);
+    assert!(result_bytes.iter().sum::<usize>() > BYTE_LIMIT);
+
+    let (checked, is_error) = raw_call(&mut server, 30, "await", json!({"handles": handles}));
+    assert!(!is_error, "retained results failed to await");
+    let results = checked["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["handle"], handles[0]);
+    assert_eq!(results[0]["state"], "unknown");
+    assert!(results[0].get("result").is_none());
+    for index in 1..3 {
+        let item = &results[index];
+        assert_eq!(item["handle"], handles[index]);
+        assert_eq!(item["state"], "finished");
+        assert_eq!(item["result"]["reported"]["content"], answers[index]);
+    }
+}
+
+#[test]
 fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
     let fleet = Fleet::new(&["agy"]);
     let release = fleet.root.join("after-panic.go");
