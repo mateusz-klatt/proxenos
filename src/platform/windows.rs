@@ -163,6 +163,7 @@ impl Group {
             {
                 if message == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT {
                     memory_limit_exceeded = true;
+                    break;
                 }
             }
         }
