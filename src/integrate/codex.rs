@@ -1,11 +1,12 @@
 //! Pointwise edits to Codex's user MCP configuration (D10).
 
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use toml_edit::{Array, Document, Item, Table, TableLike, Value, value};
+use toml_edit::{Array, Document, InlineTable, Item, RawString, TableLike, Value};
 
 use super::{
     FileData, IntegrateError, MCP_SERVER_NAME, Manifest, ResolvedSettingsPath,
@@ -19,6 +20,7 @@ pub(super) const CLIENT: &str = "codex";
 const DISPLAY_NAME: &str = "Codex";
 const SERVERS: &str = "mcp_servers";
 const ARGS: &[&str] = &["mcp", "--client", "codex"];
+const NOT_INSTALLED: &str = "Codex integration is not installed; nothing to remove.\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Registration {
@@ -49,13 +51,6 @@ impl Registration {
 
     fn arguments(&self) -> Array {
         self.args.iter().cloned().map(Value::from).collect()
-    }
-
-    fn table(&self) -> Table {
-        let mut table = Table::new();
-        table.insert("command", value(&self.command));
-        table.insert("args", value(self.arguments()));
-        table
     }
 }
 
@@ -202,21 +197,28 @@ fn modified(path: &Path, operation: &str) -> IntegrateError {
 }
 
 fn insert_registration(doc: &Document<&str>, entry: &Registration) -> String {
-    if doc
-        .as_table()
-        .get(SERVERS)
-        .is_some_and(Item::is_inline_table)
-    {
-        let mut doc = doc.clone().into_mut();
-        doc[SERVERS]
-            .as_table_like_mut()
-            .expect("inline table is table-like")
-            .insert(MCP_SERVER_NAME, Item::Table(entry.table()));
-        return doc.to_string();
+    let mut text = doc.raw().to_owned();
+    if let Some(table) = doc.as_table().get(SERVERS).and_then(Item::as_inline_table) {
+        // Leave all existing trivia before the closing brace where it was, including
+        // comments on the last existing member and a possible trailing comma.
+        let close = table.span().expect("inline table has a source span").end - 1;
+        let (prefix, suffix) = if table.trailing_comma() {
+            ("", ",")
+        } else if table.is_empty() {
+            ("", "")
+        } else {
+            (",", "")
+        };
+        let member = format!(
+            "{prefix}{MCP_SERVER_NAME} = {{ command = {}, args = {} }}{suffix}",
+            Value::from(&entry.command),
+            entry.arguments(),
+        );
+        text.insert_str(close, &member);
+        return text;
     }
     // Append after existing trailing comments so another tool's closing marker stays with
     // its own block. Build the two values with the TOML encoder to escape paths correctly.
-    let mut text = doc.raw().to_owned();
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
     if !text.is_empty() && !text.ends_with('\n') {
         text.push_str(eol);
@@ -244,32 +246,165 @@ fn replace_command(doc: &Document<&str>, current: &Item, entry: &Registration) -
 }
 
 fn remove_registration(doc: &Document<&str>, current: &Item) -> String {
-    if let Some(table) = current.as_table().filter(|table| !table.is_dotted()) {
-        // The managed table has precisely two scalar/array values. Span from its opening
-        // bracket through the last value, leaving comments on either side where they were.
-        let header = table.span().expect("managed table has a source span");
-        let last = table
-            .iter()
-            .map(|(_, item)| item.span().expect("managed value has a source span").end)
-            .max()
-            .expect("managed table has entries");
-        let raw = doc.raw();
-        let start = raw[..header.start].rfind('\n').map_or(0, |index| index + 1);
-        let end = raw[last..]
-            .find('\n')
-            .map_or(raw.len(), |index| last + index + 1);
-        let mut text = raw.to_owned();
-        text.replace_range(start..end, "");
-        return text;
+    let raw = doc.raw();
+    if let Some(table) = doc.as_table().get(SERVERS).and_then(Item::as_inline_table) {
+        return remove_inline_members(raw, table);
     }
-    // An existing inline table must stay inline. The same edit also handles a registration
-    // the user reformatted as dotted keys without changing its values.
-    let mut doc = doc.clone().into_mut();
-    doc[SERVERS]
-        .as_table_like_mut()
-        .expect("managed parent is table-like")
-        .remove(MCP_SERVER_NAME);
-    doc.to_string()
+    if let Some(table) = current.as_table() {
+        let header = (!table.is_dotted())
+            .then(|| (table.span().expect("managed table has a source span"), None));
+        let assignments = table.iter().map(|(name, item)| {
+            let key = table
+                .key(name)
+                .and_then(toml_edit::Key::span)
+                .expect("managed key has a source span");
+            let value = item.span().expect("managed value has a source span");
+            (key.start..value.end, item.as_value())
+        });
+        return remove_lines(raw, header.into_iter().chain(assignments));
+    }
+    // An inline registration under a regular or dotted parent is a whole assignment line.
+    let value = current
+        .as_value()
+        .expect("managed inline registration has a value");
+    remove_lines(raw, [(value_span(value), Some(value))])
+}
+
+fn remove_lines<'a>(
+    raw: &str,
+    entries: impl IntoIterator<Item = (Range<usize>, Option<&'a Value>)>,
+) -> String {
+    let mut text = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    for (span, value) in entries {
+        let start = line_start(raw, span.start);
+        let end = raw[span.end..]
+            .find('\n')
+            .map_or(raw.len(), |offset| span.end + offset + 1);
+        // Gaps between owned lines include standalone comments and retain their original bytes.
+        text.push_str(&raw[cursor..start]);
+        if let Some(value) = value {
+            append_value_comments(&mut text, raw, value);
+        }
+        append_comments(&mut text, raw, span.end..end);
+        cursor = end;
+    }
+    text.push_str(&raw[cursor..]);
+    text
+}
+
+struct InlineMember<'a> {
+    root: &'a str,
+    start: usize,
+    value: &'a Value,
+}
+
+fn inline_members(table: &InlineTable) -> Vec<InlineMember<'_>> {
+    let mut members: Vec<_> = table
+        .get_values()
+        .into_iter()
+        .map(|(keys, value)| InlineMember {
+            root: keys[0].get(),
+            // The leaf's prefix gives the start of this whole key even if a dotted
+            // ancestor's stored key span came from a different assignment.
+            start: keys
+                .last()
+                .and_then(|key| key.leaf_decor().prefix())
+                .and_then(RawString::span)
+                .expect("inline key has a source prefix")
+                .end,
+            value,
+        })
+        .collect();
+    members.sort_unstable_by_key(|member| member.start);
+    members
+}
+
+fn remove_inline_members(raw: &str, table: &InlineTable) -> String {
+    let members = inline_members(table);
+    let last_kept = members
+        .iter()
+        .rposition(|member| member.root != MCP_SERVER_NAME);
+    let mut changes = Vec::new();
+    for (index, member) in members.iter().enumerate() {
+        if member.root != MCP_SERVER_NAME {
+            continue;
+        }
+        let mut comments = String::new();
+        append_value_comments(&mut comments, raw, member.value);
+        changes.push((member.start..value_span(member.value).end, comments));
+        // Remove the separator after each deleted entry, except for a final run of
+        // entries with no trailing comma. That run loses its preceding separators.
+        let delimiter = if table.trailing_comma() || last_kept.is_some_and(|last| index < last) {
+            Some(member.value)
+        } else {
+            index.checked_sub(1).map(|before| members[before].value)
+        };
+        if let Some(value) = delimiter {
+            let comma = value
+                .decor()
+                .suffix()
+                .and_then(RawString::span)
+                .expect("inline value has a source suffix")
+                .end;
+            changes.push((comma..comma + 1, String::new()));
+        }
+    }
+    changes.sort_unstable_by_key(|(range, _)| range.start);
+    let mut text = raw.to_owned();
+    for (range, replacement) in changes.into_iter().rev() {
+        text.replace_range(range, &replacement);
+    }
+    text
+}
+
+fn value_span(value: &Value) -> Range<usize> {
+    value.span().expect("parsed TOML value has a source span")
+}
+
+fn append_value_comments(text: &mut String, raw: &str, value: &Value) {
+    let children: Vec<_> = match value {
+        Value::Array(array) => array
+            .iter()
+            .map(|item| (value_span(item).start, item))
+            .collect(),
+        Value::InlineTable(table) => inline_members(table)
+            .into_iter()
+            .map(|member| (member.start, member.value))
+            .collect(),
+        _ => return,
+    };
+    // Only trivia gaps between children are scanned. A '#' in a quoted or
+    // multiline string remains part of the owned value and is removed with it.
+    let span = value_span(value);
+    let mut gap = span.start;
+    for (start, child) in children {
+        append_comments(text, raw, gap..start);
+        append_value_comments(text, raw, child);
+        gap = value_span(child).end;
+    }
+    append_comments(text, raw, gap..span.end);
+}
+
+fn line_start(raw: &str, offset: usize) -> usize {
+    raw[..offset].rfind('\n').map_or_else(
+        || raw.len() - raw.strip_prefix('\u{feff}').unwrap_or(raw).len(),
+        |index| index + 1,
+    )
+}
+
+fn append_comments(text: &mut String, raw: &str, trivia: Range<usize>) {
+    let mut offset = trivia.start;
+    for line in raw[trivia].split_inclusive('\n') {
+        if let Some(comment_start) = line.find('#') {
+            let absolute_start = offset + comment_start;
+            let preceding = &raw[line_start(raw, absolute_start)..absolute_start];
+            let indent = preceding.len() - preceding.trim_start_matches([' ', '\t']).len();
+            text.push_str(&preceding[..indent]);
+            text.push_str(&line[comment_start..]);
+        }
+        offset += line.len();
+    }
 }
 
 pub fn integrate_codex() -> Result<String, IntegrateError> {
@@ -437,12 +572,15 @@ pub fn integrate_codex() -> Result<String, IntegrateError> {
 
 pub fn remove_codex() -> Result<String, IntegrateError> {
     let state_dir = state::require_state_dir().map_err(IntegrateError::Message)?;
+    if !state_dir.try_exists().map_err(io_err(&state_dir))? {
+        return Ok(NOT_INSTALLED.to_owned());
+    }
     let path = config_path()?;
     let manifest_file = manifest_path(&state_dir);
     let _lock = state::lock_integration(&state_dir).map_err(io_err(&manifest_file))?;
     let mut manifest = load_manifest(&manifest_file)?;
     let Some(record) = manifest_record(&manifest)? else {
-        return Ok("Codex integration is not installed; nothing to remove.\n".to_owned());
+        return Ok(NOT_INSTALLED.to_owned());
     };
     let resolved = resolve_settings_target(&path)?;
     let path_string = state::path_string(&path).map_err(io_err(&path))?;

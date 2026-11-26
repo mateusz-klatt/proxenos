@@ -246,7 +246,7 @@ fn shared_created_dirs(
     let shared_paths = [
         state_dir.to_path_buf(),
         state_dir.join("integrate"),
-        state_dir.join("integrate/backups"),
+        state_dir.join("integrate").join("backups"),
         settings_dir.to_path_buf(),
     ];
     for path in shared_paths {
@@ -679,16 +679,20 @@ fn remove_managed_entry(
 }
 
 pub fn remove_claude_code() -> Result<String, IntegrateError> {
+    const NOT_INSTALLED: &str = "Claude Code integration is not installed; nothing to remove.\n";
     let state_dir = state::require_state_dir().map_err(IntegrateError::Message)?;
     let current_settings_path = state::claude_settings_path().map_err(IntegrateError::Message)?;
     let current_settings_str =
         state::path_string(&current_settings_path).map_err(io_err(&current_settings_path))?;
+    if !state_dir.try_exists().map_err(io_err(&state_dir))? {
+        return Ok(NOT_INSTALLED.to_owned());
+    }
     let manifest_file = manifest_path(&state_dir);
     let _lock = state::lock_integration(&state_dir).map_err(io_err(&manifest_file))?;
     let mut manifest = load_manifest(&manifest_file)?;
     let Some(record): Option<ClientRecord> = manifest.record(CLIENT_CLAUDE_CODE, &manifest_file)?
     else {
-        return Ok("Claude Code integration is not installed; nothing to remove.\n".to_owned());
+        return Ok(NOT_INSTALLED.to_owned());
     };
 
     check_settings_path_unchanged("Claude Code", &record.settings_path, &current_settings_str)?;

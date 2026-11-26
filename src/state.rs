@@ -264,11 +264,31 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
-/// Holds the shared integration lock for this state root. Keep its file outside the
-/// removable state directory so waiters always take the lock on the same inode.
+/// Holds the shared integration lock for this state root. Normally the lock is beside
+/// the root, so removal can clean up an empty root. An existing root under a read-only
+/// parent can use a lock inside that root, which is kept through removal and later runs.
 pub fn lock_integration(state_dir: &Path) -> io::Result<fs::File> {
-    let path = state_dir.with_file_name(".proxenos-integrate.lock");
-    fs::create_dir_all(path.parent().expect("integration lock has a parent"))?;
+    const LOCK_NAME: &str = ".proxenos-integrate.lock";
+    let inside = state_dir.join(LOCK_NAME);
+    if inside.try_exists()? {
+        return open_integration_lock(&inside);
+    }
+    let adjacent = state_dir.with_file_name(LOCK_NAME);
+    fs::create_dir_all(adjacent.parent().expect("integration lock has a parent"))?;
+    match open_integration_lock(&adjacent) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ) && !adjacent.try_exists()? =>
+        {
+            open_integration_lock(&inside)
+        }
+        result => result,
+    }
+}
+
+fn open_integration_lock(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]

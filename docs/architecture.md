@@ -592,9 +592,11 @@ the working directory and refused an explicit directory that did not exist. Thes
 loaded the configuration without starting a provider turn.
 
 The integration uses the existing manifest schema and keeps Codex ownership separately under
-`clients.codex`. A shared advisory lock in the parent of `<state_dir>` serializes updates to
-the manifest by this version of Proxenos. The Codex entry is updated or removed only while it
-matches the recorded command and arguments. Proxenos preserves other MCP registrations and
+`clients.codex`. A shared advisory lock serializes updates to the manifest by this version of
+Proxenos. It lives beside `<state_dir>` when the parent permits creation. With a pre-existing
+state directory under a read-only parent, Proxenos creates the lock inside that directory and
+reuses it on later runs. The lock file remains after the last removal. Proxenos updates or removes
+the Codex entry only while it matches the recorded command and arguments. Proxenos preserves other MCP registrations and
 their comments, and keeps a symlinked `config.toml` in place while editing its resolved target.
 It records the resolved configuration directory and refuses later operations if that path
 changes. Each client keeps a record of any integration-created directories
@@ -632,7 +634,8 @@ What this cannot do:
   It cannot establish the effective registration after trusted project configuration, command
   line overrides, or managed policy are applied.
 - An external edit to `config.toml` can race the read and atomic replacement. The integration
-  lock coordinates Proxenos processes using the same state directory.
+  lock coordinates Proxenos processes sharing a state directory while its path and permissions
+  are stable.
 - An entry in `settings.json` edited by hand after `integrate` is reported and left untouched by
   both `integrate` and `--remove`, never forced or overwritten.
 - On Windows, Unix mode bits do not apply; `<state_dir>` relies on the user profile's `%LOCALAPPDATA%`

@@ -12,7 +12,11 @@ use super::{Sandbox, absolute_path_string, find_check, proxenos_bin, read_json, 
 const INSTALL: &[&str] = &["integrate", "codex"];
 const REMOVE: &[&str] = &["integrate", "codex", "--remove"];
 const DOCTOR: &[&str] = &["doctor", "--json"];
+const CLAUDE_INSTALL: &[&str] = &["integrate", "claude-code"];
+const CLAUDE_REMOVE: &[&str] = &["integrate", "claude-code", "--remove"];
 const ARGS: [&str; 3] = ["mcp", "--client", "codex"];
+const LOCK_FILE: &str = ".proxenos-integrate.lock";
+const LOCK_SENTINEL: &[u8] = b"lock contents must survive all client operations";
 
 fn command(sb: &Sandbox, args: &[&str]) -> Command {
     let mut cmd = sb.command(args);
@@ -30,6 +34,13 @@ fn config_path(sb: &Sandbox) -> PathBuf {
 
 fn backup_path(sb: &Sandbox) -> PathBuf {
     sb.state_dir().join("integrate/backups/codex-config.toml")
+}
+
+fn directory_entries(path: &Path) -> Vec<std::ffi::OsString> {
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect()
 }
 
 fn write_config(path: &Path, contents: &str) {
@@ -118,6 +129,9 @@ fn fresh_registration_round_trips_through_doctor_and_remove() {
     assert_success(&run(&sb, INSTALL));
     assert_eq!(fs::read(&path).unwrap(), written);
     assert_eq!(read_json(&sb.manifest_path()), manifest);
+    assert_success(&run(&sb, CLAUDE_REMOVE));
+    assert_eq!(fs::read(&path).unwrap(), written);
+    assert_eq!(read_json(&sb.manifest_path()), manifest);
 
     let out = run(&sb, DOCTOR);
     assert_success(&out);
@@ -141,6 +155,19 @@ fn fresh_registration_round_trips_through_doctor_and_remove() {
     assert!(!path.exists());
     assert!(!sb.manifest_path().exists());
     assert_success(&run(&sb, REMOVE));
+}
+
+#[test]
+fn remove_without_state_leaves_foreign_codex_registration_untouched() {
+    let sb = Sandbox::new();
+    let path = config_path(&sb);
+    let original = "[mcp_servers.proxenos]\ncommand = 'user-owned-launcher'\n";
+    write_config(&path, original);
+    assert!(!sb.state_dir().exists());
+
+    assert_success(&run(&sb, REMOVE));
+    assert!(!sb.state_dir().exists());
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
 }
 
 #[test]
@@ -194,6 +221,264 @@ fn assert_neighbors_preserved(path: &Path) {
     ] {
         assert!(text.contains(marker), "missing {marker:?} in {text}");
     }
+}
+
+#[test]
+fn inline_registration_changes_only_its_own_bytes_in_crlf_document() {
+    let sb = Sandbox::new();
+    let path = config_path(&sb);
+    let original = concat!(
+        "# Codex settings\r\n",
+        "model = 'original-model' # keep model comment\r\n",
+        "\r\n",
+        "mcp_servers = { iris = { command = 'keep-iris#literal', args = ['serve'] }, ",
+        "sidecar = { command = 'keep-sidecar' }  \t } # keep inline comment\r\n",
+        "\r\n",
+        "# Unrelated section  \r\n",
+        "[ui]\r\n",
+        "show_notifications = true # keep UI comment\r\n",
+    );
+    write_config(&path, original);
+    assert_success(&run(&sb, INSTALL));
+    assert_registered(&path, proxenos_bin());
+
+    let installed = fs::read_to_string(&path).unwrap();
+    assert_only_insertion(original, &installed);
+
+    // A raw edit models the user changing another setting without normalizing CRLF.
+    let edited = installed.replacen("'original-model'", "'edited-model'", 1);
+    assert_ne!(edited, installed);
+    fs::write(&path, edited).unwrap();
+    assert_success(&run(&sb, REMOVE));
+    let expected = original.replacen("'original-model'", "'edited-model'", 1);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+}
+
+fn assert_only_insertion(original: &str, installed: &str) {
+    let original_bytes = original.as_bytes();
+    let installed_bytes = installed.as_bytes();
+    let added = installed_bytes
+        .len()
+        .checked_sub(original_bytes.len())
+        .unwrap();
+    assert!(added > 0);
+    let insertion = installed_bytes
+        .iter()
+        .zip(original_bytes)
+        .position(|(new, old)| new != old)
+        .expect("the inline registration was inserted within the document");
+    assert_eq!(
+        &installed_bytes[insertion + added..],
+        &original_bytes[insertion..],
+        "the installer must preserve all original bytes: {installed:?}"
+    );
+}
+
+#[test]
+fn inline_registration_preserves_empty_parent_and_existing_trailing_comma() {
+    for table in [
+        "mcp_servers = { \t } # keep empty table\r\n",
+        concat!(
+            "mcp_servers = {\r\n",
+            "  iris = { command = 'keep-iris' }, # keep trailing comma\r\n",
+            "} # keep closing comment\r\n",
+        ),
+    ] {
+        let sb = Sandbox::new();
+        let path = config_path(&sb);
+        let original = format!("model = 'before'\r\n{table}");
+        write_config(&path, &original);
+        assert_success(&run(&sb, INSTALL));
+        assert_registered(&path, proxenos_bin());
+        let installed = fs::read_to_string(&path).unwrap();
+        assert_only_insertion(&original, &installed);
+
+        let edited = installed.replacen("model = 'before'", "model = 'after'", 1);
+        fs::write(&path, edited).unwrap();
+        assert_success(&run(&sb, REMOVE));
+        let expected = format!("model = 'after'\r\n{table}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+    }
+}
+
+#[test]
+fn inline_removal_preserves_comments_and_interleaved_dotted_members() {
+    let sb = Sandbox::new();
+    let path = config_path(&sb);
+    let before = "mcp_servers = {\r\n  iris.command = 'keep-iris', # First server\r\n";
+    let neighbor = "sidecar.command = 'keep-sidecar'";
+    let after = "} # keep closing comment\r\n";
+    write_config(&path, &format!("{before}  {neighbor}\r\n{after}"));
+    assert_success(&run(&sb, INSTALL));
+
+    let launcher = toml_edit::Value::from(absolute_path_string(proxenos_bin()));
+    let owned_command = format!("proxenos . command = {launcher},");
+    let owned_args = "proxenos . args = ['mcp', '--client', 'codex']";
+    let edited = format!(
+        concat!(
+            "{before}",
+            "  {owned_command} # Keep command comment\r\n",
+            "  {neighbor}, # Interleaved server\r\n",
+            "  {owned_args} # Keep arguments comment\r\n",
+            "{after}",
+        ),
+        before = before,
+        owned_command = owned_command,
+        neighbor = neighbor,
+        owned_args = owned_args,
+        after = after,
+    );
+    let expected = edited
+        .replacen(&owned_command, "", 1)
+        .replacen(&format!("{neighbor},"), neighbor, 1)
+        .replacen(owned_args, "", 1);
+    fs::write(&path, edited).unwrap();
+    assert_registered(&path, proxenos_bin());
+    assert_success(&run(&sb, REMOVE));
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+    assert!(server(&read_config(&path), "proxenos").is_none());
+}
+
+#[test]
+fn removal_preserves_crlf_and_comments_in_reformatted_dotted_registration() {
+    let sb = Sandbox::new();
+    let path = config_path(&sb);
+    let before = "# First server\r\nmcp_servers.iris.command = 'keep-iris#literal'\r\n";
+    let middle = "# Interleaved server  \r\nmcp_servers.sidecar.command = 'keep-sidecar'\r\n";
+    let after = "# Unrelated section\r\n[ui]\r\nshow_notifications = true\r\n";
+    write_config(&path, &format!("{before}{middle}{after}"));
+    assert_success(&run(&sb, INSTALL));
+
+    let launcher = toml_edit::Value::from(absolute_path_string(proxenos_bin()));
+    let edited = format!(
+        concat!(
+            "{before}",
+            "mcp_servers.proxenos.command = {launcher} # Keep command comment\r\n",
+            "{middle}",
+            "mcp_servers.proxenos.args = [ # Keep opening comment\r\n",
+            "  'mcp', # Keep argument comment  \r\n",
+            "  # Keep standalone comment\t\r\n",
+            "  '--client',\r\n",
+            "  'codex',\r\n",
+            "] # Keep closing comment\r\n",
+            "{after}",
+        ),
+        before = before,
+        launcher = launcher,
+        middle = middle,
+        after = after,
+    );
+    fs::write(&path, edited).unwrap();
+    assert_registered(&path, proxenos_bin());
+    assert_success(&run(&sb, REMOVE));
+
+    let expected = format!(
+        concat!(
+            "{before}",
+            "# Keep command comment\r\n",
+            "{middle}",
+            "# Keep opening comment\r\n",
+            "  # Keep argument comment  \r\n",
+            "  # Keep standalone comment\t\r\n",
+            "# Keep closing comment\r\n",
+            "{after}",
+        ),
+        before = before,
+        middle = middle,
+        after = after,
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+    assert!(server(&read_config(&path), "proxenos").is_none());
+}
+
+#[test]
+fn removal_preserves_comments_on_an_inline_member_under_a_regular_table() {
+    let sb = Sandbox::new();
+    let path = config_path(&sb);
+    let original = "[mcp_servers]\r\niris = { command = 'keep-iris' } # keep neighbor\r\n";
+    write_config(&path, original);
+    assert_success(&run(&sb, INSTALL));
+
+    let command = toml_edit::Value::from(absolute_path_string(proxenos_bin()));
+    let edited = format!(
+        "{original}proxenos = {{ command = {command}, args = ['mcp', '--client', 'codex'] }} # keep user comment\r\n"
+    );
+    fs::write(&path, edited).unwrap();
+    assert_registered(&path, proxenos_bin());
+    assert_success(&run(&sb, REMOVE));
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        format!("{original}# keep user comment\r\n")
+    );
+    assert!(server(&read_config(&path), "proxenos").is_none());
+}
+
+#[test]
+fn removal_preserves_user_comments_within_managed_toml_table_and_arguments() {
+    let sb = Sandbox::new();
+    let path = config_path(&sb);
+    let binary = sb.hard_link_binary("proxenos # part of executable path");
+    let original = "# First neighbor\r\n[mcp_servers.iris]\r\ncommand = 'keep-iris#literal'\r\n";
+    let next = "# Next neighbor\r\n[mcp_servers.sidecar]\r\ncommand = 'keep-sidecar'\r\n";
+    write_config(&path, original);
+    let install = sb
+        .command_for(&binary, INSTALL)
+        .env_remove("CODEX_HOME")
+        .output()
+        .unwrap();
+    assert_success(&install);
+
+    // Reformat the owned entry without changing either of its values.
+    let launcher = toml_edit::Value::from(absolute_path_string(&binary));
+    let edited = format!(
+        concat!(
+            "{original}",
+            "# Before the managed table\r\n",
+            "[mcp_servers.proxenos] # At the table header\t\r\n",
+            "# Between the header and command  \r\n",
+            "command = {launcher} # At the command\r\n",
+            "args = [ # At the array opening\r\n",
+            "  'mcp', # At the first argument  \r\n",
+            "  # Between arguments\t\r\n",
+            "  '--client',\r\n",
+            "  'codex',\r\n",
+            "] # At the array closing\r\n",
+            "# After the managed table\r\n",
+            "{next}",
+        ),
+        original = original,
+        launcher = launcher,
+        next = next,
+    );
+    fs::write(&path, edited).unwrap();
+    assert_registered(&path, &binary);
+    assert_success(&run(&sb, REMOVE));
+
+    let remaining = fs::read_to_string(&path).unwrap();
+    assert!(remaining.starts_with(original), "{remaining:?}");
+    assert!(remaining.ends_with(next), "{remaining:?}");
+    let mut comments = remaining.as_str();
+    for comment in [
+        "# Before the managed table\r\n",
+        "# At the table header\t\r\n",
+        "# Between the header and command  \r\n",
+        "# At the command\r\n",
+        "# At the array opening\r\n",
+        "  # At the first argument  \r\n",
+        "  # Between arguments\t\r\n",
+        "# At the array closing\r\n",
+        "# After the managed table\r\n",
+    ] {
+        let (_, rest) = comments
+            .split_once(comment)
+            .unwrap_or_else(|| panic!("missing comment {comment:?} in {remaining:?}"));
+        comments = rest;
+    }
+    assert!(!remaining.contains("# part of executable path"));
+    let parsed = read_config(&path);
+    assert!(server(&parsed, "proxenos").is_none());
+    assert!(server(&parsed, "iris").is_some());
+    assert!(server(&parsed, "sidecar").is_some());
 }
 
 #[test]
@@ -385,15 +670,161 @@ fn concurrent_client_operations_keep_both_manifest_records_consistent() {
     concurrently(&["integrate", "claude-code", "--remove"], REMOVE);
     assert!(!sb.manifest_path().exists());
     assert!(!sb.state_dir().exists());
+    assert!(sb.state_dir().with_file_name(LOCK_FILE).is_file());
     assert!(!sb.settings_path().exists());
     assert!(!config_path(&sb).exists());
 }
 
+fn assert_parent_denies_file_creation(parent: &Path) {
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(parent.join("permission-probe"));
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+}
+
+fn exercise_both_clients_with_internal_lock(sb: &Sandbox) {
+    let state = sb.state_dir();
+    let parent = state.parent().unwrap();
+    let parent_entries = directory_entries(parent);
+    let lock = state.join(LOCK_FILE);
+    let adjacent = parent.join(LOCK_FILE);
+    assert!(!lock.exists());
+    assert!(!adjacent.exists());
+
+    assert_success(&run(sb, CLAUDE_INSTALL));
+    assert!(lock.is_file());
+    fs::write(&lock, LOCK_SENTINEL).unwrap();
+    #[cfg(unix)]
+    let lock_identity = || {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::metadata(&lock).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(unix)]
+    let identity = lock_identity();
+    let verify_lock = || {
+        assert_eq!(fs::read(&lock).unwrap(), LOCK_SENTINEL);
+        assert!(!adjacent.exists());
+        #[cfg(unix)]
+        assert_eq!(lock_identity(), identity);
+    };
+    assert_success(&run(sb, INSTALL));
+    verify_lock();
+
+    let moved = sb.hard_link_binary("updated registration binary");
+    for args in [CLAUDE_INSTALL, INSTALL] {
+        let updated = sb
+            .command_for(&moved, args)
+            .env_remove("CODEX_HOME")
+            .output()
+            .unwrap();
+        assert_success(&updated);
+        verify_lock();
+    }
+    assert_registered(&config_path(sb), &moved);
+    let claude_mcp = sb.marketplace_dir().join("plugins/proxenos/.mcp.json");
+    assert_eq!(
+        read_json(&claude_mcp)["mcpServers"]["proxenos"]["command"],
+        absolute_path_string(&moved)
+    );
+
+    assert_success(&run(sb, CLAUDE_REMOVE));
+    verify_lock();
+    assert_success(&run(sb, REMOVE));
+    verify_lock();
+    assert_eq!(directory_entries(parent), parent_entries);
+    assert_eq!(
+        directory_entries(&state),
+        [std::ffi::OsString::from(LOCK_FILE)]
+    );
+    assert!(!config_path(sb).exists());
+    assert!(!sb.settings_path().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn both_clients_use_the_same_lock_inside_state_with_read_only_parent() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    struct RestorePermissions<'a>(&'a Path, fs::Permissions);
+
+    impl Drop for RestorePermissions<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, self.1.clone());
+        }
+    }
+
+    let sb = Sandbox::new();
+    let state = sb.state_dir();
+    let parent = state.parent().unwrap();
+    fs::create_dir_all(parent).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+    let restore = RestorePermissions(parent, fs::metadata(parent).unwrap().permissions());
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o500)).unwrap();
+    assert_parent_denies_file_creation(parent);
+    exercise_both_clients_with_internal_lock(&sb);
+
+    // Making the parent writable again must not switch away from the existing lock.
+    drop(restore);
+    assert_success(&run(&sb, INSTALL));
+    assert_success(&run(&sb, REMOVE));
+    assert_eq!(fs::read(state.join(LOCK_FILE)).unwrap(), LOCK_SENTINEL);
+    assert!(!parent.join(LOCK_FILE).exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn both_clients_use_internal_lock_when_parent_acl_denies_file_creation() {
+    struct RemoveDenyRule<'a> {
+        parent: &'a Path,
+        sid: &'a str,
+    }
+
+    impl Drop for RemoveDenyRule<'_> {
+        fn drop(&mut self) {
+            let restored = Command::new("icacls.exe")
+                .arg(self.parent)
+                .args(["/remove:d", self.sid])
+                .output();
+            if !std::thread::panicking() {
+                assert_success(&restored.expect("remove the test-only parent ACL rule"));
+            }
+        }
+    }
+
+    let sb = Sandbox::new();
+    let state = sb.state_dir();
+    let parent = state.parent().unwrap();
+    fs::create_dir(&state).unwrap();
+    let user = Command::new("whoami.exe")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .unwrap();
+    assert_success(&user);
+    let user = String::from_utf8_lossy(&user.stdout);
+    let sid = user
+        .split('"')
+        .find(|field| field.starts_with("S-1-"))
+        .unwrap();
+    let sid = format!("*{sid}");
+    let _restore = RemoveDenyRule { parent, sid: &sid };
+    // WD denies creating files in this directory. Without inheritance flags, the existing
+    // state directory stays writable and no other path is affected.
+    let denied = Command::new("icacls.exe")
+        .arg(parent)
+        .arg("/deny")
+        .arg(format!("{sid}:(WD)"))
+        .output()
+        .unwrap();
+    assert_success(&denied);
+    assert_parent_denies_file_creation(parent);
+    exercise_both_clients_with_internal_lock(&sb);
+}
+
 #[test]
 fn shared_settings_directory_survives_until_both_integrations_are_removed() {
-    const CLAUDE_INSTALL: &[&str] = &["integrate", "claude-code"];
-    const CLAUDE_REMOVE: &[&str] = &["integrate", "claude-code", "--remove"];
-
     for installs in [[CLAUDE_INSTALL, INSTALL], [INSTALL, CLAUDE_INSTALL]] {
         for claude_removed_first in [true, false] {
             let sb = Sandbox::new();
@@ -438,6 +869,43 @@ fn shared_settings_directory_survives_until_both_integrations_are_removed() {
             assert!(!directory.exists());
             assert!(!sb.manifest_path().exists());
         }
+    }
+}
+
+#[test]
+fn shared_backup_directory_is_removed_after_the_last_client() {
+    for installs in [[CLAUDE_INSTALL, INSTALL], [INSTALL, CLAUDE_INSTALL]] {
+        let sb = Sandbox::new();
+        let codex = config_path(&sb);
+        let claude = sb.settings_path();
+        let codex_original = "# user configuration\nmodel = 'keep'\n";
+        let claude_original = "{\n  \"theme\": \"dark\"\n}\n";
+        write_config(&codex, codex_original);
+        write_config(&claude, claude_original);
+        for args in installs {
+            assert_success(&run(&sb, args));
+        }
+        assert_eq!(
+            fs::read_to_string(backup_path(&sb)).unwrap(),
+            codex_original
+        );
+        assert_eq!(
+            fs::read_to_string(sb.backup_path()).unwrap(),
+            claude_original
+        );
+
+        let (first, last, remaining_backup) = if installs[0] == CLAUDE_INSTALL {
+            (CLAUDE_REMOVE, REMOVE, backup_path(&sb))
+        } else {
+            (REMOVE, CLAUDE_REMOVE, sb.backup_path())
+        };
+        assert_success(&run(&sb, first));
+        assert!(remaining_backup.is_file());
+        assert_success(&run(&sb, last));
+        assert_eq!(fs::read_to_string(&codex).unwrap(), codex_original);
+        assert_eq!(fs::read_to_string(&claude).unwrap(), claude_original);
+        assert!(!sb.state_dir().join("integrate").join("backups").exists());
+        assert!(!sb.state_dir().exists());
     }
 }
 
@@ -737,7 +1205,7 @@ fn codex_config_symlink_can_be_removed_only_with_original_target() {
 #[test]
 fn integration_refuses_special_file_at_shared_lock_path() {
     let sb = Sandbox::new();
-    let lock = sb.state_dir().with_file_name(".proxenos-integrate.lock");
+    let lock = sb.state_dir().with_file_name(LOCK_FILE);
     fs::create_dir_all(lock.parent().unwrap()).unwrap();
     #[cfg(unix)]
     let diagnostic = {
