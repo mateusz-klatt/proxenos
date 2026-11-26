@@ -105,6 +105,64 @@ jobs:
           "target/release/compare_init$EXE_SUFFIX" "target/release/proxenos$EXE_SUFFIX" "$BENCHMARK_NODE" \
             "../baseline" "target/release/proxenos-stub$EXE_SUFFIX" 20 > ../results/initialize.json
 
+      - name: Diagnose a failed Windows baseline start
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.measure.outcome == 'failure' }}
+        run: |
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { spawn } from 'node:child_process';
+          import readline from 'node:readline';
+          import { fileURLToPath, pathToFileURL } from 'node:url';
+          const report = JSON.parse(fs.readFileSync('results/initialize.json', 'utf8'));
+          if (!report.summary.claude_delegator.failed) process.exit(0);
+
+          const { node, bridge, stub } = report.inputs;
+          const plain = name => fileURLToPath(pathToFileURL(name));
+          const identity = name => name;
+          const request = { jsonrpc: '2.0', id: 1, method: 'initialize',
+            params: { protocolVersion: report.protocol_revision, capabilities: {},
+              clientInfo: { name: 'proxenos-comparison', version: '1' } } };
+          async function inspect(label, entry, paths) {
+            const profile = fs.mkdtempSync(path.join(paths(path.dirname(stub.path)), 'proxenos-diagnostic-'));
+            try {
+              const bin = path.join(profile, 'bin');
+              fs.mkdirSync(bin);
+              fs.linkSync(stub.path, path.join(bin, 'codex.exe'));
+              const env = { PATH: bin, SystemRoot: process.env.SystemRoot };
+              for (const key of ['HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TMPDIR', 'TEMP', 'TMP', 'PROXENOS_STUB_DIR']) env[key] = profile;
+              const child = spawn(paths(node.path), [entry(bridge.path)], { cwd: profile, env, timeout: 10_000 });
+              let stdoutBytes = 0, stderrBytes = 0, stderr = '', initialized = false, spawnError;
+              child.stdin.on('error', error => { spawnError ??= error.code; });
+              child.on('error', error => { spawnError = error.code; });
+              child.stderr.on('data', chunk => {
+                stderrBytes += chunk.length;
+                if (stderr.length < 4096) stderr += chunk.toString().slice(0, 4096 - stderr.length);
+              });
+              child.stdout.on('data', chunk => { stdoutBytes += chunk.length; if (stdoutBytes >= 1024 * 1024) child.kill(); });
+              readline.createInterface({ input: child.stdout }).on('line', line => {
+                try {
+                  const msg = JSON.parse(line);
+                  if (msg.id !== 1 || msg.result?.serverInfo?.name !== 'claude-delegator-codex') return;
+                } catch { return; }
+                initialized = true;
+                child.stdin.end(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+              });
+              child.stdin.write(JSON.stringify(request) + '\n');
+              const [status, signal] = await new Promise(resolve => child.once('close', (...args) => resolve(args)));
+              return { label, initialized, status, signal, spawnError, stdoutBytes, stderrBytes,
+                errors: stderr.split(/\r?\n/).filter(s => /^(?:[\w.]*Error|\s*code: |Require stack:)/.test(s)).slice(0, 6).map(s => s.slice(0, 350)),
+                frames: stderr.split(/\r?\n/).filter(s => /^\s+at /.test(s)).slice(0, 6).map(s => s.slice(0, 350)) };
+            } finally { fs.rmSync(profile, { recursive: true, force: true }); }
+          }
+          const diagnostics = [
+            await inspect('recorded-paths', identity, identity),
+            await inspect('ordinary-entry', plain, identity),
+            await inspect('ordinary-paths', plain, plain),
+          ];
+          fs.writeFileSync('results/windows-diagnostics.json', JSON.stringify(diagnostics, null, 2));
+          JS
+
       - name: Summarize every measured target
         if: ${{ !cancelled() && steps.measure.outcome != 'skipped' }}
         run: |
