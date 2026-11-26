@@ -781,6 +781,11 @@ Proxenos never updates itself.
 
 What this cannot do:
 
+- The macOS binary is notarized but cannot be stapled: `stapler` accepts only `.app`, `.pkg` and
+  `.dmg`, not a bare Mach-O executable. A first launch of a quarantined binary while offline may
+  therefore be unable to confirm the notarization. On a real Mac `spctl -t install` reported
+  "accepted, source=Notarized Developer ID"; `spctl -t exec` rejects any bare command-line tool as
+  "not an app", which is expected and says nothing about the signature.
 - Ruleset `28030033` on `main` requires a pull request and the four CI checks, but
   `required_approving_review_count` is `0`. A session holding the owner's token can open a pull
   request, wait for green checks, merge it into `main` and dispatch `release.yml`. Saying `main` is
