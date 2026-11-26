@@ -11,7 +11,7 @@ on:
       measurement:
         description: Measurement to run
         type: choice
-        options: [initialize, provider-scenarios, both]
+        options: [initialize, provider-scenarios, tree-cancel, all]
         default: initialize
 
 permissions:
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   initialize:
-    if: ${{ github.event_name == 'pull_request' || inputs.measurement != 'provider-scenarios' }}
+    if: ${{ github.event_name == 'pull_request' || inputs.measurement == 'initialize' || inputs.measurement == 'all' }}
     name: MCP initialize (20 pairs)
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -164,7 +164,7 @@ jobs:
       - name: Build the comparison harness separately
         working-directory: harness
         run: |
-          cargo build --locked --release --features test-tools --example comparison --target-dir "$RUNNER_TEMP/comparison-target"
+          cargo build --locked --release --features test-tools --example comparison --bin proxenos-stub --target-dir "$RUNNER_TEMP/comparison-target"
 
       - name: Identify the runner and all measured programs
         working-directory: proxenos
@@ -191,6 +191,8 @@ jobs:
           } > ../results/provenance.txt
 
       - name: Measure four scenarios with the shared stub
+        id: scenarios
+        if: ${{ github.event_name == 'pull_request' || inputs.measurement != 'tree-cancel' }}
         working-directory: proxenos
         run: |
           "$RUNNER_TEMP/comparison-target/release/examples/comparison" \
@@ -201,6 +203,7 @@ jobs:
           jq '{schema_version, metadata, part1}' "$RUNNER_TEMP"/comparison-output/part1-*.json > ../results/scenarios.json
 
       - name: Report exact-answer, cleanup, error and reply counts
+        if: ${{ steps.scenarios.outcome == 'success' }}
         run: |
           jq -e '(.metadata.mode == "part1-stubbed") and (.metadata.delegator_version == "3.5.0")
             and (.part1 | [.scenario_a_advisory, .scenario_c_cancel, .scenario_f_failures, .scenario_g_reply]
@@ -214,9 +217,10 @@ jobs:
             echo '| --- | --- | ---: | ---: |'
             jq -r '.part1.scenario_a_advisory[] | "| \(.target.server) | \(.target.provider) | \(.intact_count) | \(.wall_ms.median) |"' results/scenarios.json
             echo
-            echo '| Server | Provider | Both processes observed before cancel / 10 | CLI absent at final check / 10 | Grandchild absent at final check / 10 |'
-            echo '| --- | --- | ---: | ---: | ---: |'
-            jq -r '.part1.scenario_c_cancel[] | "| \(.target.server) | \(.target.provider) | \(.pre_verified_count) | \(.cli_gone_10s_count) | \(.gc_gone_10s_count) |"' results/scenarios.json
+            echo '| Server | Provider | CLI gone at final check / initially observed | Grandchild gone at final check / initially observed |'
+            echo '| --- | --- | ---: | ---: |'
+            jq -r 'def count(f): [.trials[] | select(f)] | length;
+              .part1.scenario_c_cancel[] | "| \(.target.server) | \(.target.provider) | \(count(.pre_cli_alive and .cli_gone_10s))/\(count(.pre_cli_alive)) | \(count(.pre_gc_alive and .gc_gone_10s))/\(count(.pre_gc_alive)) |"' results/scenarios.json
             echo
             echo '| Server | Provider | Injected case | Flagged as error / 10 | Recorded channel (first trial) |'
             echo '| --- | --- | --- | ---: | --- |'
@@ -230,10 +234,56 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload scenario trials and provenance
-        if: ${{ !cancelled() && hashFiles('results/provenance.txt') != '' }}
+        if: ${{ !cancelled() && steps.scenarios.outcome != 'skipped' && hashFiles('results/provenance.txt') != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-provider-scenarios-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: results/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Measure cancellation with the tree-capable historical stub
+        id: tree
+        if: ${{ github.event_name == 'pull_request' || inputs.measurement != 'provider-scenarios' }}
+        working-directory: proxenos
+        run: |
+          mkdir ../tree-results
+          cp ../results/provenance.txt ../tree-results/provenance.txt
+          {
+            printf '\nCancellation follow-up provider stub from %s\n' "$HARNESS_SHA"
+            sha256sum "$RUNNER_TEMP/comparison-target/release/proxenos-stub"
+          } >> ../tree-results/provenance.txt
+          "$RUNNER_TEMP/comparison-target/release/examples/comparison" \
+            --proxenos-bin target/release/proxenos --stub-bin "$RUNNER_TEMP/comparison-target/release/proxenos-stub" \
+            --delegator-dir ../baseline --node-bin "$(command -v node)" \
+            --scenarios c --runs 10 --concurrency 4 --out-dir "$RUNNER_TEMP/tree-output"
+          jq '{schema_version, metadata, scenario_c_cancel: .part1.scenario_c_cancel}' \
+            "$RUNNER_TEMP"/tree-output/part1-*.json > ../tree-results/cancellation.json
+
+      - name: Check the pre-cancel processes and report their survival
+        if: ${{ steps.tree.outcome == 'success' }}
+        run: |
+          file=tree-results/cancellation.json
+          {
+            echo '## Cancellation with a CLI that spawns a grandchild'
+            echo
+            echo 'The historical stub starts a grandchild that ignores SIGTERM. Each count includes trials where both processes were observed before cancellation.'
+            echo
+            echo '| Server | Provider | Both observed / 10 | CLI still seen at 2 s / 10 s | Grandchild still seen at 2 s / 10 s |'
+            echo '| --- | --- | ---: | ---: | ---: |'
+            jq -r 'def present(f): [.trials[] | select(.pre_cli_alive and .pre_gc_alive and (f | not))] | length;
+              .scenario_c_cancel[] | "| \(.target.server) | \(.target.provider) | \(.pre_verified_count) | \(present(.cli_gone_2s)) / \(present(.cli_gone_10s)) | \(present(.gc_gone_2s)) / \(present(.gc_gone_10s)) |"' "$file"
+            echo
+            echo 'The sampling instants are nominal. A late or missing response can delay a check. The harness cleans up surviving marked processes after observation.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -e '(.metadata.mode == "part1-stubbed") and (.metadata.delegator_version == "3.5.0")
+            and (.scenario_c_cancel | length == 4 and all(.[]; (.trials | length == 10 and all(.[]; .pre_cli_alive and .pre_gc_alive))))' "$file" > /dev/null
+
+      - name: Upload the separate tree-cancellation result
+        if: ${{ !cancelled() && steps.tree.outcome != 'skipped' && hashFiles('tree-results/provenance.txt') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mcp-tree-cancellation-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tree-results/
           if-no-files-found: error
           retention-days: 30
