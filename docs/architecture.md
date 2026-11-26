@@ -441,8 +441,9 @@ implement the Claude Code registration and health check:
   `notifications/initialized`, `tools/list`) against the registered command and args. The handshake
   spawns the child via D6's platform layer (Unix session/process group, Windows kill-on-close job)
   and caps each response line at 1 MiB, with spawn and exchange bounded by one deadline (10 seconds
-  by default) and cleanup bounded by a 2-second clean-exit grace plus `finish_reap`'s 2-second
-  reap limit so the child and its descendants are stopped. Output is text by default or
+  by default). Doctor ends the handshake by closing standard input and waiting briefly (up to 2
+  seconds, inside the same deadline) for the server to exit on its own before using D6's stop
+  signals and `finish_reap`'s 2-second reap limit so the child and its descendants are stopped. Output is text by default or
   schema-versioned JSON with `--json`, with each check reported as `ok`, `warn`, or `fail`; exit
   status is 0 when no check fails and 1 otherwise.
 

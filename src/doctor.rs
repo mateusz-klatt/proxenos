@@ -121,6 +121,19 @@ fn handshake_timeout() -> Duration {
     DEFAULT_HANDSHAKE_TIMEOUT
 }
 
+fn handshake_cleanup_error(
+    finish_status: io::Result<std::process::ExitStatus>,
+) -> Option<io::Error> {
+    #[cfg(feature = "test-tools")]
+    if std::env::var_os("PROXENOS_TEST_FAIL_HANDSHAKE_CLEANUP").is_some() {
+        return Some(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected handshake cleanup failure",
+        ));
+    }
+    finish_status.err()
+}
+
 fn read_json(path: &Path) -> Result<Value, String> {
     let bytes =
         fs::read(path).map_err(|err| format!("Could not read {}: {err}", path.display()))?;
@@ -547,17 +560,40 @@ async fn run_handshake(
         Err(_) => Err(HandshakeError::TimedOut(limit)),
     };
 
-    // Close pipes so a healthy server exits cleanly before finish() kills the group/job and reaps
-    // within its own 2-second bound.
+    // Close stdin first so a server that reacts to EOF exits cleanly before any signal is sent,
+    // bounded by both the 2-second clean-exit grace and the handshake deadline. Only if it does
+    // not exit on its own do we escalate through D6's stop (SIGTERM, grace, SIGKILL) and finish.
     drop(stdin);
+    let grace_deadline =
+        tokio_deadline.min(tokio::time::Instant::now() + HANDSHAKE_CLEAN_EXIT_GRACE);
+    let exited_cleanly = if tokio::time::Instant::now() < grace_deadline {
+        matches!(
+            tokio::time::timeout_at(grace_deadline, child.wait_for_exit()).await,
+            Ok(Ok(_))
+        )
+    } else {
+        false
+    };
     drop(reader);
-    if outcome.is_ok() {
-        let _ = tokio::time::timeout(HANDSHAKE_CLEAN_EXIT_GRACE, child.wait_for_exit()).await;
-    }
-    let _ = child.finish().await;
+    let stop_error = if exited_cleanly {
+        None
+    } else {
+        child.stop().await.err()
+    };
+    let (finish_status, _accounting) = child.finish().await;
     drain_stderr.abort();
+    let cleanup_error = handshake_cleanup_error(finish_status).or(stop_error);
 
-    outcome
+    match (outcome, cleanup_error) {
+        (Ok(info), None) => Ok(info),
+        (Ok(_), Some(error)) => Err(HandshakeError::Protocol(format!(
+            "MCP handshake cleanup failed ({error}); the server process may still be running."
+        ))),
+        (Err(error), None) => Err(error),
+        (Err(error), Some(cleanup)) => Err(HandshakeError::Protocol(format!(
+            "{error} Handshake cleanup also failed ({cleanup}); the server process may still be running."
+        ))),
+    }
 }
 
 async fn check_handshake(

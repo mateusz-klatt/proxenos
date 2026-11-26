@@ -1758,6 +1758,29 @@ mod with_stubs {
         Path::new(env!("CARGO_BIN_EXE_proxenos-stub"))
     }
 
+    /// Temporary directory outside `target/llvm-cov-target` for LLVM_PROFILE_FILE of children
+    /// that a test deliberately kills by signal, so a kill during profile startup or flush cannot
+    /// leave a corrupt `.profraw` in `cargo-llvm-cov`'s merge directory (especially on macOS).
+    struct KilledProfileDir(PathBuf);
+
+    impl KilledProfileDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("proxenos-killed-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn pattern(&self) -> PathBuf {
+            self.0.join("killed-%p.profraw")
+        }
+    }
+
+    impl Drop for KilledProfileDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn install_stub(dir: &Path, name: &str) {
         fs::create_dir_all(dir).unwrap();
         let dest = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
@@ -1965,6 +1988,34 @@ mod with_stubs {
             "{with_cli_report}"
         );
 
+        // 1c. After a successful tools/list, doctor closes stdin first and waits for a server
+        // that exits 0 on EOF without sending any signal. The stub keeps default signal handling,
+        // blocks on `stdin` until EOF, sleeps briefly, and creates a marker dir before exiting 0;
+        // any premature SIGTERM/SIGKILL/job termination would kill it before the marker exists.
+        let list_one =
+            json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"codex"}]}}).to_string();
+        let eof_marker = sb.root.join("exited-cleanly-on-eof");
+        set_stub_args(json!([
+            format!("out:{init_ok}"),
+            format!("out:{list_one}"),
+            "stdin",
+            "sleep:150",
+            format!("mkdir:{}", eof_marker.display()),
+            "exit:0"
+        ]));
+        let clean_out = sb.run(&["doctor", "--json"]);
+        let clean_report: Value = serde_json::from_slice(&clean_out.stdout).unwrap();
+        assert!(clean_out.status.success(), "{clean_report}");
+        assert_eq!(
+            find_check(&clean_report, "claude-code.handshake")["status"],
+            "ok",
+            "{clean_report}"
+        );
+        assert!(
+            eof_marker.is_dir(),
+            "server did not finish cleanly on stdin EOF without signal: {clean_report}"
+        );
+
         // 2. Closed stdout before answering (while stdin stays open).
         set_stub_args(json!(["close-output", "stdin"]));
         let eof_out = sb.run(&["doctor", "--json"]);
@@ -2045,6 +2096,7 @@ mod with_stubs {
         );
 
         // 6b. Hung server hits deadline and is killed and reaped.
+        let killed_prof = KilledProfileDir::new();
         let lock_file = sb.root.join("hung.lock");
         set_stub_args(json!([
             format!("hold:{}", lock_file.display()),
@@ -2052,7 +2104,11 @@ mod with_stubs {
         ]));
         let started = Instant::now();
         let mut cmd = sb.command(&["doctor", "--json"]);
-        cmd.env("PROXENOS_TEST_HANDSHAKE_TIMEOUT_MS", "250");
+        // Deliberately kills an instrumented child after a short deadline; redirect its profile
+        // outside target/llvm-cov-target so a kill during startup or exit flush cannot leave a
+        // corrupt .profraw on macOS. Doctor's timeout and stop paths remain covered by 6c below.
+        cmd.env("PROXENOS_TEST_HANDSHAKE_TIMEOUT_MS", "250")
+            .env("LLVM_PROFILE_FILE", killed_prof.pattern());
         let timed_out = cmd.output().unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -2077,9 +2133,11 @@ mod with_stubs {
 
         // 6c. Handshake spawns under D6 platform isolation so descendants (grandchild ignoring
         // SIGTERM on Unix / inside Job Object on Windows) are killed too when the deadline hits.
-        // The parent exits after waiting for `grandchild.lock.ready`, leaving only the silent
-        // grandchild holding stdout open until the deadline fires.
-        let gc_lock = sb.root.join("grandchild.lock");
+        // The parent exits cleanly after waiting for `grandchild.lock.ready`, leaving only the
+        // silent grandchild holding stdout open until the deadline fires. Placing `gc_lock` in
+        // `killed_prof` keeps the killed grandchild's `.profraw` outside `target/llvm-cov-target`
+        // while doctor and the cleanly-exiting parent still record coverage normally.
+        let gc_lock = killed_prof.0.join("grandchild.lock");
         set_stub_args(json!([
             format!("quiet-grandchild:{}", gc_lock.display()),
             "exit:0"
@@ -2103,7 +2161,7 @@ mod with_stubs {
             "{gc_report}"
         );
         assert!(
-            sb.root.join("grandchild.lock.ready").exists(),
+            killed_prof.0.join("grandchild.lock.ready").exists(),
             "grandchild never started: {gc_report}"
         );
         let gc_file = fs::File::options().write(true).open(&gc_lock).unwrap();
@@ -2114,6 +2172,44 @@ mod with_stubs {
                 "grandchild survived handshake cleanup: {gc_report}"
             );
             std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // 6d. Server that answers tools/list cleanly but ignores stdin EOF is bounded by the
+        // handshake deadline during the clean-exit wait and then stopped via D6 stop + finish.
+        let eof_hang_lock = sb.root.join("eof-hang.lock");
+        set_stub_args(json!([
+            format!("out:{init_ok}"),
+            format!("out:{list_one}"),
+            format!("hold:{}", eof_hang_lock.display()),
+            "sleep:60000"
+        ]));
+        let eof_hang_started = Instant::now();
+        let mut eof_hang_cmd = sb.command(&["doctor", "--json"]);
+        // Deliberately kills an instrumented child that ignores stdin EOF; keep its profile out
+        // of target/llvm-cov-target for the same reason as 6b.
+        eof_hang_cmd
+            .env("PROXENOS_TEST_HANDSHAKE_TIMEOUT_MS", "400")
+            .env("LLVM_PROFILE_FILE", killed_prof.pattern());
+        let eof_hang_out = eof_hang_cmd.output().unwrap();
+        assert!(
+            eof_hang_started.elapsed() < Duration::from_secs(10),
+            "doctor waited indefinitely on server ignoring EOF: {:?}",
+            eof_hang_started.elapsed()
+        );
+        let eof_hang_report: Value = serde_json::from_slice(&eof_hang_out.stdout).unwrap();
+        assert!(eof_hang_out.status.success(), "{eof_hang_report}");
+        assert_eq!(
+            find_check(&eof_hang_report, "claude-code.handshake")["status"],
+            "ok",
+            "{eof_hang_report}"
+        );
+        if eof_hang_lock.exists() {
+            let file = fs::File::options()
+                .write(true)
+                .open(&eof_hang_lock)
+                .unwrap();
+            file.try_lock()
+                .expect("server ignoring EOF was stopped and released its lock");
         }
 
         // 7. Response line larger than 1 MiB fails handshake cleanly.
@@ -2127,6 +2223,50 @@ mod with_stubs {
                 .unwrap()
                 .contains("exceeded 1048576 bytes"),
             "{flood_report}"
+        );
+
+        // 8a. Cleanup failure after a valid exchange turns the handshake into a failure.
+        set_stub_args(json!([
+            format!("out:{init_ok}"),
+            format!("out:{list_one}"),
+            "stdin"
+        ]));
+        let mut cleanup_ok_cmd = sb.command(&["doctor", "--json"]);
+        cleanup_ok_cmd.env("PROXENOS_TEST_FAIL_HANDSHAKE_CLEANUP", "1");
+        let cleanup_ok_out = cleanup_ok_cmd.output().unwrap();
+        let cleanup_ok_report: Value = serde_json::from_slice(&cleanup_ok_out.stdout).unwrap();
+        assert_eq!(cleanup_ok_out.status.code(), Some(1), "{cleanup_ok_report}");
+        assert_eq!(cleanup_ok_report["ok"], false, "{cleanup_ok_report}");
+        let cleanup_ok_hs = find_check(&cleanup_ok_report, "claude-code.handshake");
+        assert_eq!(cleanup_ok_hs["status"], "fail", "{cleanup_ok_report}");
+        let cleanup_ok_msg = cleanup_ok_hs["message"].as_str().unwrap();
+        assert!(
+            cleanup_ok_msg.contains("cleanup failed")
+                && cleanup_ok_msg.contains("may still be running"),
+            "{cleanup_ok_report}"
+        );
+
+        // 8b. Cleanup failure after an already-failed exchange preserves the original error and
+        // appends the cleanup failure.
+        set_stub_args(json!(["out:not-json", "stdin"]));
+        let mut cleanup_err_cmd = sb.command(&["doctor", "--json"]);
+        cleanup_err_cmd.env("PROXENOS_TEST_FAIL_HANDSHAKE_CLEANUP", "1");
+        let cleanup_err_out = cleanup_err_cmd.output().unwrap();
+        let cleanup_err_report: Value = serde_json::from_slice(&cleanup_err_out.stdout).unwrap();
+        assert_eq!(
+            cleanup_err_out.status.code(),
+            Some(1),
+            "{cleanup_err_report}"
+        );
+        assert_eq!(cleanup_err_report["ok"], false, "{cleanup_err_report}");
+        let cleanup_err_hs = find_check(&cleanup_err_report, "claude-code.handshake");
+        assert_eq!(cleanup_err_hs["status"], "fail", "{cleanup_err_report}");
+        let cleanup_err_msg = cleanup_err_hs["message"].as_str().unwrap();
+        assert!(
+            cleanup_err_msg.contains("invalid JSON")
+                && cleanup_err_msg.contains("cleanup also failed")
+                && cleanup_err_msg.contains("may still be running"),
+            "{cleanup_err_report}"
         );
     }
 

@@ -237,6 +237,9 @@ fn hold_lock(path: &str) -> io::Result<()> {
 /// to this instance: its lock survives until this process exits, including death by signal.
 fn grandchild(path: &str, announce: bool) -> io::Result<Command> {
     let mut copy = Command::new(std::env::current_exe()?);
+    // Grandchildren are deliberately killed by signal and never exit cleanly; keep any
+    // continuous-mode .profraw out of cargo-llvm-cov's target directory.
+    copy.env("LLVM_PROFILE_FILE", format!("{path}.killed-%p.profraw"));
     #[cfg(unix)]
     copy.arg("ignore-term");
     if announce {
