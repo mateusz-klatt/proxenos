@@ -1176,6 +1176,7 @@ fn doctor_json_shape_and_real_binary_handshake_and_usage_errors() {
             "cli.codex",
             "cli.antigravity",
             "cli.kimi",
+            "cli.claude",
             "claude-code.handshake"
         ]
     );
@@ -2327,6 +2328,12 @@ mod with_stubs {
             json!({"stdout": "2.8.0\n"}).to_string(),
         )
         .unwrap();
+        install_stub(&bin_dir, "claude");
+        fs::write(
+            sb.root.join("claude.version"),
+            json!({"stdout": "2.1.332 (Claude Code)\n"}).to_string(),
+        )
+        .unwrap();
         fs::write(
             sb.root.join("codex.version"),
             json!({"stdout": "codex 0.50.0\n"}).to_string(),
@@ -2365,6 +2372,10 @@ mod with_stubs {
         assert_eq!(
             find_check(&report, "cli.kimi")["details"]["version"],
             "2.8.0"
+        );
+        assert_eq!(
+            find_check(&report, "cli.claude")["details"]["version"],
+            "2.1.332 (Claude Code)"
         );
         let tools: Vec<&str> = find_check(&report, "claude-code.handshake")["details"]["tools"]
             .as_array()
