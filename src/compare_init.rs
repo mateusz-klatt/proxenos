@@ -432,8 +432,12 @@ mod windows_tests {
     }
 
     #[test]
-    fn a_missing_or_different_alias_preserves_the_fingerprinted_entry() {
+    fn node_uses_the_ordinary_entry_only_when_it_resolves_to_the_fingerprinted_file() {
         let file = env::current_exe().unwrap().canonicalize().unwrap();
+        let ordinary = ordinary_windows_path(&file);
+        assert_ne!(ordinary, file);
+        assert_eq!(verified_node_entry(&file, ordinary.clone()), ordinary);
+
         let directory = file.parent().unwrap();
         for alias in [
             directory.to_owned(),
