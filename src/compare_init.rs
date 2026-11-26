@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -25,18 +25,23 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Serialize)]
 struct Artifact {
+    #[serde(serialize_with = "display_path")]
     path: PathBuf,
     sha256: String,
+}
+
+fn display_path<S: Serializer>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    serializer.collect_str(&path.display())
 }
 
 impl Artifact {
     fn open(path: &Path) -> io::Result<Self> {
         let path = path.canonicalize()?;
-        if path.to_str().is_none() {
-            return Err(io::Error::other("artifact path cannot be recorded as UTF-8"));
-        }
         if !path.is_file() {
-            return Err(io::Error::other(format!("expected a file: {}", path.display())));
+            return Err(io::Error::other(format!(
+                "expected a file: {}",
+                path.display()
+            )));
         }
         let mut file = io::BufReader::new(File::open(&path)?);
         let mut hash = Sha256::new();
@@ -82,7 +87,9 @@ impl Inputs {
         let root = Path::new(root);
         let package = Artifact::open(&root.join("package.json"))?;
         let metadata: Value = serde_json::from_reader(File::open(&package.path)?)?;
-        let version = metadata["version"].as_str().filter(|v| !v.is_empty())
+        let version = metadata["version"]
+            .as_str()
+            .filter(|v| !v.is_empty())
             .ok_or("baseline package.json needs a version")?;
         Ok(Self {
             proxenos: Artifact::open(Path::new(proxenos))?,
@@ -101,7 +108,9 @@ struct Profile(PathBuf);
 impl Profile {
     fn new(stub: &Path) -> Result<Self> {
         // Put the stub on the same executable filesystem without copying it into every trial.
-        let root = stub.parent().expect("canonical file has a parent")
+        let root = stub
+            .parent()
+            .expect("canonical file has a parent")
             .join(format!("proxenos-bench-{}", Uuid::new_v4()));
         fs::create_dir(&root)?;
         let profile = Self(root);
@@ -112,15 +121,27 @@ impl Profile {
     }
 
     fn configure(&self, cmd: &mut Command) {
-        cmd.env_clear().current_dir(&self.0).env("PATH", self.0.join("bin"));
-        for key in ["HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "TMPDIR", "TEMP", "TMP", "PROXENOS_STUB_DIR"] {
+        cmd.env_clear()
+            .current_dir(&self.0)
+            .env("PATH", self.0.join("bin"));
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "PROXENOS_STUB_DIR",
+        ] {
             cmd.env(key, &self.0);
         }
         #[cfg(windows)]
-        if let Some(system_root) = env::var_os("SystemRoot") {
-            cmd.env("SystemRoot", system_root);
-        }
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+        cmd.envs(env::var_os("SystemRoot").map(|value| ("SystemRoot", value)));
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
     }
 }
 
@@ -161,18 +182,28 @@ struct Observation {
     server_version: String,
 }
 
-async fn exchange(child: &mut Child, start: Instant, target: Target) -> Result<Observation> {
-    let mut input = child.stdin.take().expect("piped stdin");
-    let output = child.stdout.take().expect("piped stdout");
-    let init = json!({
+fn initialize_request() -> String {
+    let request = json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
             "protocolVersion": REVISION, "capabilities": {},
             "clientInfo": {"name": "proxenos-comparison", "version": "1"}
         }
     });
-    input.write_all(format!("{init}\n").as_bytes()).await?;
-    let mut stream = BufReader::new(output.take(MAX_RESPONSE));
+    format!("{request}\n")
+}
+
+async fn exchange(
+    child: &mut Child,
+    start: Instant,
+    target: Target,
+    baseline_version: &str,
+    request: &str,
+) -> Result<Observation> {
+    let mut input = child.stdin.take().expect("piped stdin");
+    let output = child.stdout.take().expect("piped stdout");
+    input.write_all(request.as_bytes()).await?;
+    let mut stream = BufReader::new(output).take(MAX_RESPONSE);
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -189,35 +220,62 @@ async fn exchange(child: &mut Child, start: Instant, target: Target) -> Result<O
             continue;
         }
         let result = &msg["result"];
-        if msg["id"] != 1 || msg.get("error").is_some() || result["protocolVersion"] != REVISION
+        if msg["id"] != 1
+            || msg.get("error").is_some()
+            || result["protocolVersion"] != REVISION
             || !result["capabilities"]["tools"].is_object()
         {
-            return Err("invalid initialize response, protocol revision, or tools capability".into());
+            return Err(
+                "invalid initialize response, protocol revision, or tools capability".into(),
+            );
         }
         let info = &result["serverInfo"];
-        let name = info["name"].as_str().filter(|v| !v.is_empty()).ok_or("missing server name")?;
-        let version = info["version"].as_str().filter(|v| !v.is_empty()).ok_or("missing server version")?;
-        if target == Target::Proxenos && name != "proxenos" {
-            return Err("unexpected Proxenos server name".into());
+        let name = info["name"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or("missing server name")?;
+        let version = info["version"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or("missing server version")?;
+        let matches_target = match target {
+            Target::Proxenos => name == "proxenos",
+            Target::ClaudeDelegator => {
+                name == "claude-delegator-codex" && version == baseline_version
+            }
+        };
+        if !matches_target {
+            return Err("initialize response does not match the selected server".into());
         }
-        input.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await?;
+        input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await?;
         drop(input);
         // Drain anything emitted at shutdown so a write cannot block exit.
-        tokio::io::copy(&mut stream, &mut tokio::io::sink()).await?;
+        tokio::io::copy(&mut stream.into_inner(), &mut tokio::io::sink()).await?;
         if !child.wait().await?.success() {
             return Err("server exited unsuccessfully".into());
         }
-        return Ok(Observation { latency_ms, server_name: name.into(), server_version: version.into() });
+        return Ok(Observation {
+            latency_ms,
+            server_name: name.into(),
+            server_version: version.into(),
+        });
     }
 }
 
-async fn measure(inputs: &Inputs, target: Target) -> Result<Observation> {
+async fn measure(inputs: &Inputs, target: Target, request: &str) -> Result<Observation> {
     let profile = Profile::new(&inputs.stub.path)?;
     let mut cmd = target.command(inputs);
     profile.configure(&mut cmd);
     let start = Instant::now();
     let mut child = cmd.spawn()?;
-    let result = match timeout(LIMIT, exchange(&mut child, start, target)).await {
+    let result = match timeout(
+        LIMIT,
+        exchange(&mut child, start, target, &inputs.baseline_version, request),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => Err("timed out during initialization or shutdown".into()),
     };
@@ -238,9 +296,15 @@ struct Trial {
 }
 
 fn summary(trials: &[Trial], target: Target) -> Value {
-    let selected: Vec<_> = trials.iter().filter(|trial| trial.target == target).collect();
-    let mut times: Vec<_> = selected.iter().filter_map(|trial| trial.observation.as_ref())
-        .map(|sample| sample.latency_ms).collect();
+    let selected: Vec<_> = trials
+        .iter()
+        .filter(|trial| trial.target == target)
+        .collect();
+    let mut times: Vec<_> = selected
+        .iter()
+        .filter_map(|trial| trial.observation.as_ref())
+        .map(|sample| sample.latency_ms)
+        .collect();
     times.sort_unstable_by(f64::total_cmp);
     let n = times.len();
     let median = (n > 0).then(|| (times[(n - 1) / 2] + times[n / 2]) / 2.0);
@@ -249,6 +313,7 @@ fn summary(trials: &[Trial], target: Target) -> Value {
 
 async fn run() -> Result<ExitCode> {
     let inputs = Inputs::parse()?;
+    let request = initialize_request();
     let mut trials = Vec::new();
     for pair in 0..inputs.pairs {
         let mut order = [Target::Proxenos, Target::ClaudeDelegator];
@@ -256,11 +321,17 @@ async fn run() -> Result<ExitCode> {
             order.reverse();
         }
         for (position, target) in order.into_iter().enumerate() {
-            let (observation, error) = match measure(&inputs, target).await {
+            let (observation, error) = match measure(&inputs, target, &request).await {
                 Ok(observed) => (Some(observed), None),
                 Err(error) => (None, Some(error.to_string())),
             };
-            trials.push(Trial { pair: pair + 1, position: position + 1, target, observation, error });
+            trials.push(Trial {
+                pair: pair + 1,
+                position: position + 1,
+                target,
+                observation,
+                error,
+            });
         }
     }
     let all_ok = trials.iter().all(|trial| trial.error.is_none());
@@ -274,7 +345,11 @@ async fn run() -> Result<ExitCode> {
     let mut out = io::stdout().lock();
     serde_json::to_writer_pretty(&mut out, &report)?;
     writeln!(out)?;
-    Ok(if all_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+    Ok(if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 #[tokio::main(flavor = "current_thread")]
