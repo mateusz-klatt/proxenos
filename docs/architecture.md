@@ -389,8 +389,14 @@ implement the Claude Code registration and health check:
     `argv[0]` or a matching executable `PATH` entry, falling back to `current_exe()` without
     resolving links and normalizing Windows `\\?\` drive and `\\?\UNC\` prefixes) and `args` set to
     `["mcp", "--client", "claude"]`.
-- **Claude Code settings.** In `<HOME>/.claude/settings.json` (`%USERPROFILE%\.claude\settings.json`
-  on Windows), Proxenos writes `extraKnownMarketplaces.proxenos` (with
+- **Claude Code settings.** When `CLAUDE_CONFIG_DIR` is set in the process environment and
+  non-empty, Proxenos requires it to be an absolute path without `..` components (refusing relative
+  paths or `..` rather than silently falling back) and uses `<CLAUDE_CONFIG_DIR>/settings.json`
+  directly, matching Claude Code's documented user configuration directory. When `CLAUDE_CONFIG_DIR`
+  is unset or empty, Proxenos uses `<HOME>/.claude/settings.json`
+  (`%USERPROFILE%\.claude\settings.json` on Windows). Both `integrate` (including `--remove`) and
+  `doctor` apply the same rule. In that `settings.json`, Proxenos writes
+  `extraKnownMarketplaces.proxenos` (with
   `source: { source: "directory", path: "<marketplace_dir>" }`) and
   `enabledPlugins."proxenos@proxenos": true`, preserving all unrelated keys and key ordering (via
   `serde_json`'s pure-Rust `preserve_order` feature) and preserving an existing file's Unix
@@ -407,10 +413,17 @@ implement the Claude Code registration and health check:
   (`settings_is_symlink` and `settings_symlink_target`), the optional `backup_path`, the optional
   `settings_written_sha256`, the exact JSON values written under `entries`, the generated `files`,
   and the `created_dirs` list in creation order.
-  - Before writing marketplace files or `settings.json`, `integrate` writes `manifest.json` with
-    `pending: true`, then writes the plugin files and `settings.json`, and finally commits
-    `manifest.json` with `pending: false`. Both `--remove` and a later `integrate` treat a `pending`
-    manifest as ours so an interrupted write never strands entries as foreign.
+  - After ensuring only `<state_dir>/integrate` exists to hold the manifest, `integrate` records
+    every directory about to be created (`<state_dir>/integrate`, the settings parent directory, the
+    marketplace tree, and `backups` when a backup is needed) in `created_dirs` and writes
+    `manifest.json` with `pending: true` before taking any backup, creating the settings or
+    marketplace directories, or writing plugin files or `settings.json`. It then takes the backup
+    (if needed), creates the planned directories, writes the plugin files and `settings.json`, and
+    finally commits `manifest.json` with `pending: false`. A failure during the pending manifest
+    write therefore leaves no backup, settings directory, or marketplace directory behind, and a
+    failure afterwards leaves every planned directory owned by the pending manifest so both
+    `--remove` and a later `integrate` recover cleanly without stranding entries or directories as
+    foreign.
   - Re-running `integrate claude-code` is idempotent and updates `.mcp.json` and `binary_path` when
     the binary moves, keeping the original backup and creation flags. If a rerun rewrites
     `settings.json` (for example to heal a deleted managed entry), byte-exact restore eligibility
@@ -420,8 +433,10 @@ implement the Claude Code registration and health check:
     without a matching manifest record, or if `<state_dir>/claude-marketplace` already exists and is
     not recorded as ours, `integrate` refuses with exit code 1 and changes nothing. It also refuses
     to overwrite an entry the user edited after `integrate`, and both rerun and `--remove` refuse
-    without modifying anything if `settings.json` now resolves to a different symlink target than
-    the one recorded at integrate time.
+    with exit code 1 without modifying anything if the current resolved settings path differs from
+    `settings_path` recorded in the manifest (for example when `HOME`, `USERPROFILE`, or
+    `CLAUDE_CONFIG_DIR` changes under the same `<state_dir>`), or if `settings.json` now resolves
+    to a different symlink target than the one recorded at integrate time.
   - `integrate claude-code --remove` restores the original backup bytes verbatim only when
     `settings.json` is still byte-for-byte identical to what the backup-taking `integrate` wrote
     (matching `settings_written_sha256` in the manifest) and a backup exists; otherwise it edits
@@ -435,8 +450,11 @@ implement the Claude Code registration and health check:
 - **`proxenos doctor [--json]`.** Reads back the Claude Code registration (`settings.json` through
   `marketplace.json`, `plugin.json` and `.mcp.json`), fails if the registered executable does not
   exist, and warns if an executable `proxenos` on `PATH` resolves to a different binary (each
-  hinting to re-run `proxenos integrate claude-code`); checks that `<state_dir>` has private
-  (`0700`-compatible) permissions on Unix (or exists on Windows); inspects each provider CLI using
+  hinting to re-run `proxenos integrate claude-code`); checks `<state_dir>` with the same
+  `state::is_private_dir` predicate as D19 (via `fs::symlink_metadata`: a real directory and not a
+  symlink, owned by the current effective UID with exact mode `0700` on Unix; a real directory and
+  not a reparse point on Windows), warning when it does not exist yet and failing otherwise;
+  inspects each provider CLI using
   D7 discovery and reports its version; and runs an MCP stdio handshake (`initialize`,
   `notifications/initialized`, `tools/list`) against the registered command and args. The handshake
   spawns the child via D6's platform layer (Unix session/process group, Windows kill-on-close job)
@@ -451,6 +469,8 @@ What this cannot do:
 
 - Claude Code reads `settings.json` and local marketplace plugins only when it starts; running
   `integrate` or `--remove` does not reload a Claude Code session that is already open.
+- Proxenos reads `CLAUDE_CONFIG_DIR` from the process environment only, not from an `env` block
+  inside another Claude Code settings file (such as user or managed settings).
 - Claude Code can rewrite `settings.json` during a session, so Proxenos's read-modify-rename can
   lose a change Claude Code made concurrently; Proxenos does not lock `settings.json`, because Claude
   Code would not honour our lock.

@@ -16,10 +16,14 @@ const STATE_DIR_ERROR: &str = if cfg!(windows) {
     "Neither XDG_STATE_HOME nor HOME is set to an absolute path."
 };
 
+fn is_clean_absolute(path: &Path) -> bool {
+    path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
+}
+
 fn absolute_env(key: &str) -> Option<PathBuf> {
-    env::var_os(key).map(PathBuf::from).filter(|path| {
-        path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
-    })
+    env::var_os(key)
+        .map(PathBuf::from)
+        .filter(|path| is_clean_absolute(path))
 }
 
 pub fn home_dir() -> Result<PathBuf, String> {
@@ -44,7 +48,22 @@ pub fn require_state_dir() -> Result<PathBuf, String> {
     state_dir().ok_or_else(|| STATE_DIR_ERROR.to_owned())
 }
 
+/// Returns Claude Code's user `settings.json` path (D10).
+///
+/// Honours `CLAUDE_CONFIG_DIR` when set and non-empty (`<CLAUDE_CONFIG_DIR>/settings.json`),
+/// refusing relative paths or `..` components. Otherwise defaults to `<HOME>/.claude/settings.json`
+/// (`%USERPROFILE%\.claude\settings.json` on Windows).
 pub fn claude_settings_path() -> Result<PathBuf, String> {
+    if let Some(raw) = env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
+        let dir = PathBuf::from(raw);
+        if !is_clean_absolute(&dir) {
+            return Err(
+                "CLAUDE_CONFIG_DIR is not set to an absolute path without `..` components."
+                    .to_owned(),
+            );
+        }
+        return Ok(dir.join("settings.json"));
+    }
     Ok(home_dir()?.join(".claude").join("settings.json"))
 }
 
@@ -172,6 +191,26 @@ pub fn file_mode(_metadata: &fs::Metadata) -> Option<u32> {
     None
 }
 
+/// Checks whether `meta` (obtained via `fs::symlink_metadata`) describes a real, private
+/// directory per D19: a real directory (not a symlink) owned by the current effective UID with
+/// exact mode `0700` on Unix, or a real directory without `FILE_ATTRIBUTE_REPARSE_POINT` on
+/// Windows.
+pub fn is_private_dir(meta: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.file_type().is_dir()
+            && meta.uid() == crate::platform::current_uid()
+            && (meta.mode() & 0o777) == 0o700
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        meta.file_type().is_dir() && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+    }
+}
+
 /// Creates a single directory with owner-only permissions (0700) on Unix.
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
     let builder = &mut fs::DirBuilder::new();
@@ -180,38 +219,58 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
-/// Ensures `target` exists under `root`, creating missing components from `root` downward
-/// with owner-only permissions on Unix and recording every newly created directory in `created`.
-///
-/// Missing ancestors above `root` (such as `~/.local/state`) are created with default
-/// permissions and are not recorded in `created`, because Proxenos does not own them.
-pub fn ensure_private_dir_tree(
+/// Records every directory from `root` downward to `target` that does not currently exist, in
+/// creation order, without creating any directory on disk.
+pub fn plan_private_dir_tree(
     root: &Path,
     target: &Path,
-    created: &mut Vec<String>,
+    planned: &mut Vec<String>,
 ) -> io::Result<()> {
-    let parent = root.parent().expect("root directory has a parent");
-    fs::create_dir_all(parent)?;
     let rel = target.strip_prefix(root).expect("target is under root");
     let mut current = root.to_path_buf();
-    ensure_one_private_dir(&current, created)?;
+    record_missing_dir(&current, planned)?;
     for component in rel.components() {
         current.push(component);
-        ensure_one_private_dir(&current, created)?;
+        record_missing_dir(&current, planned)?;
     }
     Ok(())
 }
 
-fn ensure_one_private_dir(dir: &Path, created: &mut Vec<String>) -> io::Result<()> {
+fn record_missing_dir(dir: &Path, planned: &mut Vec<String>) -> io::Result<()> {
+    if !dir.is_dir() {
+        let path = path_string(dir)?;
+        if !planned.contains(&path) {
+            planned.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Ensures `target` exists under `root`, creating missing components from `root` downward
+/// with owner-only permissions on Unix.
+///
+/// Missing ancestors above `root` (such as `~/.local/state`) are created with default
+/// permissions, because Proxenos does not own them.
+pub fn ensure_private_dir_tree(root: &Path, target: &Path) -> io::Result<()> {
+    if !root.is_dir() {
+        let parent = root.parent().expect("root directory has a parent");
+        fs::create_dir_all(parent)?;
+    }
+    let rel = target.strip_prefix(root).expect("target is under root");
+    let mut current = root.to_path_buf();
+    ensure_one_private_dir(&current)?;
+    for component in rel.components() {
+        current.push(component);
+        ensure_one_private_dir(&current)?;
+    }
+    Ok(())
+}
+
+fn ensure_one_private_dir(dir: &Path) -> io::Result<()> {
     if dir.is_dir() {
         return Ok(());
     }
-    create_private_dir(dir)?;
-    let path = path_string(dir)?;
-    if !created.contains(&path) {
-        created.push(path);
-    }
-    Ok(())
+    create_private_dir(dir)
 }
 
 /// Atomically writes `content` to `path` via a unique temporary file in the same directory.
