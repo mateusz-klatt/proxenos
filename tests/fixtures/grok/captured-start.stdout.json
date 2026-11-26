@@ -1,0 +1,25 @@
+{
+  "text": "Proxenos fixture answer 1.",
+  "stopReason": "end_turn",
+  "sessionId": "01a21907-cf8c-7550-ad5c-dadebae7ae4b",
+  "requestId": "302d2fea-4cf2-4cac-89fa-77534a0503c2",
+  "cwd": "/tmp/proxenos-grok.vmysowq_/cwd",
+  "usage": {
+    "input_tokens": 10,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 2,
+    "reasoning_tokens": 0,
+    "total_tokens": 12
+  },
+  "num_turns": 1,
+  "modelUsage": {
+    "proxenos-local": {
+      "inputTokens": 10,
+      "outputTokens": 2,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "modelCalls": 1
+    }
+  }
+}

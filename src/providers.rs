@@ -5,6 +5,7 @@ mod antigravity;
 mod claude;
 mod codex;
 mod copilot;
+mod grok;
 mod kimi;
 
 use std::ffi::OsString;
@@ -23,6 +24,7 @@ pub const ALL: &[Provider] = &[
     kimi::SPEC,
     claude::SPEC,
     copilot::SPEC,
+    grok::SPEC,
 ];
 pub const DEFAULT_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_MODEL_LEN: usize = 256;
@@ -70,6 +72,14 @@ pub struct RememberedStart {
 
 fn is_canonical_uuid(id: &str) -> bool {
     uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
+}
+
+fn token_usage(value: &Value, fields: &[&str]) -> Option<Value> {
+    let counts: Map<String, Value> = fields
+        .iter()
+        .filter_map(|&field| Some((field.to_owned(), Value::from(value[field].as_u64()?))))
+        .collect();
+    (!counts.is_empty()).then_some(Value::Object(counts))
 }
 
 /// Validates a model name from either a caller or untrusted provider output.

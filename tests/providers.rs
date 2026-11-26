@@ -19,6 +19,8 @@ mod content;
 mod copilot;
 #[path = "mcp/discovery.rs"]
 mod discovery;
+#[path = "mcp/grok.rs"]
+mod grok;
 #[path = "mcp/kimi.rs"]
 mod kimi;
 mod provider_support;

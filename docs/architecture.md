@@ -6,7 +6,7 @@ changes it. [ADR 001](adr/001-decisions-by-the-families-that-can-answer.md) says
 taken, and [votes.md](votes.md) records who proposed and who supported each one.
 
 **Status: milestone 1 in progress.** `proxenos mcp --client <client>` serves the MCP layer of D4.
-Codex, Antigravity, Kimi, Claude Code and GitHub Copilot CLI run through the D6 supervisor with D17 background delegations (`wait: false`,
+Codex, Antigravity, Kimi, Claude Code, GitHub Copilot CLI and Grok Build run through the D6 supervisor with D17 background delegations (`wait: false`,
 `await`, `cancel`, at most 3 concurrent delegations), D18 resource accounting and optional memory
 limits, and D19 persisted session settings files. Behavioural tests install the crate’s stub
 in a private search path.
@@ -375,6 +375,16 @@ apply. The adapter offers no read-only mode because we have not verified restric
 all Copilot tools. The CLI also accepts names and prefixes in its resume option; checking the
 returned UUID can detect a different session only after the CLI runs. The capture method and its limits are recorded with the
 [Copilot fixtures](../tests/fixtures/copilot/README.md).
+
+Grok Build 1.0.92 completed a Linux headless start and an explicit UUID resume using its
+documented custom-model configuration and an isolated local endpoint. Its single JSON result
+must report `stopReason: "end_turn"`, a positive turn count, a canonical session ID, nonblank
+answer text and a successful process exit. The ID on reply must match the requested ID.
+Grok also accepts titles on resume; the return check happens after the CLI runs.
+Proxenos exposes per-invocation token counters and a model only when one model-usage entry
+reports a positive call count. The adapter passes full access through `--always-approve`;
+enforcement of read-only access across Grok tools is unverified. The
+[Grok fixtures](../tests/fixtures/grok/README.md) record the local measurement and its limits.
 
 ### D6. Children are supervised to the end
 
