@@ -1,4 +1,4 @@
-name: Benchmark MCP initialization
+name: Benchmark MCP servers
 
 on:
   pull_request:
@@ -7,12 +7,19 @@ on:
       - '.github/workflows/benchmark-initialize.yml'
       - 'src/compare_init.rs'
   workflow_dispatch:
+    inputs:
+      measurement:
+        description: Measurement to run
+        type: choice
+        options: [initialize, provider-scenarios, both]
+        default: initialize
 
 permissions:
   contents: read
 
 jobs:
   initialize:
+    if: ${{ github.event_name == 'pull_request' || inputs.measurement != 'provider-scenarios' }}
     name: MCP initialize (20 pairs)
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -100,6 +107,133 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-initialize-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/
+          if-no-files-found: error
+          retention-days: 30
+
+  provider-scenarios:
+    name: Stubbed Codex and Antigravity scenarios
+    if: ${{ github.event_name == 'pull_request' || inputs.measurement != 'initialize' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      PROXENOS_SHA: 651991f217bb57463a6375bcea18bf12d184880e
+      HARNESS_SHA: 7ea45c7230ca1d3fb27e5bac37492785c518f31d
+      BASELINE_SHA: cd4eb9ec6b08bc065884be893ae4bf55367ae9fe
+
+    steps:
+      - name: Check out the measured server and stub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mateusz-klatt/proxenos
+          ref: ${{ env.PROXENOS_SHA }}
+          path: proxenos
+          persist-credentials: false
+
+      - name: Check out the published comparison harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mateusz-klatt/proxenos
+          ref: ${{ env.HARNESS_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Check out claude-delegator v3.5.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mateusz-klatt/claude-delegator
+          ref: ${{ env.BASELINE_SHA }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Install the baseline runtime dependencies
+        working-directory: baseline
+        run: |
+          node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 12)) throw Error("Node 22.12 or later required");'
+          npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+
+      - name: Build the release server and shared provider stub
+        working-directory: proxenos
+        run: |
+          cargo build --locked --release --bin proxenos
+          cargo build --locked --release --features test-tools --bin proxenos-stub
+
+      - name: Build the comparison harness separately
+        working-directory: harness
+        run: |
+          cargo build --locked --release --features test-tools --example comparison --target-dir "$RUNNER_TEMP/comparison-target"
+
+      - name: Identify the runner and all measured programs
+        working-directory: proxenos
+        env:
+          WORKFLOW_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROXENOS_SHA"
+          test "$(git -C ../baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test "$(git -C ../harness rev-parse HEAD)" = "$HARNESS_SHA"
+          mkdir ../results
+          {
+            printf 'Run %s/%s/actions/runs/%s (attempt %s)\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'Workflow head %s\nProxenos and stub %s\nComparison harness %s\nclaude-delegator %s\n' "$WORKFLOW_HEAD" "$PROXENOS_SHA" "$HARNESS_SHA" "$BASELINE_SHA"
+            printf 'Runner image %s %s\n' "$ImageOS" "$ImageVersion"
+            cat /etc/os-release
+            uname -srmo
+            lscpu
+            rustc -Vv
+            cargo -Vv
+            printf 'Node %s at %s\nnpm %s\n' "$(node --version)" "$(realpath "$(command -v node)")" "$(npm --version)"
+            sha256sum Cargo.lock ../harness/Cargo.lock ../baseline/package-lock.json ../baseline/package.json \
+              ../baseline/server/{codex,agy}/index.js target/release/{proxenos,proxenos-stub} \
+              "$(realpath "$(command -v node)")" "$RUNNER_TEMP/comparison-target/release/examples/comparison"
+          } > ../results/provenance.txt
+
+      - name: Measure four scenarios with the shared stub
+        working-directory: proxenos
+        run: |
+          "$RUNNER_TEMP/comparison-target/release/examples/comparison" \
+            --proxenos-bin target/release/proxenos --stub-bin target/release/proxenos-stub \
+            --delegator-dir ../baseline --node-bin "$(command -v node)" \
+            --scenarios a,c,f,g --runs 10 --concurrency 4 --out-dir "$RUNNER_TEMP/comparison-output"
+          # Retain every raw scenario trial. The historical report also contains a static feature table.
+          jq '{schema_version, metadata, part1}' "$RUNNER_TEMP"/comparison-output/part1-*.json > ../results/scenarios.json
+
+      - name: Report exact-answer, cleanup, error and reply counts
+        run: |
+          jq -e '(.metadata.mode == "part1-stubbed") and (.metadata.delegator_version == "3.5.0")
+            and (.part1 | [.scenario_a_advisory, .scenario_c_cancel, .scenario_f_failures, .scenario_g_reply]
+              | (map(length) == [4,4,16,4]) and all(.[][]; .trials | length == 10))' results/scenarios.json > /dev/null
+          {
+            echo '## Codex and Antigravity using the shared stub'
+            echo
+            echo '10 trials per target and case, in fixed target order. Foreground call timing begins after initialize and tools/list.'
+            echo
+            echo '| Server | Provider | Fixed answer intact / 10 | Foreground median (ms, all trials) |'
+            echo '| --- | --- | ---: | ---: |'
+            jq -r '.part1.scenario_a_advisory[] | "| \(.target.server) | \(.target.provider) | \(.intact_count) | \(.wall_ms.median) |"' results/scenarios.json
+            echo
+            echo '| Server | Provider | Both processes observed before cancel / 10 | CLI absent at final check / 10 | Grandchild absent at final check / 10 |'
+            echo '| --- | --- | ---: | ---: | ---: |'
+            jq -r '.part1.scenario_c_cancel[] | "| \(.target.server) | \(.target.provider) | \(.pre_verified_count) | \(.cli_gone_10s_count) | \(.gc_gone_10s_count) |"' results/scenarios.json
+            echo
+            echo '| Server | Provider | Injected case | Flagged as error / 10 | Recorded channel (first trial) |'
+            echo '| --- | --- | --- | ---: | --- |'
+            jq -r '.part1.scenario_f_failures[] | "| \(.target.server) | \(.target.provider) | \(.case) | \(.is_error_count) | \(.channel_sample) |"' results/scenarios.json
+            echo
+            echo '| Server | Provider | Bare reply with no RPC/tool error / 10 | Model carried / 10 | Working directory carried / 10 |'
+            echo '| --- | --- | ---: | ---: | ---: |'
+            jq -r '.part1.scenario_g_reply[] | "| \(.target.server) | \(.target.provider) | \(.bare_reply_succeeded_count) | \(.model_carried_count) | \(.cwd_carried_count) |"' results/scenarios.json
+            echo
+            echo 'Cancellation checks target 2 s and 10 s and can run later while waiting for a response. Injected errors and reply outcomes have different criteria; the artifact retains each recorded field.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scenario trials and provenance
+        if: ${{ !cancelled() && hashFiles('results/provenance.txt') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mcp-provider-scenarios-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: results/
           if-no-files-found: error
           retention-days: 30
