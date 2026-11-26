@@ -307,6 +307,7 @@ impl Registry {
             }
             if (finished.code != Some(0) || !result.report.completed)
                 && !finished.stderr.bytes.is_empty()
+                && result.report.diagnostic.is_none()
             {
                 let diagnostic = &finished.stderr.bytes[..finished.stderr.bytes.len().min(2048)];
                 result.report.diagnostic = Some(String::from_utf8_lossy(diagnostic).into_owned());

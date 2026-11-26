@@ -13,7 +13,8 @@ Captured, not edited (264 bytes, SHA-256 `e7c67c888408868bb307500372a671210a4bf3
 - Streams: stdout redirected to the file and stderr discarded (stderr printed
   `"Authentication required. Please visit the URL to log in:"` followed by an OAuth URL, so it
   was not saved)
-- Exit status: exit code 1 after about 60 s
+- Exit status: exit code 1 after about 60 s (`duration_seconds` in the JSON is still `0` even
+  though the run took about 60 s)
 - Date: `2026-11-26T10:57:30Z`
 - Captured by: the macOS verifier
 
@@ -27,5 +28,3 @@ from a real CLI; the remaining fixtures are synthetic.
   `56975da34f8a1821ac21950108c9ee031b0149fe`. That checkout contains no raw Antigravity
   print-result fixture. The response text and conversation ID here were written for Proxenos. A
   reported print timeout can still carry a conversation ID.
-- `synthetic-error.json`: synthetic. Non-authentication `ERROR` payload shaped after the measured
-  `agy` 1.5.18 error JSON with a synthetic error message written for Proxenos.
