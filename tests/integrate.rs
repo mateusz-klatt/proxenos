@@ -1,5 +1,8 @@
 //! Behavioural tests for `proxenos integrate claude-code [--remove]` and `proxenos doctor` (D10).
 
+#[path = "integrate/codex.rs"]
+mod codex;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

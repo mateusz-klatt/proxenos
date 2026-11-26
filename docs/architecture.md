@@ -528,7 +528,7 @@ implement the Claude Code registration and health check:
   `settings.json` and the two container objects, whether `settings.json` was a symlink
   (`settings_is_symlink` and `settings_symlink_target`), the optional `backup_path`, the optional
   `settings_written_sha256`, the exact JSON values written under `entries`, the generated `files`,
-  and the `created_dirs` list in creation order.
+  and the list of directories created by the integration, `created_dirs`.
   - After ensuring only `<state_dir>/integrate` exists to hold the manifest, `integrate` records
     every directory about to be created (`<state_dir>/integrate`, the settings parent directory, the
     marketplace tree, and `backups` when a backup is needed) in `created_dirs` and writes
@@ -581,6 +581,34 @@ implement the Claude Code registration and health check:
   schema-versioned JSON with `--json`, with each check reported as `ok`, `warn`, or `fail`; exit
   status is 0 when no check fails and 1 otherwise.
 
+Codex CLI registration uses `proxenos integrate codex [--remove]`. It works on the user
+`config.toml` under `CODEX_HOME` or the default `~/.codex` directory. Proxenos registers the
+absolute path of the invoked binary as `mcp_servers.proxenos.command` and the arguments
+`["mcp", "--client", "codex"]` as `mcp_servers.proxenos.args`, the stdio configuration described
+in the [Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli#configure-with-configtoml).
+Codex CLI 0.172.0 read back these fields from isolated profiles on macOS and Windows, including
+paths with spaces and non-ASCII characters. On Linux it resolved a relative `CODEX_HOME` from
+the working directory and refused an explicit directory that did not exist. These checks
+loaded the configuration without starting a provider turn.
+
+The integration uses the existing manifest schema and keeps Codex ownership separately under
+`clients.codex`. A shared advisory lock in the parent of `<state_dir>` serializes updates to
+the manifest by this version of Proxenos. The Codex entry is updated or removed only while it
+matches the recorded command and arguments. Proxenos preserves other MCP registrations and
+their comments, and keeps a symlinked `config.toml` in place while editing its resolved target.
+It records the resolved configuration directory and refuses later operations if that path
+changes. Each client keeps a record of any integration-created directories
+shared with the other, allowing the last removal to clean up the empty directories.
+It saves the original configuration to `<state_dir>/integrate/backups/codex-config.toml`
+when taking ownership of an existing file. Removal restores that backup if the configuration
+still matches the bytes written when the backup was taken. Otherwise it removes the owned entry
+pointwise. An interrupted write is recoverable using the pending manifest.
+
+Doctor reports registration and handshake checks for each recorded supported client. It checks
+state permissions and provider CLIs once. Without a recorded supported client, it still checks
+the legacy Claude Code registration. A managed Codex registration must match its ownership
+record before doctor launches the handshake.
+
 What this cannot do:
 
 - Claude Code reads `settings.json` and local marketplace plugins only when it starts; running
@@ -600,6 +628,11 @@ What this cannot do:
 - `doctor`'s handshake proves that the registered binary starts and speaks MCP with the configured
   arguments; it does not prove that Claude Code itself loaded the plugin or that Claude Code's own
   hook/plugin discovery will accept it.
+- For Codex, the handshake starts the command directly from the inspected user configuration.
+  It cannot establish the effective registration after trusted project configuration, command
+  line overrides, or managed policy are applied.
+- An external edit to `config.toml` can race the read and atomic replacement. The integration
+  lock coordinates Proxenos processes using the same state directory.
 - An entry in `settings.json` edited by hand after `integrate` is reported and left untouched by
   both `integrate` and `--remove`, never forced or overwritten.
 - On Windows, Unix mode bits do not apply; `<state_dir>` relies on the user profile's `%LOCALAPPDATA%`

@@ -17,6 +17,7 @@ rmcp = { version = "=3.11.0", default-features = false, features = ["server", "t
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 tokio = { version = "1.54.1", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7.20"
+toml_edit = "0.25.21"
 
 [target.'cfg(unix)'.dependencies]
 tokio = { version = "1.54.1", features = ["signal"] }

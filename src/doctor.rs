@@ -1,5 +1,6 @@
 //! Diagnostic checks for `proxenos doctor` (D10).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -14,7 +15,9 @@ use tokio::process::ChildStdout;
 use tokio_util::sync::CancellationToken;
 
 use crate::discovery::{self, CliStatus};
-use crate::integrate::{ENABLED_PLUGIN_KEY, MARKETPLACE_NAME, MCP_SERVER_NAME, PLUGIN_NAME};
+use crate::integrate::{
+    self, CLIENT_CLAUDE_CODE, ENABLED_PLUGIN_KEY, MARKETPLACE_NAME, MCP_SERVER_NAME, PLUGIN_NAME,
+};
 use crate::mcp::Activity;
 use crate::platform;
 use crate::providers::{self, Provider};
@@ -79,9 +82,47 @@ pub struct Report {
 
 struct RegisteredCommand {
     settings_path: PathBuf,
-    marketplace_dir: PathBuf,
+    marketplace_dir: Option<PathBuf>,
     command: PathBuf,
     args: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum IntegrationClient<'a> {
+    ClaudeCode,
+    Codex(&'a Value),
+}
+
+impl IntegrationClient<'_> {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => CLIENT_CLAUDE_CODE,
+            Self::Codex(_) => "codex",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex(_) => "Codex",
+        }
+    }
+
+    fn registration(self) -> Result<RegisteredCommand, String> {
+        match self {
+            Self::ClaudeCode => read_claude_registration(&state::claude_settings_path()?),
+            Self::Codex(record) => {
+                let (settings_path, command, args) = integrate::read_codex_registration(record)
+                    .map_err(|error| error.to_string())?;
+                Ok(RegisteredCommand {
+                    settings_path,
+                    marketplace_dir: None,
+                    command,
+                    args,
+                })
+            }
+        }
+    }
 }
 
 enum HandshakeError {
@@ -141,7 +182,7 @@ fn read_json(path: &Path) -> Result<Value, String> {
         .map_err(|err| format!("Could not parse {}: {err}", path.display()))
 }
 
-fn read_registration(settings_path: &Path) -> Result<RegisteredCommand, String> {
+fn read_claude_registration(settings_path: &Path) -> Result<RegisteredCommand, String> {
     let settings = read_json(settings_path)?;
     let marketplace_str = settings["extraKnownMarketplaces"][MARKETPLACE_NAME]["source"]
         .as_object()
@@ -193,83 +234,78 @@ fn read_registration(settings_path: &Path) -> Result<RegisteredCommand, String> 
         ));
     };
 
-    let command_path = PathBuf::from(command);
-    if !command_path.is_file() {
-        return Err(format!(
-            "Registered executable does not exist: {}. Run `proxenos integrate claude-code` again to update the registration.",
-            command_path.display()
-        ));
-    }
-
     Ok(RegisteredCommand {
         settings_path: settings_path.to_path_buf(),
-        marketplace_dir,
-        command: command_path,
+        marketplace_dir: Some(marketplace_dir),
+        command: PathBuf::from(command),
         args,
     })
 }
 
-fn check_registration() -> (Check, Option<RegisteredCommand>) {
-    let settings_path = match state::claude_settings_path() {
-        Ok(path) => path,
-        Err(message) => {
-            return (
-                Check::new("claude-code.registration", Status::Fail, message, None),
-                None,
-            );
-        }
-    };
-    match read_registration(&settings_path) {
-        Ok(reg) => {
-            let path_mismatch =
-                state::find_on_path(Path::new("proxenos"), |_| true).and_then(|on_path| {
-                    let reg_real = fs::canonicalize(&reg.command)
-                        .ok()
-                        .map(state::normalize_path)?;
-                    let path_real = fs::canonicalize(&on_path).ok().map(state::normalize_path)?;
-                    (reg_real != path_real).then_some((on_path, path_real))
-                });
-            let check = if let Some((on_path, path_real)) = path_mismatch {
-                Check::new(
-                    "claude-code.registration",
-                    Status::Warn,
-                    format!(
-                        "Claude Code registration points to {}, but `proxenos` on PATH resolves to {}. Run `proxenos integrate claude-code` again to update the registration.",
-                        reg.command.display(),
-                        path_real.display()
-                    ),
-                    Some(json!({
-                        "settings_path": reg.settings_path.display().to_string(),
-                        "marketplace_dir": reg.marketplace_dir.display().to_string(),
-                        "command": reg.command.display().to_string(),
-                        "args": reg.args,
-                        "path_command": on_path.display().to_string(),
-                        "path_resolved": path_real.display().to_string(),
-                    })),
-                )
-            } else {
-                Check::new(
-                    "claude-code.registration",
-                    Status::Ok,
-                    format!(
-                        "Claude Code registration points to {}.",
-                        reg.command.display()
-                    ),
-                    Some(json!({
-                        "settings_path": reg.settings_path.display().to_string(),
-                        "marketplace_dir": reg.marketplace_dir.display().to_string(),
-                        "command": reg.command.display().to_string(),
-                        "args": reg.args,
-                    })),
-                )
-            };
-            (check, Some(reg))
-        }
-        Err(reason) => (
-            Check::new("claude-code.registration", Status::Fail, reason, None),
-            None,
-        ),
+fn installed_clients() -> Result<BTreeMap<String, Value>, integrate::IntegrateError> {
+    match state::state_dir() {
+        Some(dir) => integrate::read_installed_clients(&dir),
+        None => Ok(BTreeMap::new()),
     }
+}
+
+fn registration_clients(installed: &BTreeMap<String, Value>) -> Vec<IntegrationClient<'_>> {
+    let codex = installed.get("codex");
+    let mut clients = Vec::new();
+    if installed.contains_key(CLIENT_CLAUDE_CODE) || codex.is_none() {
+        clients.push(IntegrationClient::ClaudeCode);
+    }
+    if let Some(record) = codex {
+        clients.push(IntegrationClient::Codex(record));
+    }
+    clients
+}
+
+fn check_registration(client: IntegrationClient<'_>) -> (Check, Option<RegisteredCommand>) {
+    let name = format!("{}.registration", client.name());
+    let label = client.label();
+    let update = format!(
+        "Run `proxenos integrate {}` again to update the registration.",
+        client.name()
+    );
+    let reg = match client.registration() {
+        Ok(reg) => reg,
+        Err(reason) => return (Check::new(name, Status::Fail, reason, None), None),
+    };
+    let command = reg.command.display();
+    if !reg.command.is_file() {
+        let reason = format!("Registered executable does not exist: {command}. {update}");
+        return (Check::new(name, Status::Fail, reason, None), None);
+    }
+
+    let mut details = json!({
+        "settings_path": reg.settings_path.display().to_string(),
+        "command": command.to_string(),
+        "args": reg.args,
+    });
+    if let Some(marketplace) = &reg.marketplace_dir {
+        details["marketplace_dir"] = json!(marketplace.display().to_string());
+    }
+    let mismatch = state::find_on_path(Path::new("proxenos"), |_| true).and_then(|on_path| {
+        let reg_real = state::normalize_path(fs::canonicalize(&reg.command).ok()?);
+        let path_real = state::normalize_path(fs::canonicalize(&on_path).ok()?);
+        (reg_real != path_real).then_some((on_path, path_real))
+    });
+    let (status, message) = if let Some((on_path, path_real)) = mismatch {
+        details["path_command"] = json!(on_path.display().to_string());
+        details["path_resolved"] = json!(path_real.display().to_string());
+        let message = format!(
+            "{label} registration points to {command}, but `proxenos` on PATH resolves to {}. {update}",
+            path_real.display()
+        );
+        (Status::Warn, message)
+    } else {
+        (
+            Status::Ok,
+            format!("{label} registration points to {command}."),
+        )
+    };
+    (Check::new(name, status, message, Some(details)), Some(reg))
 }
 
 fn check_state_dir() -> Check {
@@ -598,15 +634,17 @@ async fn run_handshake(
 }
 
 async fn check_handshake(
+    client: IntegrationClient<'_>,
     registration: Option<&RegisteredCommand>,
     any_provider_found: bool,
     activity: Activity,
 ) -> Check {
+    let name = format!("{}.handshake", client.name());
     let Some(reg) = registration else {
         return Check::new(
-            "claude-code.handshake",
+            name,
             Status::Fail,
-            "Skipped: Claude Code registration check failed.",
+            format!("Skipped: {} registration check failed.", client.label()),
             None,
         );
     };
@@ -630,10 +668,10 @@ async fn check_handshake(
                         clis.join(", ")
                     )
                 };
-                Check::new("claude-code.handshake", Status::Warn, message, details)
+                Check::new(name, Status::Warn, message, details)
             } else {
                 Check::new(
-                    "claude-code.handshake",
+                    name,
                     Status::Ok,
                     format!("MCP handshake succeeded ({} tools).", info.tools.len()),
                     details,
@@ -641,7 +679,7 @@ async fn check_handshake(
             }
         }
         Err(error) => Check::new(
-            "claude-code.handshake",
+            name,
             Status::Fail,
             error.to_string(),
             Some(json!({
@@ -653,11 +691,28 @@ async fn check_handshake(
 }
 
 pub fn run(json_output: bool) -> (bool, String) {
-    let (reg_check, registration) = check_registration();
+    let mut checks = Vec::new();
+    let mut registrations = Vec::new();
+    let installed = installed_clients();
+    match &installed {
+        Ok(installed) => {
+            for client in registration_clients(installed) {
+                let (check, registration) = check_registration(client);
+                checks.push(check);
+                registrations.push((client, registration));
+            }
+        }
+        Err(error) => checks.push(Check::new(
+            "integration.manifest",
+            Status::Fail,
+            error.to_string(),
+            None,
+        )),
+    }
     let state_check = check_state_dir();
 
     let runtime = tokio::runtime::Runtime::new().expect("the async runtime starts");
-    let (cli_checks, handshake_check) = runtime.block_on(async {
+    let (cli_checks, handshake_checks) = runtime.block_on(async {
         let cancel = CancellationToken::new();
         let (activity, mut finished) = Activity::track();
         let mut handles = Vec::with_capacity(providers::ALL.len());
@@ -678,19 +733,27 @@ pub fn run(json_output: bool) -> (bool, String) {
             cli_checks.push(provider_check(provider, status));
         }
 
-        let handshake_check =
-            check_handshake(registration.as_ref(), any_provider_found, activity.clone()).await;
+        let mut handshake_checks = Vec::with_capacity(registrations.len());
+        for (client, registration) in &registrations {
+            handshake_checks.push(
+                check_handshake(
+                    *client,
+                    registration.as_ref(),
+                    any_provider_found,
+                    activity.clone(),
+                )
+                .await,
+            );
+        }
         drop(activity);
         let _ = tokio::time::timeout(Duration::from_secs(2), finished.recv()).await;
-        (cli_checks, handshake_check)
+        (cli_checks, handshake_checks)
     });
     runtime.shutdown_timeout(Duration::from_millis(500));
 
-    let mut checks = Vec::with_capacity(3 + cli_checks.len());
-    checks.push(reg_check);
     checks.push(state_check);
     checks.extend(cli_checks);
-    checks.push(handshake_check);
+    checks.extend(handshake_checks);
 
     let ok = checks.iter().all(|check| check.status != Status::Fail);
     let report = Report {

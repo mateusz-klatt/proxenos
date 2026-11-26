@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use client::Client;
 
-const USAGE: &str = "usage: proxenos --version\n       proxenos mcp --client <claude|codex|antigravity|kimi|grok|cursor|copilot>\n       proxenos integrate claude-code [--remove]\n       proxenos doctor [--json]";
+const USAGE: &str = "usage: proxenos --version\n       proxenos mcp --client <claude|codex|antigravity|kimi|grok|cursor|copilot>\n       proxenos integrate <claude-code|codex> [--remove]\n       proxenos doctor [--json]";
 
 /// How long the runtime may take to stop once serving has ended.
 const RUNTIME_STOPS_WITHIN: Duration = Duration::from_millis(500);
@@ -30,7 +30,7 @@ const RUNTIME_STOPS_WITHIN: Duration = Duration::from_millis(500);
 enum Command {
     Version,
     Mcp(Client),
-    IntegrateClaudeCode { remove: bool },
+    Integrate(fn() -> Result<String, integrate::IntegrateError>),
     Doctor { json: bool },
 }
 
@@ -39,10 +39,12 @@ fn parse(args: &[OsString]) -> Option<Command> {
     match args.as_slice() {
         ["--version" | "version"] => Some(Command::Version),
         ["mcp", "--client", name] => Client::parse(name).map(Command::Mcp),
-        ["integrate", "claude-code"] => Some(Command::IntegrateClaudeCode { remove: false }),
+        ["integrate", "claude-code"] => Some(Command::Integrate(integrate::integrate_claude_code)),
         ["integrate", "claude-code", "--remove"] => {
-            Some(Command::IntegrateClaudeCode { remove: true })
+            Some(Command::Integrate(integrate::remove_claude_code))
         }
+        ["integrate", "codex"] => Some(Command::Integrate(integrate::integrate_codex)),
+        ["integrate", "codex", "--remove"] => Some(Command::Integrate(integrate::remove_codex)),
         ["doctor"] => Some(Command::Doctor { json: false }),
         ["doctor", "--json"] => Some(Command::Doctor { json: true }),
         _ => None,
@@ -57,17 +59,10 @@ fn main() -> ExitCode {
             emit(true, &line, None)
         }
         Some(Command::Mcp(client)) => serve(client),
-        Some(Command::IntegrateClaudeCode { remove }) => {
-            let outcome = if remove {
-                integrate::remove_claude_code()
-            } else {
-                integrate::integrate_claude_code()
-            };
-            match outcome {
-                Ok(message) => emit(true, &message, None),
-                Err(error) => emit(false, "", Some(&format!("proxenos: {error}"))),
-            }
-        }
+        Some(Command::Integrate(action)) => match action() {
+            Ok(message) => emit(true, &message, None),
+            Err(error) => emit(false, "", Some(&format!("proxenos: {error}"))),
+        },
         Some(Command::Doctor { json }) => {
             let (ok, output) = doctor::run(json);
             emit(ok, &output, None)
