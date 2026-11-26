@@ -202,6 +202,53 @@ fn failed(message: &str) -> String {
 }
 
 #[test]
+fn captured_missing_provider_key_reports_the_terminal_error_without_an_answer() {
+    let stdout = include_str!("../fixtures/codex/captured-missing-provider-key.stdout.jsonl");
+    let stderr = include_str!("../fixtures/codex/captured-missing-provider-key.stderr.txt");
+    let fleet = Fleet::new(&["codex"]);
+    fleet.script("codex", json!([{"stdout":stdout, "stderr":stderr, "code":1}]));
+    let mut server = fleet.server("claude");
+    let result = call(&mut server, "codex", json!({"prompt":"Reply with OK."}));
+
+    assert_reported_failure(
+        &result,
+        Some(("abnormal_exit", "exit code 1")),
+        "unknown",
+        "Missing environment variable: `PROXENOS_D5_EMPTY_TEST_KEY`.",
+    );
+    assert_eq!(
+        result["reported"]["thread_id"],
+        "01a21898-0d84-70a1-b61f-e5dcec9a06b1",
+        "{result}"
+    );
+    assert!(result["reported"]["content"].is_null(), "{result}");
+    assert_eq!(result["reported"]["diagnostic"], stderr, "{result}");
+    assert_eq!(invocations(&fleet).len(), 1, "{result}");
+}
+
+#[test]
+fn captured_unknown_resume_reports_the_exit_and_keeps_the_cli_diagnostic() {
+    let stderr = include_str!("../fixtures/codex/captured-unknown-session.stderr.txt");
+    let fleet = Fleet::new(&["codex"]);
+    fleet.script("codex", json!([{"stderr":stderr, "code":1}]));
+    let mut server = fleet.server("claude");
+    let result = call(
+        &mut server,
+        "codex-reply",
+        json!({
+            "thread_id":"00000000-0000-4000-8000-000000000001", "prompt":"Reply with OK.",
+            "cwd":fleet.root, "access":"read-only", "mode":"advisory"
+        }),
+    );
+
+    assert_observed_failure(&result, "abnormal_exit", "exit code 1");
+    assert!(result["reported"]["thread_id"].is_null(), "{result}");
+    assert!(result["reported"]["content"].is_null(), "{result}");
+    assert_eq!(result["reported"]["diagnostic"], stderr, "{result}");
+    assert_eq!(invocations(&fleet).len(), 1, "{result}");
+}
+
+#[test]
 fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_quota() {
     let fleet = Fleet::new(&["codex"]);
     let backend = |status: u32, error: Value| {

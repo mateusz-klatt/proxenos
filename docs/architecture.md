@@ -320,11 +320,13 @@ standard error normally goes into `reported.diagnostic`. An authentication failu
 The diagnostic tells the caller to run `agy` to sign in. The observed byte counts still include
 the captured output.
 
-Not measured: Proxenos has not yet captured live `agy` `SUCCESS` turn output, print-timeout
-output, or any real Codex CLI output; those fixtures remain synthetic, derived from
-claude-delegator's code. Capturing real Codex CLI output—including pre-turn errors that spend no
-model call (such as `codex exec` with an invalid model while logged out)—and live turn output for
-both CLIs is the next step.
+Two offline failures were captured with Codex CLI 0.172.0 on Linux x86_64. With a missing
+credential for a local custom provider, `codex exec --json` emitted a thread ID and
+`turn.started`, then `error` and `turn.failed`. It exited 1 before inference. With an unknown
+UUID in an empty profile, `codex exec resume --json` exited 1 with an empty stdout and a
+diagnostic on stderr. The [Codex fixtures](../tests/fixtures/codex/README.md) record the
+arguments and raw streams. Successful Codex turns, live Antigravity successes and Antigravity
+print timeouts still use synthetic fixtures.
 
 Measured for Kimi (`kimi 2.8.0` on Linux x86_64, 2026-11-26):
 
