@@ -289,6 +289,41 @@ fn await_expires_at_the_20_second_limit_without_cancelling_the_delegation() {
 }
 
 #[test]
+fn await_reports_completion_when_its_deadline_and_the_handle_are_ready_together() {
+    let fleet = Fleet::new(&["agy"]);
+    let go = fleet.root.join("complete");
+    let mut step = turn("done at deadline");
+    step["wait_for"] = json!(go);
+    fleet.script("agy", json!([step]));
+    let mut command = fleet.command("claude");
+    command.env("PROXENOS_TEST_AWAIT_DEADLINE_ON_UPDATE", "1");
+    let mut server = Server::start_command(command);
+    server.initialize("2025-11-25");
+
+    let (started, is_error) = raw_call(
+        &mut server,
+        1,
+        "antigravity",
+        json!({"prompt": "wait for release", "wait": false}),
+    );
+    assert!(!is_error, "{started}");
+    let handle = started["handle"].as_str().unwrap();
+    server.start_call(2, "await", json!({"handles": [handle]}));
+    server.wait_for_stderr("proxenos test await: waiting for update");
+    fs::write(go, []).unwrap();
+
+    let frame = server.next_frame(Instant::now() + WAIT).unwrap();
+    assert_eq!(frame["id"], 2, "{frame}");
+    let result: Value = serde_json::from_str(text(&frame)).unwrap();
+    assert_eq!(result["satisfied"], true, "{result}");
+    assert_eq!(result["timed_out"], false, "{result}");
+    let item = &result["results"][0];
+    assert_eq!(item["handle"], handle, "{result}");
+    assert_eq!(item["state"], "finished", "{result}");
+    assert_eq!(item["result"]["reported"]["content"], "done at deadline");
+}
+
+#[test]
 fn fourth_concurrent_delegation_is_refused_as_busy_until_a_slot_frees() {
     let fleet = Fleet::new(&["agy"]);
     let mut steps = Vec::new();
@@ -423,7 +458,7 @@ fn retained_background_results_are_bounded_and_evict_the_oldest() {
         assert!(!is_error, "{started}");
         let handle = started["handle"].as_str().unwrap().to_owned();
         let (done, _) = raw_call(&mut server, 200 + i, "await", json!({"handles": [handle]}));
-        assert_eq!(done["results"][0]["state"], "finished");
+        assert_eq!(done["results"][0]["state"], "finished", "{done}");
         handles.push(handle);
     }
 
@@ -439,9 +474,79 @@ fn retained_background_results_are_bounded_and_evict_the_oldest() {
 }
 
 #[test]
+fn retained_background_results_evict_the_oldest_when_they_exceed_the_byte_limit() {
+    const BYTE_LIMIT: usize = 1 << 20;
+    // Escaping the instructions in observed.requested and observed.passed makes the
+    // result JSON large while keeping the CLI argument below Windows' length limit.
+    let instructions = "\u{0001}".repeat(29 * 1024);
+    let answers = ["first answer", "second answer", "third answer"];
+    let fleet = Fleet::new(&["agy"]);
+    fleet.script("agy", json!(answers.map(turn)));
+
+    let mut server = fleet.server("claude");
+    let mut handles = Vec::new();
+    let mut result_bytes = [0; 3];
+    for (index, answer) in answers.into_iter().enumerate() {
+        let (started, is_error) = raw_call(
+            &mut server,
+            10 + index as i64,
+            "antigravity",
+            json!({"prompt": format!("item {index}"), "instructions": instructions, "wait": false}),
+        );
+        assert!(!is_error, "{started}");
+        assert_eq!(started["state"], "running", "{started}");
+        let handle = started["handle"].as_str().unwrap().to_owned();
+
+        // Finish each delegation before starting the next to fix the retention order.
+        let (done, is_error) = raw_call(
+            &mut server,
+            20 + index as i64,
+            "await",
+            json!({"handles": [handle]}),
+        );
+        assert!(!is_error, "result {index} failed to await");
+        let item = &done["results"][0];
+        assert_eq!(item["handle"], handle);
+        assert_eq!(
+            item["state"], "finished",
+            "result {index}: observed failure {}, reported failure {}",
+            item["result"]["observed"]["failure"], item["result"]["reported"]["failure"]
+        );
+        let result = &item["result"];
+        assert_eq!(result["reported"]["content"], answer);
+        result_bytes[index] = result.to_string().len();
+        handles.push(handle);
+    }
+    assert!(result_bytes[..2].iter().sum::<usize>() <= BYTE_LIMIT);
+    assert!(result_bytes.iter().sum::<usize>() > BYTE_LIMIT);
+
+    let (checked, is_error) = raw_call(&mut server, 30, "await", json!({"handles": handles}));
+    assert!(!is_error, "retained results failed to await");
+    let results = checked["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["handle"], handles[0]);
+    assert_eq!(results[0]["state"], "unknown");
+    assert!(results[0].get("result").is_none());
+    for index in 1..3 {
+        let item = &results[index];
+        assert_eq!(item["handle"], handles[index]);
+        assert_eq!(item["state"], "finished");
+        assert_eq!(item["result"]["reported"]["content"], answers[index]);
+    }
+}
+
+#[test]
 fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
     let fleet = Fleet::new(&["agy"]);
-    fleet.script("agy", json!([turn("ok1"), turn("ok2"), turn("ok3")]));
+    let release = fleet.root.join("after-panic.go");
+    let locks = [1, 2, 3].map(|i| fleet.root.join(format!("after-panic-{i}.lock")));
+    let steps = locks.each_ref().map(|lock| {
+        let mut step = turn("completed after panic");
+        step["hold_file"] = json!(lock);
+        step["wait_for"] = json!(release);
+        step
+    });
+    fleet.script("agy", json!(steps));
     let mut server = fleet.server("claude");
 
     let (started, is_error) = raw_call(&mut server, 1, "test_panic", json!({"background": true}));
@@ -475,16 +580,19 @@ fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
         r#"{"alive":true}"#
     );
     let mut handles = Vec::new();
-    for i in 0..3 {
+    for (i, lock) in locks.iter().enumerate() {
         let (bg, is_error) = raw_call(
             &mut server,
-            10 + i,
+            10 + i as i64,
             "antigravity",
             json!({"prompt": format!("after panic {i}"), "wait": false}),
         );
         assert!(!is_error, "{bg}");
+        assert_eq!(bg["state"], "running", "{bg}");
         handles.push(bg["handle"].as_str().unwrap().to_owned());
+        assert!(!is_free(&lock_file(lock)), "stub {i} must hold its slot");
     }
+    fs::write(release, []).unwrap();
     let (done, _) = raw_call(
         &mut server,
         20,
