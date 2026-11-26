@@ -5,6 +5,7 @@ mod antigravity;
 mod claude;
 mod codex;
 mod copilot;
+mod cursor;
 mod kimi;
 
 use std::ffi::OsString;
@@ -23,6 +24,7 @@ pub const ALL: &[Provider] = &[
     kimi::SPEC,
     claude::SPEC,
     copilot::SPEC,
+    cursor::SPEC,
 ];
 pub const DEFAULT_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_MODEL_LEN: usize = 256;
@@ -237,10 +239,7 @@ impl Provider {
             };
             if !valid {
                 if key == "access" && value.as_str() == Some("read-only") {
-                    return Err(format!(
-                        "{} does not support access: read-only; its CLI cannot enforce read-only restrictions.",
-                        self.name
-                    ));
+                    return Err(format!("{} does not support access: read-only.", self.name));
                 }
                 return Err(format!("Unsupported parameter or value for {key}"));
             }

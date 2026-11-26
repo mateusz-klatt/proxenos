@@ -17,6 +17,8 @@ mod common;
 mod content;
 #[path = "mcp/copilot.rs"]
 mod copilot;
+#[path = "mcp/cursor.rs"]
+mod cursor;
 #[path = "mcp/discovery.rs"]
 mod discovery;
 #[path = "mcp/kimi.rs"]
