@@ -134,6 +134,8 @@ fn response(bytes: &[u8]) -> Option<Value> {
     object(bytes).or_else(|| bytes.rsplit(|b| *b == b'\n').find_map(object))
 }
 
+// Only CLI error channels (top-level JSON `error` on non-SUCCESS status and stderr) reach
+// this classifier, never agent-authored `response` text.
 fn classify(message: &str) -> Option<Failure> {
     let lower = message.to_ascii_lowercase();
     let kind = if lower.contains("quota")
@@ -145,7 +147,15 @@ fn classify(message: &str) -> Option<Failure> {
     } else if [
         "unauthenticated",
         "authentication required",
+        "authentication failed",
         "not authenticated",
+        "unauthorized",
+        "authorization failed",
+        "authorization required",
+        "not logged in",
+        "login required",
+        "please log in",
+        "invalid credentials",
     ]
     .iter()
     .any(|s| lower.contains(s))

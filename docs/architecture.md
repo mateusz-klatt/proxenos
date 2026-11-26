@@ -301,10 +301,24 @@ Measured on 2026-11-26 on Linux x86_64 against Claude Code `2.1.332`:
   `error_during_execution` / `permission_denials` JSON payloads (synthetic fixtures), managed
   settings and `CLAUDE.md` behavior under `--setting-sources user`, and Windows/macOS execution.
 
-Not measured: Proxenos has not yet captured the real Codex or `agy` CLI output shape; the
-fixtures are synthetic, derived from claude-delegator's code. Capturing real CLI output—including
-pre-turn errors that spend no model call (such as `codex exec` with an invalid model while logged
-out) as well as live turn output—is the next step.
+Measured on 2026-11-26 with `agy` 1.5.18 on macOS `x86_64` while logged out:
+`agy --output-format json --disable-slash-commands --print ...` exits with code 1 after about
+60 s, writes an OAuth prompt (`"Authentication required. Please visit the URL to log in:"` plus
+URL) to standard error, and writes a single JSON object to standard output with fields
+`conversation_id` (`""`), `status` (`"ERROR"`), `response` (`""`), `error`
+(`"authentication failed or timed out"`), `duration_seconds`, `num_turns`, `usage`
+(`input_tokens`, `output_tokens`, `thinking_tokens`, `cache_read_tokens`, `total_tokens`), and
+`finished_reason` (`"error"`). Proxenos classifies Antigravity failures only from the top-level
+JSON `error` field when `status` is not `"SUCCESS"` and from standard error, never from
+`response`, passing the provider's message on (bounded by D2's excerpt limit) as `authentication`
+when it indicates a login or authorization failure and `unknown` otherwise.
+
+Not measured: Proxenos has not yet captured live `agy` `SUCCESS` turn output, print-timeout
+output, or any real Codex CLI output; those fixtures remain synthetic, derived from
+claude-delegator's code (or, for the synthetic non-auth Antigravity error fixture, shaped after
+the measured `agy` 1.5.18 error JSON). Capturing real Codex CLI output—including pre-turn errors
+that spend no model call (such as `codex exec` with an invalid model while logged out)—and live
+turn output for both CLIs is the next step.
 
 Measured for Kimi (`kimi 2.8.0` on Linux x86_64, 2026-11-26):
 

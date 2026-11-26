@@ -8,6 +8,9 @@ use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_fa
 
 const FINISHED: &str = include_str!("../fixtures/antigravity/finished.json");
 const PRINT_TIMEOUT: &str = include_str!("../fixtures/antigravity/timeout.json");
+const CAPTURED_AUTH_FAILED: &str =
+    include_str!("../fixtures/antigravity/captured-auth-failed.stdout.json");
+const SYNTHETIC_ERROR: &str = include_str!("../fixtures/antigravity/synthetic-error.json");
 const ID: &str = "paper-crane";
 
 fn store(fleet: &Fleet) -> PathBuf {
@@ -553,4 +556,78 @@ fn a_conversation_removed_during_discovery_never_receives_the_reply() {
     let records = fleet.records();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["args"], json!(["--version"]));
+}
+
+#[test]
+fn captured_auth_failed_fixture_classifies_as_authentication() {
+    let fleet = Fleet::new(&["agy"]);
+    fleet.script("agy", json!([{"stdout": CAPTURED_AUTH_FAILED, "code": 1}]));
+    let mut server = fleet.server("claude");
+    let result = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+    assert_reported_failure(
+        &result,
+        Some(("abnormal_exit", "exit code 1")),
+        "authentication",
+        "authentication failed or timed out",
+    );
+    assert_eq!(
+        result["reported"]["failure"]["message"], "authentication failed or timed out",
+        "{result}"
+    );
+    assert!(result["reported"]["thread_id"].is_null(), "{result}");
+    assert!(result["reported"]["content"].is_null(), "{result}");
+    assert!(result["reported"]["diagnostic"].is_null(), "{result}");
+    fleet.assert_steps_remaining("agy", 0);
+    assert_eq!(delegated(&fleet).len(), 1);
+}
+
+#[test]
+fn synthetic_non_auth_error_fixture_classifies_as_unknown_with_provider_message() {
+    let fleet = Fleet::new(&["agy"]);
+    fleet.script("agy", json!([{"stdout": SYNTHETIC_ERROR, "code": 1}]));
+    let mut server = fleet.server("claude");
+    let result = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+    assert_reported_failure(
+        &result,
+        Some(("abnormal_exit", "exit code 1")),
+        "unknown",
+        "model unavailable in print mode",
+    );
+    assert_eq!(
+        result["reported"]["failure"]["message"], "model unavailable in print mode",
+        "{result}"
+    );
+    assert!(result["reported"]["thread_id"].is_null(), "{result}");
+    assert!(result["reported"]["content"].is_null(), "{result}");
+    assert!(result["reported"]["diagnostic"].is_null(), "{result}");
+    fleet.assert_steps_remaining("agy", 0);
+    assert_eq!(delegated(&fleet).len(), 1);
+}
+
+#[test]
+fn success_response_containing_authentication_failed_is_not_classified() {
+    let fleet = Fleet::new(&["agy"]);
+    let payload = json!({
+        "conversation_id": ID,
+        "status": "SUCCESS",
+        "response": "The log recorded authentication failed or timed out."
+    })
+    .to_string();
+    fleet.script("agy", json!([{"stdout": payload}]));
+    let mut server = fleet.server("claude");
+    let result = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "Quote the log line."}),
+    );
+    assert_eq!(result["observed"]["state"], "finished", "{result}");
+    assert!(result["observed"]["failure"].is_null(), "{result}");
+    assert!(result["reported"]["failure"].is_null(), "{result}");
+    assert_eq!(result["reported"]["thread_id"], ID, "{result}");
+    assert_eq!(
+        result["reported"]["content"], "The log recorded authentication failed or timed out.",
+        "{result}"
+    );
+    fleet.assert_steps_remaining("agy", 0);
+    assert_eq!(delegated(&fleet).len(), 1);
 }
