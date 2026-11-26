@@ -240,9 +240,18 @@ fn a_call_that_outlasts_the_stop_limit_makes_serving_fail() {
     let (mut server, _) = Server::initialized("2025-11-25");
     server.start_call(1, "test_wait", json!({ "ms": 60_000, "linger_ms": 60_000 }));
     server.wait_for_stderr("test_wait: started");
-    let (status, took) = server.finish();
+    let closed = Instant::now();
+    server.close_input();
+    server.wait_for_stderr_within("did not finish within 10 s", Duration::from_secs(15));
+    let diagnostic_at = closed.elapsed();
+    assert!(
+        diagnostic_at >= Duration::from_millis(9_900),
+        "watchdog diagnostic appeared too early: {diagnostic_at:?}"
+    );
+    let (status, _) = server.wait_for_exit(common::EXIT_WAIT);
+    let took = closed.elapsed();
     assert_eq!(status.code(), Some(1));
-    assert!(took < Duration::from_secs(20), "exit took {took:?}");
+    assert!(took < Duration::from_secs(12), "exit took {took:?}");
     assert!(
         server.stderr().contains("did not finish within 10 s"),
         "{}",

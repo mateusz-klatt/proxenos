@@ -486,7 +486,7 @@ fn a_child_exiting_on_sigterm_stops_well_below_the_grace() {
     assert_eq!(cancelled["signal"], libc::SIGTERM, "{cancelled}");
     assert!(is_free(&gc_lock));
     assert!(
-        cancel_elapsed < Duration::from_millis(2_500),
+        cancel_elapsed < Duration::from_secs(1),
         "SIGTERM cancellation waited too long: {cancel_elapsed:?}"
     );
     assert!(cancel_server.finish().0.success());
@@ -509,11 +509,11 @@ fn a_child_exiting_on_sigterm_stops_well_below_the_grace() {
     assert_eq!(timed_out["ending"], "timed_out", "{timed_out}");
     assert_eq!(timed_out["signal"], libc::SIGTERM, "{timed_out}");
     assert!(
-        timeout_elapsed < Duration::from_millis(4_500),
+        timeout_elapsed < Duration::from_millis(3_000),
         "SIGTERM timeout stop waited too long: {timeout_elapsed:?} ({timed_out})"
     );
     assert!(
-        timed_out["elapsed_ms"].as_u64().unwrap() < 4_500,
+        timed_out["elapsed_ms"].as_u64().unwrap() < 3_000,
         "SIGTERM timeout stop waited too long: {timed_out}"
     );
     assert!(timeout_server.finish().0.success());
@@ -548,7 +548,7 @@ fn a_child_exiting_on_sigterm_stops_well_below_the_grace() {
     assert!(is_free(&slow_lock));
     assert!(
         delayed_elapsed >= Duration::from_millis(450)
-            && delayed_elapsed < Duration::from_millis(2_700),
+            && delayed_elapsed < Duration::from_millis(2_000),
         "delayed grandchild stop took {delayed_elapsed:?}: {delayed}"
     );
     assert!(delayed_server.finish().0.success());

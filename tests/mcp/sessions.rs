@@ -72,6 +72,48 @@ fn wait_for_codex_output_removed(fleet: &Fleet, before_records: usize) {
     }
 }
 
+/// Probes `key_lock` via a `codex-reply` that fails immediately in memory (without spawning a
+/// CLI) whenever `key_lock` is free on a server that already seeded `CODEX_THREAD` in `advisory`
+/// mode. A timeout in "Loading session settings" proves the in-flight start's detached save worker
+/// already owns `key_lock` and is blocked on `<key>.lock`.
+fn wait_for_codex_key_lock_held(server: &mut Server, first_probe_id: i64) {
+    let probe_until = Instant::now() + crate::common::WAIT;
+    let mut probe_id = first_probe_id;
+    loop {
+        let reply = server.call(
+            probe_id,
+            "codex-reply",
+            json!({
+                "thread_id": CODEX_THREAD,
+                "prompt": "probe key_lock",
+                "mode": "implementation",
+                "timeout_ms": 500
+            }),
+        );
+        probe_id += 1;
+        let envelope: Value = serde_json::from_str(crate::common::text(&reply)).unwrap();
+        if envelope["observed"]["failure"]["kind"] == "timeout" {
+            assert!(
+                envelope["observed"]["failure"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Loading session settings"),
+                "{envelope}"
+            );
+            return;
+        }
+        assert_eq!(
+            envelope["observed"]["failure"]["kind"], "invalid_request",
+            "{envelope}"
+        );
+        assert!(
+            Instant::now() < probe_until,
+            "save worker never acquired key_lock: {envelope}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn reply_after_server_restart_uses_persisted_file_and_stores_no_secrets() {
     let fleet = Fleet::new(&["codex"]);
@@ -1022,14 +1064,13 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
             {"stdout": CODEX_FINISHED}
         ]),
     );
-    let mut seed_b = fleet_b.server("claude");
+    let mut server_b = fleet_b.server("claude");
     let seeded_b = call(
-        &mut seed_b,
+        &mut server_b,
         "codex",
         json!({"prompt": "seed", "access": "full"}),
     );
     assert_eq!(seeded_b["observed"]["state"], "finished", "{seeded_b}");
-    assert!(seed_b.finish().0.success());
 
     let session_b = single_session_file(&sessions_root(&fleet_b.root).join("codex"));
     let lock_b = fs::OpenOptions::new()
@@ -1039,8 +1080,6 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
         .unwrap();
     lock_b.lock().unwrap();
 
-    let mut server_b = fleet_b.server("claude");
-    server_b.request(1, "tools/list", json!({}));
     let before_b = fleet_b.records().len();
     server_b.start_call(
         20,
@@ -1048,6 +1087,7 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
         json!({"prompt": "conflicting start", "access": "read-only"}),
     );
     wait_for_codex_output_removed(&fleet_b, before_b);
+    wait_for_codex_key_lock_held(&mut server_b, 22);
 
     // Issue a reply while save #20 is still blocked on the advisory lock.
     server_b.start_call(
@@ -1635,44 +1675,7 @@ fn session_save_respects_call_deadline_and_cancellation() {
         json!({"prompt": "save cancelled", "model": "cancelled-save-model"}),
     );
     wait_for_codex_output_removed(&fleet_b, before);
-    // Probe `key_lock` via a `codex-reply` that fails immediately in memory (without spawning a
-    // CLI) while `key_lock` is free. A timeout in "Loading session settings" proves call 40's
-    // detached save worker already owns `key_lock` and is blocked on `lock_b`.
-    let probe_until = Instant::now() + crate::common::WAIT;
-    let mut probe_id = 41;
-    loop {
-        let reply = server_b.call(
-            probe_id,
-            "codex-reply",
-            json!({
-                "thread_id": CODEX_THREAD,
-                "prompt": "probe key_lock",
-                "mode": "implementation",
-                "timeout_ms": 500
-            }),
-        );
-        probe_id += 1;
-        let envelope: Value = serde_json::from_str(crate::common::text(&reply)).unwrap();
-        if envelope["observed"]["failure"]["kind"] == "timeout" {
-            assert!(
-                envelope["observed"]["failure"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Loading session settings"),
-                "{envelope}"
-            );
-            break;
-        }
-        assert_eq!(
-            envelope["observed"]["failure"]["kind"], "invalid_request",
-            "{envelope}"
-        );
-        assert!(
-            Instant::now() < probe_until,
-            "save worker never acquired key_lock: {envelope}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_codex_key_lock_held(&mut server_b, 41);
     let cancel_began = Instant::now();
     server_b.close_input();
     let cancelled: Value =
