@@ -1184,6 +1184,7 @@ fn doctor_json_shape_and_real_binary_handshake_and_usage_errors() {
             "cli.antigravity",
             "cli.kimi",
             "cli.claude",
+            "cli.copilot",
             "claude-code.handshake"
         ]
     );
@@ -2335,6 +2336,12 @@ mod with_stubs {
             json!({"stdout": "2.8.0\n"}).to_string(),
         )
         .unwrap();
+        install_stub(&bin_dir, "copilot");
+        fs::write(
+            sb.root.join("copilot.version"),
+            json!({"stdout": "GitHub Copilot CLI 1.0.116.\nRun 'copilot update' to check for updates.\n"}).to_string(),
+        )
+        .unwrap();
         install_stub(&bin_dir, "claude");
         fs::write(
             sb.root.join("claude.version"),
@@ -2384,13 +2391,24 @@ mod with_stubs {
             find_check(&report, "cli.claude")["details"]["version"],
             "2.1.332 (Claude Code)"
         );
+        assert_eq!(
+            find_check(&report, "cli.copilot")["details"]["version"],
+            "GitHub Copilot CLI 1.0.116."
+        );
         let tools: Vec<&str> = find_check(&report, "claude-code.handshake")["details"]["tools"]
             .as_array()
             .unwrap()
             .iter()
             .map(|t| t.as_str().unwrap())
             .collect();
-        for expected in ["codex", "codex-reply", "antigravity", "antigravity-reply"] {
+        for expected in [
+            "codex",
+            "codex-reply",
+            "antigravity",
+            "antigravity-reply",
+            "copilot",
+            "copilot-reply",
+        ] {
             assert!(
                 tools.contains(&expected),
                 "missing tool {expected} in {tools:?}"

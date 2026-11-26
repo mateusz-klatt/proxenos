@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::{CommandLine, Failure, Provider, Report, Turn};
+use super::{CommandLine, Failure, Provider, Report, Turn, is_canonical_uuid};
 use crate::envelope::FailureKind;
 use crate::supervise::Finished;
 
@@ -41,10 +41,6 @@ pub(super) const SPEC: Provider = Provider {
     argv,
     parse,
 };
-
-fn is_canonical_uuid(id: &str) -> bool {
-    uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
-}
 
 fn prepare(turn: &mut Turn) -> Result<(), String> {
     if turn.prompt == "-" {
