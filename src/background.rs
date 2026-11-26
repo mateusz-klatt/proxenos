@@ -58,10 +58,7 @@ pub struct SlotGuard {
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        let mut state = lock(&self.background.state);
-        state.running -= 1;
-        drop(state);
-        self.background.notify();
+        lock(&self.background.state).running -= 1;
     }
 }
 
@@ -73,7 +70,7 @@ pub struct BackgroundTask {
     background: Arc<Background>,
     handle: String,
     provider: &'static str,
-    slot: Option<SlotGuard>,
+    finished: bool,
     _activity: Activity,
 }
 
@@ -83,18 +80,15 @@ impl BackgroundTask {
     }
 
     pub fn finish(mut self, state: &'static str, value: Value) {
-        // Free the concurrency slot before waking `await`, so a follow-up start
-        // issued right after `await` returns never races with the finished slot.
-        drop(self.slot.take());
         self.background
             .complete(&self.handle, self.provider, state, value);
+        self.finished = true;
     }
 }
 
 impl Drop for BackgroundTask {
     fn drop(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            drop(slot);
+        if !self.finished {
             let failure = Failure::new(
                 FailureKind::Unknown,
                 format!(
@@ -177,14 +171,12 @@ impl Background {
             background: Arc::clone(self),
             handle,
             provider,
-            slot: Some(SlotGuard {
-                background: Arc::clone(self),
-            }),
+            finished: false,
             _activity: activity,
         })
     }
 
-    pub fn complete(
+    fn complete(
         &self,
         handle: &str,
         provider: &'static str,
@@ -194,6 +186,7 @@ impl Background {
         let bytes = result.to_string().len();
         let now = Instant::now();
         let mut state = lock(&self.state);
+        state.running -= 1;
         state.entries.insert(
             handle.to_owned(),
             Entry::Terminal {
@@ -231,6 +224,18 @@ impl Background {
             if satisfied {
                 return await_outcome(condition, true, false, results);
             }
+            #[cfg(feature = "test-tools")]
+            if std::env::var_os("PROXENOS_TEST_AWAIT_DEADLINE_ON_UPDATE").is_some() {
+                // Model the next state change coinciding with the deadline. The test
+                // releases the provider only after this first, unsatisfied snapshot.
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "proxenos test await: waiting for update"
+                );
+                let _ = updates.changed().await;
+                deadline.as_mut().reset(tokio::time::Instant::now());
+            }
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break false,
@@ -239,7 +244,7 @@ impl Background {
             }
         };
         let (results, satisfied) = self.snapshot(&handles, condition);
-        await_outcome(condition, satisfied, timed_out, results)
+        await_outcome(condition, satisfied, timed_out && !satisfied, results)
     }
 
     pub fn call_cancel(&self, args: &Map<String, Value>) -> ToolOutcome {
