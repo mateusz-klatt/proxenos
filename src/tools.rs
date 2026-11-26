@@ -423,8 +423,9 @@ mod test_tools {
             "test_panic" if arguments.get("background") == Some(&Value::Bool(true)) => {
                 let bg_cancel = activity.shutdown_token();
                 let task = background
-                    .try_start("test", bg_cancel, activity)
-                    .expect("slot available for background test_panic");
+                    .try_acquire_slot()
+                    .expect("slot available for background test_panic")
+                    .start("test", bg_cancel, activity);
                 let handle = task.handle().to_owned();
                 tokio::spawn(async move {
                     let _guard = task;

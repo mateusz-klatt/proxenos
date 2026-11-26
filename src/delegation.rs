@@ -44,6 +44,10 @@ impl Registry {
         activity: Activity,
     ) -> ToolOutcome {
         let mut result = Envelope::new(p, &args);
+        let Some(slot) = self.background.try_acquire_slot() else {
+            result.fail(busy_failure());
+            return result.outcome();
+        };
         let (turn, call_deadline) = match self
             .prepare_turn(p, reply, &args, &cancel, activity.clone(), result.started())
             .await
@@ -56,24 +60,7 @@ impl Registry {
         };
         if !turn.wait {
             let bg_cancel = activity.shutdown_token();
-            let task = match await_bounded(
-                async {
-                    self.background
-                        .try_start(p.name, bg_cancel.clone(), activity.clone())
-                        .ok_or_else(busy_failure)
-                },
-                call_deadline,
-                &cancel,
-                "Starting the background delegation",
-            )
-            .await
-            {
-                Ok(task) => task,
-                Err(error) => {
-                    result.fail(error);
-                    return result.outcome();
-                }
-            };
+            let task = slot.start(p.name, bg_cancel.clone(), activity.clone());
             let handle = task.handle().to_owned();
             let registry = Arc::clone(&self);
             tokio::spawn(async move {
@@ -105,10 +92,6 @@ impl Registry {
                 .to_string(),
             };
         }
-        let Some(_slot) = self.background.try_acquire_slot() else {
-            result.fail(busy_failure());
-            return result.outcome();
-        };
         let outcome = self
             .execute(
                 p,
@@ -123,6 +106,7 @@ impl Registry {
         if let Err(error) = outcome {
             result.fail(error);
         }
+        drop(slot);
         result.outcome()
     }
 

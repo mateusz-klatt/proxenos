@@ -1,7 +1,7 @@
 //! Background delegations, `await`, `cancel`, concurrency limit and shutdown (D17).
 
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -610,12 +610,10 @@ fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
     );
 }
 
-#[test]
-fn cancelled_or_expired_wait_false_request_does_not_spawn_background_delegation() {
-    const CODEX_FINISHED: &str = include_str!("../fixtures/codex/finished.jsonl");
-    const CODEX_THREAD: &str = "eeb3a731-d53a-4444-8a6a-4d9d89e76073";
+const CODEX_FINISHED: &str = include_str!("../fixtures/codex/finished.jsonl");
+const CODEX_THREAD: &str = "eeb3a731-d53a-4444-8a6a-4d9d89e76073";
 
-    let fleet = Fleet::new(&["codex"]);
+fn seed_codex_session(fleet: &Fleet) -> PathBuf {
     fleet.script("codex", json!([{"stdout": CODEX_FINISHED}]));
     let mut seed = fleet.server("claude");
     let seeded = call(&mut seed, "codex", json!({"prompt": "seed"}));
@@ -631,19 +629,32 @@ fn cancelled_or_expired_wait_false_request_does_not_spawn_background_delegation(
     #[cfg(windows)]
     let provider_dir = fleet.root.join("proxenos/sessions/codex");
 
-    let session_file = fs::read_dir(&provider_dir)
+    fs::read_dir(&provider_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .unwrap();
+        .unwrap()
+        .with_extension("lock")
+}
+
+fn acquire_exclusive_lock(path: &Path) -> File {
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(session_file.with_extension("lock"))
+        .open(path)
         .unwrap();
     lock.lock().unwrap();
+    lock
+}
 
+#[test]
+fn cancelled_or_expired_wait_false_request_does_not_spawn_background_delegation() {
+    let fleet = Fleet::new(&["codex"]);
+    let lock_path = seed_codex_session(&fleet);
+
+    // Declare `server` before `lock` so unwind releases the OS lock before server cleanup.
     let mut server = fleet.server("claude");
+    let lock = acquire_exclusive_lock(&lock_path);
     let before = fleet.records().len();
     let timed = call(
         &mut server,
@@ -681,5 +692,244 @@ fn cancelled_or_expired_wait_false_request_does_not_spawn_background_delegation(
     );
 
     drop(lock);
+    assert!(server.finish().0.success());
+}
+
+#[test]
+fn fourth_reply_is_refused_as_busy_before_blocked_session_load() {
+    let fleet = Fleet::new(&["codex", "agy", "kimi", "grok"]);
+    let lock_path = seed_codex_session(&fleet);
+
+    let locks = [0, 1, 2].map(|i| fleet.root.join(format!("busy-slot-{i}.lock")));
+    let releases = [0, 1, 2].map(|i| fleet.root.join(format!("busy-slot-{i}.go")));
+    fleet.script(
+        "agy",
+        json!([{
+            "stdout": json!({
+                "status": "SUCCESS",
+                "conversation_id": "busy-agy",
+                "response": "agy-done"
+            }).to_string(),
+            "hold_file": locks[0],
+            "wait_for": releases[0],
+        }]),
+    );
+    fleet.script(
+        "kimi",
+        json!([{
+            "stdout": format!(
+                "{}\n{}\n",
+                json!({"role": "assistant", "content": "kimi-done"}),
+                json!({"role": "meta", "type": "session.resume_hint", "session_id": "busy-kimi"})
+            ),
+            "hold_file": locks[1],
+            "wait_for": releases[1],
+        }]),
+    );
+    fleet.script(
+        "grok",
+        json!([{
+            "stdout": json!({
+                "stopReason": "end_turn",
+                "num_turns": 1,
+                "sessionId": "11111111-2222-4333-8444-555555555555",
+                "text": "grok-done"
+            }).to_string(),
+            "hold_file": locks[2],
+            "wait_for": releases[2],
+        }]),
+    );
+
+    // Fresh tested server has an empty StartStore; declare `server` before `session_lock` so
+    // an assert panic drops the external OS lock before `Server::drop` waits on cleanup.
+    let mut server = fleet.server("claude");
+    server.request(1, "tools/list", json!({}));
+    let session_lock = acquire_exclusive_lock(&lock_path);
+
+    let mut handles = Vec::new();
+    for (i, (provider, lock)) in ["antigravity", "kimi", "grok"]
+        .into_iter()
+        .zip(&locks)
+        .enumerate()
+    {
+        let (started, is_error) = raw_call(
+            &mut server,
+            10 + i as i64,
+            provider,
+            json!({"prompt": format!("occupy slot {i}"), "wait": false}),
+        );
+        assert!(!is_error, "{provider}: {started}");
+        assert_eq!(started["state"], "running", "{started}");
+        handles.push(started["handle"].as_str().unwrap().to_owned());
+        assert!(!is_free(&lock_file(lock)), "{provider} stub must hold slot");
+    }
+
+    let before = fleet.records().len();
+    for wait in [false, true] {
+        let busy = call(
+            &mut server,
+            "codex-reply",
+            json!({
+                "thread_id": CODEX_THREAD,
+                "prompt": "fourth reply while locked",
+                "wait": wait,
+                "timeout_ms": 500
+            }),
+        );
+        assert_eq!(busy["observed"]["state"], "failed", "wait={wait}: {busy}");
+        assert_eq!(
+            busy["observed"]["failure"]["kind"], "busy",
+            "wait={wait}: {busy}"
+        );
+    }
+    assert_eq!(
+        fleet.records().len(),
+        before,
+        "busy fourth reply must not launch any provider child"
+    );
+
+    fs::write(&releases[0], []).unwrap();
+    let (first_done, is_error) = raw_call(
+        &mut server,
+        20,
+        "await",
+        json!({"handles": [&handles[0]], "condition": "all"}),
+    );
+    assert!(!is_error, "{first_done}");
+    assert_eq!(
+        first_done["results"][0]["state"], "finished",
+        "{first_done}"
+    );
+
+    drop(session_lock);
+    fleet.script("codex", json!([{"stdout": CODEX_FINISHED}]));
+    let resumed = call(
+        &mut server,
+        "codex-reply",
+        json!({"thread_id": CODEX_THREAD, "prompt": "resume after slot frees"}),
+    );
+    assert_eq!(resumed["observed"]["state"], "finished", "{resumed}");
+    assert_eq!(resumed["reported"]["content"], "The two paragraphs agree.");
+
+    fs::write(&releases[1], []).unwrap();
+    fs::write(&releases[2], []).unwrap();
+    let (rest_done, is_error) = raw_call(
+        &mut server,
+        21,
+        "await",
+        json!({"handles": [&handles[1], &handles[2]], "condition": "all"}),
+    );
+    assert!(!is_error, "{rest_done}");
+    assert!(
+        rest_done["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["state"] == "finished"),
+        "{rest_done}"
+    );
+    assert!(server.finish().0.success());
+}
+
+#[test]
+fn preflight_failure_after_admission_releases_capacity() {
+    let fleet = Fleet::new(&["codex", "agy"]);
+    let lock_path = seed_codex_session(&fleet);
+
+    let locks = [0, 1, 2].map(|i| fleet.root.join(format!("cap-{i}.lock")));
+    let releases = [0, 1, 2].map(|i| fleet.root.join(format!("cap-{i}.go")));
+    let steps = [0, 1, 2].map(|i| {
+        let mut step = turn(&format!("cap-{i}"));
+        step["hold_file"] = json!(locks[i]);
+        step["wait_for"] = json!(releases[i]);
+        step
+    });
+    fleet.script("agy", json!(steps));
+
+    let mut server = fleet.server("claude");
+    server.request(1, "tools/list", json!({}));
+    let session_lock = acquire_exclusive_lock(&lock_path);
+
+    let mut handles = Vec::new();
+    for (i, lock) in locks.iter().take(2).enumerate() {
+        let (started, is_error) = raw_call(
+            &mut server,
+            10 + i as i64,
+            "antigravity",
+            json!({"prompt": format!("hold {i}"), "wait": false}),
+        );
+        assert!(!is_error, "{started}");
+        handles.push(started["handle"].as_str().unwrap().to_owned());
+        assert!(!is_free(&lock_file(lock)), "stub {i} must hold slot");
+    }
+
+    let before = fleet.records().len();
+    let bad_turn = call(
+        &mut server,
+        "codex",
+        json!({"prompt": "bad effort", "effort": "bogus"}),
+    );
+    assert_eq!(bad_turn["observed"]["failure"]["kind"], "invalid_request");
+
+    let bad_preflight = call(&mut server, "codex", json!({"prompt": "-", "wait": false}));
+    assert_eq!(
+        bad_preflight["observed"]["failure"]["kind"],
+        "invalid_request"
+    );
+
+    let timed_load = call(
+        &mut server,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "blocked load",
+            "wait": false,
+            "timeout_ms": 500
+        }),
+    );
+    assert_eq!(timed_load["observed"]["failure"]["kind"], "timeout");
+    drop(session_lock);
+    assert_eq!(
+        fleet.records().len(),
+        before,
+        "preflight failures must not launch any provider child"
+    );
+
+    let (third, is_error) = raw_call(
+        &mut server,
+        12,
+        "antigravity",
+        json!({"prompt": "third slot", "wait": false}),
+    );
+    assert!(!is_error, "{third}");
+    assert_eq!(third["state"], "running", "{third}");
+    handles.push(third["handle"].as_str().unwrap().to_owned());
+    assert!(!is_free(&lock_file(&locks[2])), "stub 2 must hold slot");
+
+    let busy = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "fourth must be busy", "wait": false}),
+    );
+    assert_eq!(busy["observed"]["failure"]["kind"], "busy");
+
+    for release in &releases {
+        fs::write(release, []).unwrap();
+    }
+    let (done, is_error) = raw_call(
+        &mut server,
+        20,
+        "await",
+        json!({"handles": handles, "condition": "all"}),
+    );
+    assert!(!is_error, "{done}");
+    assert!(
+        done["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["state"] == "finished"),
+        "{done}"
+    );
     assert!(server.finish().0.success());
 }

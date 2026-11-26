@@ -52,13 +52,50 @@ struct Retained {
     bytes: usize,
 }
 
+/// Concurrency slot guard that releases the slot on drop unless transferred to a
+/// [`BackgroundTask`] via [`start`](Self::start).
 pub struct SlotGuard {
     background: Arc<Background>,
+    transferred: bool,
+}
+
+impl SlotGuard {
+    /// Transfers this admitted concurrency slot into a tracked background task.
+    pub fn start(
+        mut self,
+        provider: &'static str,
+        cancel: CancellationToken,
+        activity: Activity,
+    ) -> BackgroundTask {
+        let mut state = lock(&self.background.state);
+        let handle = Uuid::new_v4().to_string();
+        state.entries.insert(
+            handle.clone(),
+            Entry::Running {
+                provider,
+                cancel,
+                cancel_requested: false,
+            },
+        );
+        drop(state);
+        let task = BackgroundTask {
+            background: Arc::clone(&self.background),
+            handle,
+            provider,
+            finished: false,
+            _activity: activity,
+        };
+        self.transferred = true;
+        task.background.notify();
+        task
+    }
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        lock(&self.background.state).running -= 1;
+        if !self.transferred {
+            lock(&self.background.state).running -= 1;
+        }
     }
 }
 
@@ -142,37 +179,7 @@ impl Background {
         state.running += 1;
         Some(SlotGuard {
             background: Arc::clone(self),
-        })
-    }
-
-    pub fn try_start(
-        self: &Arc<Self>,
-        provider: &'static str,
-        cancel: CancellationToken,
-        activity: Activity,
-    ) -> Option<BackgroundTask> {
-        let mut state = lock(&self.state);
-        if state.running >= MAX_CONCURRENT {
-            return None;
-        }
-        state.running += 1;
-        let handle = Uuid::new_v4().to_string();
-        state.entries.insert(
-            handle.clone(),
-            Entry::Running {
-                provider,
-                cancel,
-                cancel_requested: false,
-            },
-        );
-        drop(state);
-        self.notify();
-        Some(BackgroundTask {
-            background: Arc::clone(self),
-            handle,
-            provider,
-            finished: false,
-            _activity: activity,
+            transferred: false,
         })
     }
 
