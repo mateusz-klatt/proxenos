@@ -471,6 +471,9 @@ What this cannot do:
   `integrate` or `--remove` does not reload a Claude Code session that is already open.
 - Proxenos reads `CLAUDE_CONFIG_DIR` from the process environment only, not from an `env` block
   inside another Claude Code settings file (such as user or managed settings).
+- A registration follows the `CLAUDE_CONFIG_DIR` it was made with. If the variable changes between
+  `integrate` and `--remove`, both refuse because the settings path changed; run `--remove` again
+  with the value used at `integrate` time to take the registration out.
 - Claude Code can rewrite `settings.json` during a session, so Proxenos's read-modify-rename can
   lose a change Claude Code made concurrently; Proxenos does not lock `settings.json`, because Claude
   Code would not honour our lock.
