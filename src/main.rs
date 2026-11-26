@@ -4,11 +4,14 @@ mod background;
 mod client;
 mod delegation;
 mod discovery;
+mod doctor;
 mod envelope;
+mod integrate;
 mod mcp;
 mod platform;
 mod providers;
 mod sessions;
+mod state;
 mod supervise;
 mod tools;
 
@@ -19,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use client::Client;
 
-const USAGE: &str = "usage: proxenos --version\n       proxenos mcp --client <claude|codex|antigravity|kimi|grok|cursor|copilot>";
+const USAGE: &str = "usage: proxenos --version\n       proxenos mcp --client <claude|codex|antigravity|kimi|grok|cursor|copilot>\n       proxenos integrate claude-code [--remove]\n       proxenos doctor [--json]";
 
 /// How long the runtime may take to stop once serving has ended.
 const RUNTIME_STOPS_WITHIN: Duration = Duration::from_millis(500);
@@ -27,6 +30,8 @@ const RUNTIME_STOPS_WITHIN: Duration = Duration::from_millis(500);
 enum Command {
     Version,
     Mcp(Client),
+    IntegrateClaudeCode { remove: bool },
+    Doctor { json: bool },
 }
 
 fn parse(args: &[OsString]) -> Option<Command> {
@@ -34,6 +39,12 @@ fn parse(args: &[OsString]) -> Option<Command> {
     match args.as_slice() {
         ["--version" | "version"] => Some(Command::Version),
         ["mcp", "--client", name] => Client::parse(name).map(Command::Mcp),
+        ["integrate", "claude-code"] => Some(Command::IntegrateClaudeCode { remove: false }),
+        ["integrate", "claude-code", "--remove"] => {
+            Some(Command::IntegrateClaudeCode { remove: true })
+        }
+        ["doctor"] => Some(Command::Doctor { json: false }),
+        ["doctor", "--json"] => Some(Command::Doctor { json: true }),
         _ => None,
     }
 }
@@ -41,8 +52,26 @@ fn parse(args: &[OsString]) -> Option<Command> {
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match parse(&args) {
-        Some(Command::Version) => version(),
+        Some(Command::Version) => {
+            let line = format!("proxenos {}\n", env!("CARGO_PKG_VERSION"));
+            emit(true, &line, None)
+        }
         Some(Command::Mcp(client)) => serve(client),
+        Some(Command::IntegrateClaudeCode { remove }) => {
+            let outcome = if remove {
+                integrate::remove_claude_code()
+            } else {
+                integrate::integrate_claude_code()
+            };
+            match outcome {
+                Ok(message) => emit(true, &message, None),
+                Err(error) => emit(false, "", Some(&format!("proxenos: {error}"))),
+            }
+        }
+        Some(Command::Doctor { json }) => {
+            let (ok, output) = doctor::run(json);
+            emit(ok, &output, None)
+        }
         None => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -50,13 +79,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn version() -> ExitCode {
-    // Standard output carries the MCP protocol, so nothing reaches it through a print macro
-    // (the lint denies that): every write to it is explicit.
-    let line = format!("proxenos {}\n", env!("CARGO_PKG_VERSION"));
-    match std::io::stdout().write_all(line.as_bytes()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::FAILURE,
+fn emit(ok: bool, stdout: &str, stderr: Option<&str>) -> ExitCode {
+    if let Some(error) = stderr {
+        eprintln!("{error}");
+    }
+    // Standard output carries the MCP protocol in `mcp` mode, so nothing reaches it through a
+    // print macro (the lint denies that): every write to it is explicit.
+    if std::io::stdout().write_all(stdout.as_bytes()).is_ok() && ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
