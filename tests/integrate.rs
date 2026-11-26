@@ -1185,6 +1185,7 @@ fn doctor_json_shape_and_real_binary_handshake_and_usage_errors() {
             "cli.kimi",
             "cli.claude",
             "cli.copilot",
+            "cli.grok",
             "claude-code.handshake"
         ]
     );
@@ -2336,6 +2337,12 @@ mod with_stubs {
             json!({"stdout": "2.8.0\n"}).to_string(),
         )
         .unwrap();
+        install_stub(&bin_dir, "grok");
+        fs::write(
+            sb.root.join("grok.version"),
+            json!({"stdout": "grok 1.0.92 (b06756fd6256)\n"}).to_string(),
+        )
+        .unwrap();
         install_stub(&bin_dir, "copilot");
         fs::write(
             sb.root.join("copilot.version"),
@@ -2395,6 +2402,10 @@ mod with_stubs {
             find_check(&report, "cli.copilot")["details"]["version"],
             "GitHub Copilot CLI 1.0.116."
         );
+        assert_eq!(
+            find_check(&report, "cli.grok")["details"]["version"],
+            "grok 1.0.92 (b06756fd6256)"
+        );
         let tools: Vec<&str> = find_check(&report, "claude-code.handshake")["details"]["tools"]
             .as_array()
             .unwrap()
@@ -2408,6 +2419,8 @@ mod with_stubs {
             "antigravity-reply",
             "copilot",
             "copilot-reply",
+            "grok",
+            "grok-reply",
         ] {
             assert!(
                 tools.contains(&expected),

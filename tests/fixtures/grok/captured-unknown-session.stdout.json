@@ -1,0 +1,1 @@
+{"type":"error","message":"No session found with ID: 00000000-0000-4000-8000-000000000001. Sessions saved to the session registry weren't searched: no live xAI login is stored here; run `grok login` to search them."}

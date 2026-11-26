@@ -5,6 +5,7 @@ mod antigravity;
 mod claude;
 mod codex;
 mod copilot;
+mod grok;
 mod kimi;
 
 use std::ffi::OsString;
@@ -23,6 +24,7 @@ pub const ALL: &[Provider] = &[
     kimi::SPEC,
     claude::SPEC,
     copilot::SPEC,
+    grok::SPEC,
 ];
 pub const DEFAULT_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_MODEL_LEN: usize = 256;
@@ -46,9 +48,67 @@ pub struct Provider {
     pub parse: fn(&Finished, &str, Option<&str>) -> Report,
 }
 
+// A static provider declaration. The callbacks contain all executable behaviour.
+macro_rules! full_access_print {
+    (
+        name: $name:literal, unix_dirs: $dirs:expr, efforts: $efforts:expr,
+        full_access: $access:literal, handlers: ($prepare:path, $argv:path, $parse:path),
+    ) => {
+        $crate::providers::Provider {
+            name: $name,
+            cli: $name,
+            #[cfg(unix)]
+            install_dirs: $dirs,
+            #[cfg(windows)]
+            install_dirs: &[],
+            efforts: $efforts,
+            start_settings: $crate::providers::PRINT_SETTINGS,
+            reply_settings: $crate::providers::PRINT_SETTINGS,
+            access: &[("full", $access)],
+            fixed_instructions: false,
+            reply_model: false,
+            not_claimed: &[],
+            read_only_not_claimed: &[],
+            prepare: $prepare,
+            argv: $argv,
+            parse: $parse,
+        }
+    };
+}
+use full_access_print;
+
+const PRINT_SETTINGS: &[&str] = &["model", "effort", "cwd", "access", "mode", "instructions"];
+
 pub struct CommandLine {
     pub args: Vec<OsString>,
     pub cli_timeout_ms: Option<u64>,
+}
+
+impl CommandLine {
+    /// Build a JSON print invocation around the CLI's own access and resume switches.
+    fn for_print_turn(
+        turn: &Turn,
+        flags: &[&str],
+        resume: impl IntoIterator<Item = OsString>,
+    ) -> Self {
+        let mut args = vec![OsString::from("--output-format"), "json".into()];
+        args.extend(flags.iter().copied().map(OsString::from));
+        args.extend(resume);
+        if let Some(model) = &turn.settings.model {
+            args.extend(["--model".into(), model.into()]);
+        }
+        if let Some(effort) = &turn.settings.effort {
+            args.extend(["--reasoning-effort".into(), effort.into()]);
+        }
+        args.extend([
+            "-p".into(),
+            format!("{}\n\n{}", turn.guidance, turn.prompt).into(),
+        ]);
+        Self {
+            args,
+            cli_timeout_ms: None,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -70,6 +130,14 @@ pub struct RememberedStart {
 
 fn is_canonical_uuid(id: &str) -> bool {
     uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
+}
+
+fn token_usage(value: &Value, fields: &[&str]) -> Option<Value> {
+    let counts: Map<String, Value> = fields
+        .iter()
+        .filter_map(|&field| Some((field.to_owned(), Value::from(value[field].as_u64()?))))
+        .collect();
+    (!counts.is_empty()).then_some(Value::Object(counts))
 }
 
 /// Validates a model name from either a caller or untrusted provider output.
@@ -96,6 +164,21 @@ pub struct Turn {
     pub wait: bool,
     pub memory_limit_bytes: Option<u64>,
     pub denied_tools: Vec<String>,
+}
+
+impl Turn {
+    fn require_session_uuid(&self, provider: &str) -> Result<(), String> {
+        if self
+            .thread_id
+            .as_deref()
+            .is_some_and(|id| !is_canonical_uuid(id))
+        {
+            return Err(format!(
+                "{provider} thread_id must be a canonical session UUID."
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default, Serialize)]

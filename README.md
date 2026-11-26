@@ -39,9 +39,9 @@ over standard I/O. The accepted client names are `claude`, `codex`, `antigravity
 ## Delegate a task
 
 The available providers are Claude Code (`claude`), Codex CLI (`codex`), Antigravity
-(`antigravity`, using `agy`), Kimi Code (`kimi`) and GitHub Copilot CLI (`copilot`).
+(`antigravity`, using `agy`), Kimi Code (`kimi`), GitHub Copilot CLI (`copilot`) and Grok Build (`grok`).
 Each provider whose CLI is found offers a start tool and a matching `-reply` tool.
-The server omits the client’s own provider. Copilot requires `access: "full"`.
+The server omits the client’s own provider. Copilot and Grok require `access: "full"`.
 For example, Claude Code can call `codex` with a `prompt`, then call `codex-reply` with a
 new prompt and the `thread_id` returned by Codex.
 

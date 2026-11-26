@@ -1,4 +1,5 @@
 //! Copilot print mode emits events followed by a result for the session.
+
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -7,68 +8,28 @@ use super::{CommandLine, Failure, Provider, Report, Turn, is_canonical_uuid, is_
 use crate::envelope::FailureKind;
 use crate::supervise::Finished;
 
-const SETTINGS: &[&str] = &["model", "effort", "cwd", "access", "mode", "instructions"];
-
-pub(super) const SPEC: Provider = Provider {
+pub(super) const SPEC: Provider = super::full_access_print! {
     name: "copilot",
-    cli: "copilot",
-    #[cfg(unix)]
-    install_dirs: &[("HOME", ".local/bin")],
-    #[cfg(windows)]
-    install_dirs: &[],
+    unix_dirs: &[("HOME", ".local/bin")],
     efforts: &["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-    start_settings: SETTINGS,
-    reply_settings: SETTINGS,
-    access: &[(
-        "full",
-        "Copilot runs with --allow-all. CLI deny rules and organization policy still apply. No read-only configuration has been verified across its tools.",
-    )],
-    fixed_instructions: false,
-    reply_model: false,
-    not_claimed: &[],
-    read_only_not_claimed: &[],
-    prepare,
-    argv,
-    parse,
+    full_access: "Copilot runs with --allow-all. CLI deny rules and organization policy still apply. No read-only configuration has been verified across its tools.",
+    handlers: (prepare, argv, parse),
 };
 
 fn prepare(turn: &mut Turn) -> Result<(), String> {
-    if turn
-        .thread_id
-        .as_deref()
-        .is_some_and(|id| !is_canonical_uuid(id))
-    {
-        return Err("Copilot thread_id must be a canonical session UUID.".into());
-    }
-    Ok(())
+    turn.require_session_uuid("Copilot")
 }
 
 fn argv(turn: &Turn, _output: &Path) -> CommandLine {
-    let mut args = vec![
-        "--output-format".into(),
-        "json".into(),
-        "--stream".into(),
-        "off".into(),
-        "--no-custom-instructions".into(),
-        "--allow-all".into(),
-    ];
-    if let Some(id) = &turn.thread_id {
-        args.push(format!("--resume={id}").into());
-    }
-    if let Some(model) = &turn.settings.model {
-        args.extend(["--model".into(), model.into()]);
-    }
-    if let Some(effort) = &turn.settings.effort {
-        args.extend(["--reasoning-effort".into(), effort.into()]);
-    }
-    args.extend([
-        "-p".into(),
-        format!("{}\n\n{}", turn.guidance, turn.prompt).into(),
-    ]);
-    CommandLine {
-        args,
-        cli_timeout_ms: None,
-    }
+    let resume = turn
+        .thread_id
+        .as_ref()
+        .map(|id| format!("--resume={id}").into());
+    CommandLine::for_print_turn(
+        turn,
+        &["--stream", "off", "--no-custom-instructions", "--allow-all"],
+        resume,
+    )
 }
 
 fn cli_failure(stderr: &[u8], expected: Option<&str>) -> Option<Failure> {
