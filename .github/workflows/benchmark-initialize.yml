@@ -20,13 +20,25 @@ permissions:
 jobs:
   initialize:
     if: ${{ github.event_name == 'pull_request' || inputs.measurement == 'initialize' || inputs.measurement == 'all' }}
-    name: MCP initialize (20 pairs)
-    runs-on: ubuntu-26.04
+    name: MCP initialize (${{ matrix.platform }}, 20 pairs)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            platform: linux
+            exe_suffix: ''
+          - runner: windows-latest
+            platform: windows
+            exe_suffix: .exe
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     defaults:
       run:
         shell: bash
     env:
+      BENCHMARK_OS: ${{ matrix.platform }}
+      EXE_SUFFIX: ${{ matrix.exe_suffix }}
       PROXENOS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       BASELINE_SHA: cd4eb9ec6b08bc065884be893ae4bf55367ae9fe
 
@@ -64,36 +76,43 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$PROXENOS_SHA"
           test "$(git -C ../baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          node_bin="$(node -e 'process.stdout.write(process.execPath)')"
+          printf 'BENCHMARK_NODE=%s\n' "$node_bin" >> "$GITHUB_ENV"
           mkdir ../results
           {
             printf 'Run %s/%s/actions/runs/%s (attempt %s)\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
             printf 'Proxenos %s\nclaude-delegator %s\n' "$PROXENOS_SHA" "$BASELINE_SHA"
             printf 'Runner image %s %s\n' "$ImageOS" "$ImageVersion"
-            cat /etc/os-release
-            uname -srmo
-            lscpu
+            node -e 'const os = require("node:os"); const cpus = os.cpus();
+              console.log("OS", os.type(), os.release(), os.version(), os.arch());
+              console.log("Logical CPUs", cpus.length, "Models", [...new Set(cpus.map(cpu => cpu.model))].join(", "));'
+            if [[ "$RUNNER_OS" == Linux ]]; then
+              cat /etc/os-release
+              uname -srmo
+              lscpu
+            fi
             rustc -Vv
             cargo -Vv
-            printf 'Node %s at %s\n' "$(node --version)" "$(realpath "$(command -v node)")"
+            printf 'Node %s at %s\n' "$(node --version)" "$node_bin"
             printf 'npm %s\n' "$(npm --version)"
-            sha256sum Cargo.lock ../baseline/package-lock.json target/release/compare_init
+            sha256sum Cargo.lock ../baseline/package-lock.json "target/release/compare_init$EXE_SUFFIX"
           } > ../results/provenance.txt
 
       - name: Measure 20 balanced pairs
         id: measure
         working-directory: proxenos
         run: |
-          target/release/compare_init target/release/proxenos "$(command -v node)" \
-            ../baseline target/release/proxenos-stub 20 > ../results/initialize.json
+          "target/release/compare_init$EXE_SUFFIX" "target/release/proxenos$EXE_SUFFIX" "$BENCHMARK_NODE" \
+            "../baseline" "target/release/proxenos-stub$EXE_SUFFIX" 20 > ../results/initialize.json
 
       - name: Summarize every measured target
         if: ${{ !cancelled() && steps.measure.outcome != 'skipped' }}
         run: |
-          jq -e '.d12_baseline_version_matches and .inputs.pairs == 20 and (.trials | length == 40)' results/initialize.json > /dev/null
+          jq -e --arg os "$BENCHMARK_OS" '.os == $os and .d12_baseline_version_matches and .inputs.pairs == 20 and (.trials | length == 40)' results/initialize.json > /dev/null
           {
             echo '## MCP process startup to initialize response'
             echo
-            echo '20 alternating pairs on one Linux runner. Each median includes successful trials only.'
+            printf '20 alternating pairs on one %s runner. Each median includes successful trials only.\n' "$RUNNER_OS"
             echo
             echo '| Target | Successful | Failed | Median (ms) |'
             echo '| --- | ---: | ---: | ---: |'
@@ -106,7 +125,7 @@ jobs:
         if: ${{ !cancelled() && steps.measure.outcome != 'skipped' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mcp-initialize-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          name: mcp-initialize-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: results/
           if-no-files-found: error
           retention-days: 30
