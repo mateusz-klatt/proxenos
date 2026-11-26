@@ -1,0 +1,5 @@
+Session "session_11111111-2222-4333-8444-555555555555" was created under a different directory.
+  cd "/tmp/other-workspace" && kimi -r session_11111111-2222-4333-8444-555555555555
+
+error: failed to run prompt: Session "session_11111111-2222-4333-8444-555555555555" was created under a different directory.
+See log: /tmp/kimi-capture-env/.kimi-code/logs/kimi-code.log

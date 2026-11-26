@@ -15,6 +15,8 @@ mod common;
 mod content;
 #[path = "mcp/discovery.rs"]
 mod discovery;
+#[path = "mcp/kimi.rs"]
+mod kimi;
 mod provider_support;
 #[path = "mcp/sessions.rs"]
 mod sessions;

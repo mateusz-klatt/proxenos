@@ -1,0 +1,7 @@
+{"role":"meta","type":"system.version","version":"2.8.0"}
+non-json terminal noise {ignored}
+{"role":"assistant","content":null}
+{"role":"assistant","content":"   "}
+{"role":"assistant","content":"First step."}
+{"role":"assistant","content":"Second step."}
+{"role":"meta","type":"session.resume_hint","session_id":"session_11111111-2222-4333-8444-555555555555","command":"kimi -r session_11111111-2222-4333-8444-555555555555","content":"To resume this session: kimi -r session_11111111-2222-4333-8444-555555555555"}

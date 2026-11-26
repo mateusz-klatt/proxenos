@@ -31,6 +31,7 @@ pub(super) const SPEC: Provider = Provider {
             "Antigravity denies shell permission in print mode. It can still write files, search the web and fetch URLs.",
         ),
     ],
+    not_claimed: &[],
     fixed_instructions: false,
     reply_model: true,
     prepare,

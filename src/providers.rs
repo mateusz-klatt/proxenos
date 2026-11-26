@@ -3,6 +3,7 @@
 
 mod antigravity;
 mod codex;
+mod kimi;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use crate::envelope::Failure;
 use crate::mcp::ToolSpec;
 use crate::supervise::Finished;
 
-pub const ALL: &[Provider] = &[codex::SPEC, antigravity::SPEC];
+pub const ALL: &[Provider] = &[codex::SPEC, antigravity::SPEC, kimi::SPEC];
 pub const DEFAULT_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_MODEL_LEN: usize = 256;
 
@@ -28,6 +29,7 @@ pub struct Provider {
     pub start_settings: &'static [&'static str],
     pub reply_settings: &'static [&'static str],
     pub access: &'static [(&'static str, &'static str)],
+    pub not_claimed: &'static [&'static str],
     pub fixed_instructions: bool,
     pub reply_model: bool,
     pub prepare: fn(&Turn) -> Result<(), String>,
@@ -218,6 +220,12 @@ impl Provider {
                 }
             };
             if !valid {
+                if key == "access" && value.as_str() == Some("read-only") {
+                    return Err(format!(
+                        "{} does not support access: read-only; its CLI cannot enforce read-only restrictions.",
+                        self.name
+                    ));
+                }
                 return Err(format!("Unsupported parameter or value for {key}"));
             }
         }

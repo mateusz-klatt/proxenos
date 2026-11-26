@@ -60,6 +60,7 @@ pub struct Envelope {
     pub report: Report,
     attempts: Vec<Value>,
     accounting: Option<Accounting>,
+    not_claimed: &'static [&'static str],
 }
 
 impl Envelope {
@@ -75,6 +76,7 @@ impl Envelope {
             report: Report::default(),
             attempts: Vec::new(),
             accounting: None,
+            not_claimed: provider.not_claimed,
             observed: json!({
                 "provider": provider.name,
                 "requested": requested,
@@ -164,16 +166,18 @@ impl Envelope {
         self.observed["duration_ms"] = json!(self.elapsed().as_millis());
         self.observed["attempts"] = json!(self.attempts);
         self.observed["accounting"] = json!(self.accounting);
+        let mut not_claimed = vec![
+            "The provider followed its requested mode.",
+            "The CLI loaded particular instruction files.",
+            "A review established a verdict.",
+            "A git snapshot identifies the author of a change or captures every edit.",
+        ];
+        not_claimed.extend_from_slice(self.not_claimed);
         let value = json!({
             "schema_version": 1,
             "observed": self.observed,
             "reported": self.report,
-            "not_claimed": [
-                "The provider followed its requested mode.",
-                "The CLI loaded particular instruction files.",
-                "A review established a verdict.",
-                "A git snapshot identifies the author of a change or captures every edit."
-            ]
+            "not_claimed": not_claimed
         });
         (self.state, value)
     }
