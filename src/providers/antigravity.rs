@@ -134,9 +134,15 @@ fn response(bytes: &[u8]) -> Option<Value> {
     object(bytes).or_else(|| bytes.rsplit(|b| *b == b'\n').find_map(object))
 }
 
-// Only CLI error channels (top-level JSON `error` on non-SUCCESS status and stderr) reach
-// this classifier, never agent-authored `response` text.
-fn classify(message: &str) -> Option<Failure> {
+const SIGN_IN_PROMPT: &str = "Authentication required. Please visit the URL to log in";
+const SIGN_IN_DIAGNOSTIC: &str = "agy is not signed in. Run `agy` to sign in. The CLI's sign-in output was omitted because it contains a one-time login URL.";
+
+fn authentication_failure() -> Failure {
+    Failure::new(FailureKind::Authentication, "Antigravity requires sign-in")
+}
+
+// Only CLI error channels reach this classifier, never agent-authored `response` text.
+fn classify(message: &str, from_json: bool) -> Option<Failure> {
     let lower = message.to_ascii_lowercase();
     let kind = if lower.contains("quota")
         && ["exhaust", "exceed", "quota limit reached"]
@@ -144,16 +150,17 @@ fn classify(message: &str) -> Option<Failure> {
             .any(|s| lower.contains(s))
     {
         FailureKind::Quota
-    } else if [
-        "unauthenticated",
-        "authentication required",
-        "authentication failed",
-        "not authenticated",
-    ]
-    .iter()
-    .any(|s| lower.contains(s))
+    } else if from_json
+        && [
+            "unauthenticated",
+            "authentication required",
+            "authentication failed",
+            "not authenticated",
+        ]
+        .iter()
+        .any(|s| lower.contains(s))
     {
-        FailureKind::Authentication
+        return Some(authentication_failure());
     } else if lower.contains("timeout waiting for response") {
         FailureKind::Timeout
     } else if lower.contains("a tool required the \"command\" permission") {
@@ -171,117 +178,38 @@ fn classify(message: &str) -> Option<Failure> {
     Some(failure)
 }
 
-const DIAGNOSTIC_LIMIT: usize = 2048;
-const OMITTED_URL: &str = "[sign-in URL omitted]";
-
-fn redact_urls_in_line(line: &str) -> (String, bool) {
-    let lower = line.to_ascii_lowercase();
-    let mut out = String::with_capacity(line.len());
-    let mut cursor = 0;
-    let mut found = false;
-    while let Some(offset) = ["https://", "http://"]
-        .into_iter()
-        .filter_map(|scheme| lower[cursor..].find(scheme))
-        .min()
-    {
-        let start = cursor + offset;
-        let end = line[start..]
-            .find(char::is_whitespace)
-            .map_or(line.len(), |len| start + len);
-        out.push_str(&line[cursor..start]);
-        out.push_str(OMITTED_URL);
-        cursor = end;
-        found = true;
+fn turn_failure(error: Option<&str>, stderr: &str) -> Option<Failure> {
+    if let Some(failure) = error.and_then(|message| classify(message, true)) {
+        return Some(failure);
     }
-    out.push_str(&line[cursor..]);
-    (out, found)
-}
-
-fn is_url_continuation(line: &str) -> bool {
-    let trimmed = line.trim();
-    !trimmed.is_empty()
-        && trimmed.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'-' | b'.'
-                        | b'_'
-                        | b'~'
-                        | b':'
-                        | b'/'
-                        | b'?'
-                        | b'#'
-                        | b'['
-                        | b']'
-                        | b'@'
-                        | b'!'
-                        | b'$'
-                        | b'&'
-                        | b'\''
-                        | b'('
-                        | b')'
-                        | b'*'
-                        | b'+'
-                        | b','
-                        | b';'
-                        | b'='
-                        | b'%'
-                )
-        })
-}
-
-fn omit_sign_in_urls(text: &str) -> String {
-    let mut in_url_continuation = false;
-    let mut out = String::with_capacity(text.len());
-    for chunk in text.split_inclusive('\n') {
-        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
-        let eol = &chunk[line.len()..];
-        let (redacted, had_url) = redact_urls_in_line(line);
-        if had_url {
-            out.push_str(&redacted);
-            out.push_str(eol);
-            in_url_continuation = redacted.trim_end().ends_with(OMITTED_URL);
-        } else if in_url_continuation && is_url_continuation(line) {
-            continue;
-        } else {
-            out.push_str(line);
-            out.push_str(eol);
-            in_url_continuation = false;
-        }
+    if stderr.lines().any(|line| line.starts_with(SIGN_IN_PROMPT)) {
+        return Some(authentication_failure());
     }
-    out
-}
-
-fn stderr_auth_fallback(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    lower.contains("authentication required. please visit the url to log in")
-        || lower.contains("authentication failed")
-}
-
-fn finish_report(mut report: Report, stderr: &str) -> Report {
-    if let Some(failure) = &mut report.failure
-        && failure.kind == FailureKind::Authentication
-    {
-        failure.message = omit_sign_in_urls(&failure.message);
-        if !stderr.is_empty() {
-            let redacted = omit_sign_in_urls(stderr);
-            let end = redacted.floor_char_boundary(DIAGNOSTIC_LIMIT);
-            report.diagnostic = Some(redacted[..end].to_owned());
-        }
+    if error.is_none() {
+        return classify(stderr.trim(), false);
     }
-    report
+    None
 }
 
 fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
     let stderr = String::from_utf8_lossy(&finished.stderr.bytes);
-    let Some(value) = response(&finished.stdout.bytes) else {
-        return finish_report(
-            Report {
-                failure: classify(stderr.trim()),
-                ..Report::default()
-            },
-            &stderr,
-        );
+    let mut report = parse_report(response(&finished.stdout.bytes), &stderr, expected);
+    if report
+        .failure
+        .as_ref()
+        .is_some_and(|failure| failure.kind == FailureKind::Authentication)
+    {
+        report.diagnostic = Some(SIGN_IN_DIAGNOSTIC.to_owned());
+    }
+    report
+}
+
+fn parse_report(value: Option<Value>, stderr: &str, expected: Option<&str>) -> Report {
+    let Some(value) = value else {
+        return Report {
+            failure: turn_failure(None, stderr),
+            ..Report::default()
+        };
     };
     let text = |key: &str| value[key].as_str().filter(|s| !s.trim().is_empty());
     let raw_id = text("conversation_id");
@@ -307,22 +235,17 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
     }
     if !success {
         let error = text("error");
-        let stderr = stderr.trim();
-        let reason = error.unwrap_or(stderr);
-        let reason = if reason.is_empty() {
-            "Antigravity returned an unsuccessful status"
-        } else {
-            reason
-        };
-        let failure = classify(reason).or_else(|| {
-            error
-                .filter(|_| stderr_auth_fallback(stderr))
-                .map(|_| Failure::new(FailureKind::Authentication, reason))
-        });
-        report.failure =
-            Some(failure.unwrap_or_else(|| Failure::new(FailureKind::Unknown, reason)));
+        report.failure = Some(turn_failure(error, stderr).unwrap_or_else(|| {
+            let reason = error.unwrap_or_else(|| stderr.trim());
+            let reason = if reason.is_empty() {
+                "Antigravity returned an unsuccessful status"
+            } else {
+                reason
+            };
+            Failure::new(FailureKind::Unknown, reason)
+        }));
     } else if report.content.is_none() {
-        report.failure = Some(classify(stderr.trim()).unwrap_or_else(|| {
+        report.failure = Some(turn_failure(None, stderr).unwrap_or_else(|| {
             Failure::new(
                 FailureKind::Unknown,
                 "Antigravity returned an empty response",
@@ -331,5 +254,5 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
     } else {
         report.completed = true;
     }
-    finish_report(report, &stderr)
+    report
 }

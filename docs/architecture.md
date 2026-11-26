@@ -308,15 +308,17 @@ URL) to standard error, and writes a single JSON object to standard output with 
 `conversation_id` (`""`), `status` (`"ERROR"`), `response` (`""`), `error`
 (`"authentication failed or timed out"`), `duration_seconds` (`0` despite the ~60 s wait),
 `num_turns`, `usage` (`input_tokens`, `output_tokens`, `thinking_tokens`, `cache_read_tokens`,
-`total_tokens`), and `finished_reason` (`"error"`). For Antigravity failure classification, the top-level JSON `error` field on non-`"SUCCESS"`
-status wins; standard error is used when `error` is absent or empty, or as an authentication
-fallback on `agy`'s login prompt or `"authentication failed"` when `error` is unclassified
-(keeping the JSON `error` text as the failure message when present, bounded by D2's excerpt
-limit), and `response` is never classified. Classification applies `quota`, `authentication`,
-`timeout`, and `refusal`, falling back to `unknown` otherwise. On a non-zero exit or incomplete
-turn, standard error (up to 2 KiB) is copied into `reported.diagnostic`. For an Antigravity
-authentication failure, Proxenos omits sign-in URLs (and any wrapped continuation lines) from the
-diagnostic with `[sign-in URL omitted]`.
+`total_tokens`), and `finished_reason` (`"error"`).
+
+For a failed Antigravity turn, a classified top-level JSON `error` takes precedence. Standard
+error can establish an authentication failure when that field is absent, blank or unclassified
+and a line starts with the exact `agy` sign-in prompt above. When both the JSON error and the
+sign-in prompt are absent, Proxenos reads other failure kinds from standard error. It never
+classifies agent-authored `response` text. On a non-zero exit or incomplete turn, up to 2 KiB of
+standard error normally goes into `reported.diagnostic`. An authentication failure uses fixed
+`reported.failure.message` and `reported.diagnostic` text that omits the CLI's sign-in output.
+The diagnostic tells the caller to run `agy` to sign in. The observed byte counts still include
+the captured output.
 
 Not measured: Proxenos has not yet captured live `agy` `SUCCESS` turn output, print-timeout
 output, or any real Codex CLI output; those fixtures remain synthetic, derived from

@@ -11,6 +11,26 @@ const PRINT_TIMEOUT: &str = include_str!("../fixtures/antigravity/timeout.json")
 const CAPTURED_AUTH_FAILED: &str =
     include_str!("../fixtures/antigravity/captured-auth-failed.stdout.json");
 const ID: &str = "paper-crane";
+const SIGN_IN_PROMPT: &str = "Authentication required. Please visit the URL to log in:";
+const SIGN_IN_DIAGNOSTIC: &str = "agy is not signed in. Run `agy` to sign in. The CLI's sign-in output was omitted because it contains a one-time login URL.";
+
+fn failed_json(error: &str) -> String {
+    json!({"status": "ERROR", "response": "", "error": error}).to_string()
+}
+
+#[track_caller]
+fn assert_sign_in_failure(result: &Value) {
+    assert_reported_failure(
+        result,
+        Some(("abnormal_exit", "exit code 1")),
+        "authentication",
+        "Antigravity requires sign-in",
+    );
+    assert_eq!(
+        result["reported"]["diagnostic"], SIGN_IN_DIAGNOSTIC,
+        "{result}"
+    );
+}
 
 fn store(fleet: &Fleet) -> PathBuf {
     fleet.root.join(".gemini/antigravity-cli/conversations")
@@ -304,15 +324,14 @@ fn both_directory_overrides_are_honoured_with_the_proxenos_one_first() {
 fn print_status_and_permission_diagnostics_classify_only_the_failed_turn() {
     let fleet = Fleet::new(&["agy"]);
     let mut server = fleet.server("claude");
-    let failed = |error: &str| json!({"status":"ERROR","response":"","error":error}).to_string();
     let denial = "jetski: no output produced — a tool required the \"command\" permission";
     let quota = "Quota exhausted. Quota resets at 2030-04-02T15:00:00Z.";
     fleet.script("agy", json!([
         {"stdout": PRINT_TIMEOUT, "code":1},
-        {"stdout":failed(quota), "code":1},
-        {"stdout":failed("Authentication required"), "code":1},
-        {"stdout":failed("Invalid model selection"), "code":1},
-        {"stdout":failed(""), "code":1},
+        {"stdout":failed_json(quota), "code":1},
+        {"stdout":failed_json("Authentication required"), "code":1},
+        {"stdout":failed_json("Invalid model selection"), "code":1},
+        {"stdout":failed_json(""), "code":1},
         {"stdout":r#"{"status":"SUCCESS","response":""}"#, "stderr":denial},
         {"stdout":r#"{"status":"SUCCESS","response":"  "}"#},
         {"stdout":"terminal noise {with braces}\n{\"status\":\"SUCCESS\",\"response\":\"quota exceeded\",\"conversation_id\":\"paper-crane\"}\n{}", "stderr":"authentication required"},
@@ -333,7 +352,7 @@ fn print_status_and_permission_diagnostics_classify_only_the_failed_turn() {
         (
             Some(("abnormal_exit", "exit code 1")),
             "authentication",
-            "Authentication required",
+            "Antigravity requires sign-in",
         ),
         (
             Some(("abnormal_exit", "exit code 1")),
@@ -388,13 +407,9 @@ fn print_status_and_permission_diagnostics_classify_only_the_failed_turn() {
         "without evidence of a completed turn",
     );
     fleet.assert_steps_remaining("agy", 1);
-    let auth = call(&mut server, "antigravity", json!({"prompt":"Login."}));
-    assert_reported_failure(
-        &auth,
-        Some(("abnormal_exit", "exit code 1")),
-        "authentication",
-        "Unauthenticated",
-    );
+    let unconfirmed = call(&mut server, "antigravity", json!({"prompt":"Login."}));
+    assert_observed_failure(&unconfirmed, "abnormal_exit", "exit code 1");
+    assert_eq!(unconfirmed["reported"]["diagnostic"], "Unauthenticated");
     fleet.assert_steps_remaining("agy", 0);
     assert_eq!(delegated(&fleet).len(), 10);
 }
@@ -579,19 +594,9 @@ fn captured_auth_failed_fixture_classifies_as_authentication() {
     let mut server = fleet.server("claude");
 
     let failed = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
-    assert_reported_failure(
-        &failed,
-        Some(("abnormal_exit", "exit code 1")),
-        "authentication",
-        "authentication failed or timed out",
-    );
-    assert_eq!(
-        failed["reported"]["failure"]["message"], "authentication failed or timed out",
-        "{failed}"
-    );
+    assert_sign_in_failure(&failed);
     assert!(failed["reported"]["thread_id"].is_null(), "{failed}");
     assert!(failed["reported"]["content"].is_null(), "{failed}");
-    assert!(failed["reported"]["diagnostic"].is_null(), "{failed}");
     fleet.assert_steps_remaining("agy", 3);
 
     let quoted = call(
@@ -623,103 +628,45 @@ fn captured_auth_failed_fixture_classifies_as_authentication() {
 #[test]
 fn delayed_auth_failure_with_stderr_and_real_argv_classifies_as_authentication() {
     let fleet = Fleet::new(&["agy"]);
-    let oauth_prompt = concat!(
-        "Authentication required. Please visit the URL to log in:\n",
-        "  https://example.invalid/oauth?code=fake\n\n",
-        "Waiting for authentication (timeout 60s)...\n",
-        "Or, paste the authorization code here and press Enter:\n"
+    let oauth_prompt = format!(
+        "{SIGN_IN_PROMPT}\n  https://example.invalid/oauth?code=fake\n\nWaiting for authentication (timeout 60s)...\n"
     );
-    let generic_error = json!({
-        "conversation_id": "",
-        "status": "ERROR",
-        "response": "",
-        "error": "request aborted",
-        "finished_reason": "error"
-    })
-    .to_string();
+    let oauth_error =
+        "Error: authentication timed out.\nerror: authentication failed or timed out\n";
     fleet.script(
         "agy",
-        json!([
-            {
-                "stderr": oauth_prompt,
-                "sleep_ms": 2000,
-                "after_sleep_stderr": "Error: authentication timed out.\nerror: authentication failed or timed out\n",
-                "after_sleep_stdout": CAPTURED_AUTH_FAILED.trim_end_matches('\n'),
-                "code": 1
-            },
-            {
-                "stderr": oauth_prompt,
-                "stdout": generic_error,
-                "code": 1
-            },
-            {
-                "stderr": r#"mcp "github": rpc error: code = Unauthenticated"#,
-                "stdout": generic_error,
-                "code": 1
-            }
-        ]),
+        json!([{
+            "stderr": oauth_prompt,
+            "sleep_ms": 2000,
+            "after_sleep_stderr": oauth_error,
+            "after_sleep_stdout": CAPTURED_AUTH_FAILED,
+            "code": 1
+        }]),
     );
     let mut server = fleet.server("claude");
-
     let delayed = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
-    assert_reported_failure(
-        &delayed,
-        Some(("abnormal_exit", "exit code 1")),
-        "authentication",
-        "authentication failed or timed out",
-    );
-    assert_eq!(
-        delayed["reported"]["failure"]["message"], "authentication failed or timed out",
-        "{delayed}"
-    );
-    let delayed_diag = delayed["reported"]["diagnostic"].as_str().unwrap_or("");
-    assert!(
-        delayed_diag.contains("Authentication required. Please visit the URL to log in:"),
-        "{delayed}"
-    );
-    assert!(
-        delayed_diag.contains("[sign-in URL omitted]")
-            && !delayed_diag.contains("https://example.invalid"),
-        "{delayed}"
-    );
+
+    assert_sign_in_failure(&delayed);
     let attempt = &delayed["observed"]["attempts"][0];
     assert_eq!(attempt["cli_timeout_ms"], 3_570_000, "{delayed}");
-    assert_eq!(attempt["stdout_bytes"], 263, "{delayed}");
-    assert!(attempt["stderr_bytes"].as_u64().unwrap() > 0, "{delayed}");
+    assert_eq!(
+        attempt["stdout_bytes"],
+        CAPTURED_AUTH_FAILED.len(),
+        "{delayed}"
+    );
+    assert_eq!(
+        attempt["stderr_bytes"],
+        oauth_prompt.len() + oauth_error.len(),
+        "{delayed}"
+    );
     assert!(
         attempt["elapsed_ms"].as_u64().unwrap() >= 1500,
         "expected delayed auth failure to take ~2s: {delayed}"
     );
-    fleet.assert_steps_remaining("agy", 2);
-
-    let fallback = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
-    assert_reported_failure(
-        &fallback,
-        Some(("abnormal_exit", "exit code 1")),
-        "authentication",
-        "request aborted",
-    );
-    assert_eq!(
-        fallback["reported"]["failure"]["message"], "request aborted",
-        "stderr classification fallback must preserve JSON error message: {fallback}"
-    );
-    fleet.assert_steps_remaining("agy", 1);
-
-    let third_party = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
-    assert_reported_failure(
-        &third_party,
-        Some(("abnormal_exit", "exit code 1")),
-        "unknown",
-        "request aborted",
-    );
-    assert_eq!(
-        third_party["reported"]["failure"]["message"], "request aborted",
-        "third-party Unauthenticated stderr must not override unclassified JSON error: {third_party}"
-    );
     fleet.assert_steps_remaining("agy", 0);
 
     let records = delegated(&fleet);
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 1);
     assert_eq!(argument(&records[0], "--output-format"), Some("json"));
     assert_eq!(argument(&records[0], "--print-timeout"), Some("3570000ms"));
     assert!(
@@ -732,110 +679,148 @@ fn delayed_auth_failure_with_stderr_and_real_argv_classifies_as_authentication()
 }
 
 #[test]
-fn auth_failure_diagnostic_omits_sign_in_url_and_keeps_other_lines() {
+fn third_party_stderr_does_not_turn_an_unknown_json_error_into_authentication() {
     let fleet = Fleet::new(&["agy"]);
-    let oauth_stderr = concat!(
-        "Authentication required. Please visit the URL to log in:\n",
-        "  https://example.invalid/o/oauth2/auth?state=fake&code_challenge=fake\n\n",
-        "Waiting for authentication (timeout 60s)...\n",
-        "Error: authentication timed out.\n",
-        "error: authentication failed or timed out\n"
-    );
-    let prose_and_wrapped_stderr = concat!(
-        "Authentication required.\n",
-        "Sign in at https://example.invalid/oauth?state=fake to continue.\n",
-        "Or open https://example.invalid/oauth?client_id=abc\n",
-        "&state=wrapped&code_challenge=xyz\n",
-        "Waiting for authentication (timeout 60s)...\n"
-    );
-    let non_auth_json = json!({
-        "conversation_id": "",
-        "status": "ERROR",
-        "response": "",
-        "error": "Invalid model selection",
-        "finished_reason": "error"
-    })
-    .to_string();
-    let non_auth_stderr = concat!(
-        "Model lookup failed.\n",
-        "Please visit the URL for available models:\n",
-        "  https://example.invalid/docs/models\n"
+    let third_party_errors = [
+        r#"mcp "github": authentication failed"#.to_owned(),
+        r#"mcp "github": rpc error: code = Unauthenticated"#.to_owned(),
+        format!(r#"mcp "github": {SIGN_IN_PROMPT}"#),
+        format!("  {SIGN_IN_PROMPT}"),
+        SIGN_IN_PROMPT.to_ascii_lowercase(),
+    ];
+    let steps: Vec<_> = third_party_errors
+        .iter()
+        .map(
+            |stderr| json!({"stdout": failed_json("request aborted"), "stderr": stderr, "code": 1}),
+        )
+        .collect();
+    fleet.script("agy", json!(steps));
+    let mut server = fleet.server("claude");
+
+    for stderr in third_party_errors {
+        let failure = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+        assert_reported_failure(
+            &failure,
+            Some(("abnormal_exit", "exit code 1")),
+            "unknown",
+            "request aborted",
+        );
+        assert_eq!(failure["reported"]["diagnostic"], stderr, "{failure}");
+    }
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn authentication_omits_a_wrapped_sign_in_url_from_the_envelope() {
+    let fleet = Fleet::new(&["agy"]);
+    let stderr = format!(
+        "{SIGN_IN_PROMPT}\n  https://example.invalid/oauth?client_id=fake\n&state=wrapped&code_challenge=xyz to continue.\n"
     );
     fleet.script(
         "agy",
+        json!([{"stdout": CAPTURED_AUTH_FAILED, "stderr": stderr, "code": 1}]),
+    );
+    let mut server = fleet.server("claude");
+    let failure = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+
+    let envelope = failure.to_string();
+    for sensitive in ["https://example.invalid", "state=wrapped", "code_challenge"] {
+        assert!(
+            !envelope.contains(sensitive),
+            "sign-in URL leaked: {failure}"
+        );
+    }
+    assert_sign_in_failure(&failure);
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn only_authentication_replaces_stderr_with_fixed_sign_in_diagnostic() {
+    let fleet = Fleet::new(&["agy"]);
+    let stderr = "Please see https://example.invalid/support\nECONNREFUSED\n";
+    fleet.script(
+        "agy",
         json!([
-            {"stdout": CAPTURED_AUTH_FAILED, "stderr": oauth_stderr, "code": 1},
-            {"stdout": CAPTURED_AUTH_FAILED, "stderr": prose_and_wrapped_stderr, "code": 1},
-            {"stdout": non_auth_json, "stderr": non_auth_stderr, "code": 1}
+            {"stdout": CAPTURED_AUTH_FAILED, "stderr": stderr, "code": 1},
+            {"stdout": failed_json("Invalid model selection"), "stderr": stderr, "code": 1}
         ]),
     );
     let mut server = fleet.server("claude");
 
-    let oauth = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+    let authentication = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+    let other_failure = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
     assert_reported_failure(
-        &oauth,
-        Some(("abnormal_exit", "exit code 1")),
-        "authentication",
-        "authentication failed or timed out",
-    );
-    let oauth_diag = oauth["reported"]["diagnostic"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing reported.diagnostic: {oauth}"));
-    assert!(
-        !oauth_diag.contains("https://example.invalid") && !oauth_diag.contains("code_challenge"),
-        "sign-in URL leaked into diagnostic: {oauth_diag}"
-    );
-    assert_eq!(
-        oauth_diag,
-        concat!(
-            "Authentication required. Please visit the URL to log in:\n",
-            "  [sign-in URL omitted]\n\n",
-            "Waiting for authentication (timeout 60s)...\n",
-            "Error: authentication timed out.\n",
-            "error: authentication failed or timed out\n"
-        )
-    );
-    fleet.assert_steps_remaining("agy", 2);
-
-    let wrapped = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
-    assert_reported_failure(
-        &wrapped,
-        Some(("abnormal_exit", "exit code 1")),
-        "authentication",
-        "authentication failed or timed out",
-    );
-    let wrapped_diag = wrapped["reported"]["diagnostic"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing reported.diagnostic: {wrapped}"));
-    assert!(
-        !wrapped_diag.contains("https://example.invalid")
-            && !wrapped_diag.contains("state=wrapped")
-            && !wrapped_diag.contains("code_challenge"),
-        "prose-prefixed or wrapped sign-in URL leaked: {wrapped_diag}"
-    );
-    assert_eq!(
-        wrapped_diag,
-        concat!(
-            "Authentication required.\n",
-            "Sign in at [sign-in URL omitted] to continue.\n",
-            "Or open [sign-in URL omitted]\n",
-            "Waiting for authentication (timeout 60s)...\n"
-        )
-    );
-    fleet.assert_steps_remaining("agy", 1);
-
-    let non_auth = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
-    assert_reported_failure(
-        &non_auth,
+        &other_failure,
         Some(("abnormal_exit", "exit code 1")),
         "unknown",
         "Invalid model selection",
     );
-    let non_auth_diag = non_auth["reported"]["diagnostic"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing reported.diagnostic: {non_auth}"));
-    assert_eq!(non_auth_diag, non_auth_stderr);
-    assert!(!non_auth_diag.contains("[sign-in URL omitted]"));
+    assert_eq!(
+        other_failure["reported"]["diagnostic"], stderr,
+        "{other_failure}"
+    );
+    assert_eq!(
+        authentication["reported"]["diagnostic"], SIGN_IN_DIAGNOSTIC,
+        "{authentication}"
+    );
+    assert_eq!(
+        authentication["reported"]["failure"]["kind"],
+        "authentication"
+    );
     fleet.assert_steps_remaining("agy", 0);
-    assert_eq!(delegated(&fleet).len(), 3);
+}
+
+#[test]
+fn exact_sign_in_line_fills_in_an_unclassified_or_missing_json_error() {
+    let fleet = Fleet::new(&["agy"]);
+    let stderr = format!(
+        "Starting agy\r\n{SIGN_IN_PROMPT}\r\n  https://example.invalid/oauth?code=fake\r\n"
+    );
+    let quota_stderr = "Quota exhausted. Quota resets at 2030-04-02T15:00:00Z.\n";
+    let mixed_stderr = format!("{stderr}{quota_stderr}");
+    fleet.script(
+        "agy",
+        json!([
+            {"stdout": failed_json("request aborted"), "stderr": stderr, "code": 1},
+            {"stdout": r#"{"status":"ERROR","response":""}"#, "stderr": mixed_stderr, "code": 1},
+            {"stdout": failed_json(" \t "), "stderr": mixed_stderr, "code": 1},
+            {"stderr": stderr, "code": 1},
+            {"stdout": r#"{"status":"SUCCESS","response":""}"#, "stderr": stderr, "code": 1},
+            {"stdout": PRINT_TIMEOUT, "stderr": SIGN_IN_PROMPT, "code": 1},
+            {"stderr": quota_stderr, "code": 1}
+        ]),
+    );
+    let mut server = fleet.server("claude");
+
+    for _ in 0..5 {
+        let failure = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+        assert_sign_in_failure(&failure);
+        assert!(!failure.to_string().contains("code=fake"), "{failure}");
+    }
+
+    let timeout = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+    assert_reported_failure(
+        &timeout,
+        Some(("abnormal_exit", "exit code 1")),
+        "timeout",
+        "timeout waiting for response",
+    );
+    assert_eq!(
+        timeout["reported"]["diagnostic"], SIGN_IN_PROMPT,
+        "{timeout}"
+    );
+
+    let quota = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+    assert_reported_failure(
+        &quota,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        "Quota exhausted",
+    );
+    assert_eq!(quota["reported"]["diagnostic"], quota_stderr, "{quota}");
+    assert_eq!(
+        quota["reported"]["failure"]["reset_at"], "2030-04-02T15:00:00Z",
+        "{quota}"
+    );
+    fleet.assert_steps_remaining("agy", 0);
 }
