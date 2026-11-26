@@ -113,12 +113,17 @@ jobs:
           import path from 'node:path';
           import { spawn } from 'node:child_process';
           import readline from 'node:readline';
-          import { fileURLToPath, pathToFileURL } from 'node:url';
           const report = JSON.parse(fs.readFileSync('results/initialize.json', 'utf8'));
           if (!report.summary.claude_delegator.failed) process.exit(0);
 
           const { node, bridge, stub } = report.inputs;
-          const plain = name => fileURLToPath(pathToFileURL(name));
+          function plain(name) {
+            const ordinary = name.replace(/^\\\\\?\\(?=[A-Za-z]:\\)/, '');
+            if (ordinary === name || path.win32.toNamespacedPath(ordinary) !== name) {
+              throw new Error('Expected a canonical Windows drive path for the diagnostic');
+            }
+            return ordinary;
+          }
           const identity = name => name;
           const request = { jsonrpc: '2.0', id: 1, method: 'initialize',
             params: { protocolVersion: report.protocol_revision, capabilities: {},
@@ -131,13 +136,20 @@ jobs:
               fs.linkSync(stub.path, path.join(bin, 'codex.exe'));
               const env = { PATH: bin, SystemRoot: process.env.SystemRoot };
               for (const key of ['HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TMPDIR', 'TEMP', 'TMP', 'PROXENOS_STUB_DIR']) env[key] = profile;
-              const child = spawn(paths(node.path), [entry(bridge.path)], { cwd: profile, env, timeout: 10_000 });
+              const script = entry(bridge.path);
+              const child = spawn(paths(node.path), [script], { cwd: profile, env, timeout: 10_000 });
               let stdoutBytes = 0, stderrBytes = 0, stderr = '', initialized = false, spawnError;
+              const marker = 'codex cli not found';
+              let stderrTail = '', codexCliNotFound = false;
               child.stdin.on('error', error => { spawnError ??= error.code; });
               child.on('error', error => { spawnError = error.code; });
               child.stderr.on('data', chunk => {
                 stderrBytes += chunk.length;
-                if (stderr.length < 4096) stderr += chunk.toString().slice(0, 4096 - stderr.length);
+                const text = chunk.toString();
+                if (stderr.length < 4096) stderr += text.slice(0, 4096 - stderr.length);
+                const window = stderrTail + text.toLowerCase();
+                codexCliNotFound ||= window.includes(marker);
+                stderrTail = window.slice(1 - marker.length);
               });
               child.stdout.on('data', chunk => { stdoutBytes += chunk.length; if (stdoutBytes >= 1024 * 1024) child.kill(); });
               readline.createInterface({ input: child.stdout }).on('line', line => {
@@ -150,7 +162,14 @@ jobs:
               });
               child.stdin.write(JSON.stringify(request) + '\n');
               const [status, signal] = await new Promise(resolve => child.once('close', (...args) => resolve(args)));
-              return { label, initialized, status, signal, spawnError, stdoutBytes, stderrBytes,
+              const log = path.join(profile, 'invocations');
+              const codexVersionInvoked = fs.existsSync(log) && fs.readFileSync(log, 'utf8').split(/\r?\n/).some(line => {
+                if (!line) return false;
+                const { cli, args } = JSON.parse(line);
+                return cli === 'codex' && args.includes('--version');
+              });
+              return { label, entryPathChanged: script !== bridge.path, initialized, status, signal, spawnError,
+                stdoutBytes, stderrBytes, codexVersionInvoked, codexCliNotFound,
                 errors: stderr.split(/\r?\n/).filter(s => /^(?:[\w.]*Error|\s*code: |Require stack:)/.test(s)).slice(0, 6).map(s => s.slice(0, 350)),
                 frames: stderr.split(/\r?\n/).filter(s => /^\s+at /.test(s)).slice(0, 6).map(s => s.slice(0, 350)) };
             } finally { fs.rmSync(profile, { recursive: true, force: true }); }
