@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::{CommandLine, Failure, Provider, Report, Turn, is_valid_model};
+use super::{CommandLine, Failure, Provider, Report, Turn, is_canonical_uuid, is_valid_model};
 use crate::envelope::FailureKind;
 use crate::supervise::Finished;
 
@@ -49,10 +49,6 @@ pub(super) const SPEC: Provider = Provider {
     argv,
     parse,
 };
-
-fn is_canonical_uuid(id: &str) -> bool {
-    uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
-}
 
 fn is_regular_file(meta: &fs::Metadata) -> bool {
     #[cfg(windows)]

@@ -6,7 +6,7 @@ changes it. [ADR 001](adr/001-decisions-by-the-families-that-can-answer.md) says
 taken, and [votes.md](votes.md) records who proposed and who supported each one.
 
 **Status: milestone 1 in progress.** `proxenos mcp --client <client>` serves the MCP layer of D4.
-Codex, Antigravity and Kimi run through the D6 supervisor with D17 background delegations (`wait: false`,
+Codex, Antigravity, Kimi, Claude Code and GitHub Copilot CLI run through the D6 supervisor with D17 background delegations (`wait: false`,
 `await`, `cancel`, at most 3 concurrent delegations), D18 resource accounting and optional memory
 limits, and D19 persisted session settings files. Behavioural tests install the crate’s stub
 in a private search path.
@@ -364,6 +364,17 @@ Measured for Kimi (`kimi 2.8.0` on Linux x86_64, 2026-11-26):
   `session_id` or if a reply's reported `session_id` does not match the requested ID. If Kimi exits
   `0` on an interrupted or step-limited turn after printing assistant text and
   `session.resume_hint`, Proxenos has no wire evidence to distinguish that from a completed turn.
+
+GitHub Copilot CLI 1.0.116 was measured on Linux with its documented local-provider mode.
+A deterministic loopback endpoint answered one start and one explicit UUID resume. Copilot
+emitted a completed assistant turn, the answer's model and a terminal session result for both.
+Proxenos requires matching turn IDs, a canonical session UUID and success in both the terminal
+record and the process status. It passes a named model and reasoning effort again on reply.
+It requests full access with `--allow-all`; Copilot's deny rules and organization policy still
+apply. The adapter offers no read-only mode because we have not verified restrictions across
+all Copilot tools. The CLI also accepts names and prefixes in its resume option; checking the
+returned UUID can detect a different session only after the CLI runs. The capture method and its limits are recorded with the
+[Copilot fixtures](../tests/fixtures/copilot/README.md).
 
 ### D6. Children are supervised to the end
 
