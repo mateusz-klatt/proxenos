@@ -1072,16 +1072,22 @@ the job on Windows, samples of the supervised process group on Linux and macOS.
   missed under memory pressure, in which case a memory-limit failure may surface as
   `abnormal_exit`.
 - **Linux and macOS**: the processes of the supervised process group are sampled every 50 ms
-  (`linux_proc_group_sample` from `/proc/<pid>/stat` RSS pages and CPU ticks on Linux;
-  `macos_proc_group_sample` from `proc_listpgrppids` and `proc_pidinfo(PROC_PIDTASKINFO)` scaled
-  with `mach_timebase_info` on macOS). Samples can miss a brief peak, a short-lived child, and a
-  descendant that has left the group. Summed RSS across group members double-counts pages shared
-  between processes. On macOS only the first 4096 members of the group are sampled (and per-sample
-  PID tracking is bounded at 4096 members on Unix, folding exited PIDs into an accumulator so PID
-  reuse does not overwrite earlier CPU time). With `memory_limit_bytes` set, a sample above it
-  starts a single D6 stop (`Ending::MemoryLimit`) without reading the provider output file and
-  reports `memory_limit`. That is a threshold checked between samples, not a hard allocation
-  ceiling.
+  (`linux_proc_group_sample` from `/proc/<pid>/stat` RSS pages, CPU ticks, and start ticks on
+  Linux; `macos_proc_group_sample` from `proc_listpgrppids` and
+  `proc_pidinfo(PROC_PIDTASKALLINFO)` scaled with `mach_timebase_info` on macOS). Samples can miss
+  a brief peak, a short-lived child, and a descendant that has left the group. Summed RSS across
+  group members double-counts pages shared between processes. Retained per-PID CPU state keys each
+  PID by its OS start identity (`starttime` ticks on Linux; `pbi_start_tvsec` / `pbi_start_tvusec`
+  on macOS) and last-seen sample so temporary PID omissions preserve prior CPU without
+  double-counting while PID reuse with a different start identity folds the earlier process's CPU
+  even when the new counter is higher. Both per-sample tracking and the retained per-PID table are
+  bounded at 4096 entries on Unix (and on macOS only the first 4096 members of the group are
+  sampled); at capacity, the stalest unseen entry is folded and evicted, so an evicted live PID that
+  later reappears can still double-count CPU time. PID reuse with an identical start timestamp or
+  within the same start tick can instead undercount CPU time. These limits keep totals approximate. With
+  `memory_limit_bytes` set, a sample above it starts a single D6 stop (`Ending::MemoryLimit`) without
+  reading the provider output file and reports `memory_limit`. That is a threshold checked between
+  samples, not a hard allocation ceiling.
 
 No memory limit applies unless the caller sets `memory_limit_bytes`.
 

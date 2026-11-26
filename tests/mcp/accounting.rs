@@ -44,6 +44,7 @@ fn accounting_reports_platform_method_caveats_memory_and_cpu() {
             assert!(caveats.contains("leave the process group"), "{caveats}");
             assert!(caveats.contains("double-counts"), "{caveats}");
             assert!(caveats.contains("4096"), "{caveats}");
+            assert!(caveats.contains("evicted"), "{caveats}");
         }
         #[cfg(target_os = "macos")]
         {
@@ -55,6 +56,7 @@ fn accounting_reports_platform_method_caveats_memory_and_cpu() {
             assert!(caveats.contains("leave the process group"), "{caveats}");
             assert!(caveats.contains("double-counts"), "{caveats}");
             assert!(caveats.contains("4096"), "{caveats}");
+            assert!(caveats.contains("evicted"), "{caveats}");
         }
         #[cfg(windows)]
         {

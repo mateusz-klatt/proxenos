@@ -2,7 +2,7 @@
 //! and periodic process-group sampling for D18 accounting and optional memory thresholds.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
@@ -35,7 +35,7 @@ const METHOD: &str = "macos_proc_group_sample";
 #[cfg(target_os = "linux")]
 const CAVEATS: &[&str] = &[
     "Values come from periodic samples of the supervised process group; sampling can miss brief peaks, short-lived children, and descendants that leave the process group.",
-    "At most 4096 members of the process group are tracked per sample.",
+    "At most 4096 members of the process group are tracked per sample and in retained per-PID CPU state; at capacity the stalest entry is folded and evicted, so an evicted live PID that reappears can double-count CPU time. PID reuse within the same start tick can undercount CPU time.",
     "Summed RSS across group members double-counts pages shared between processes.",
     "A memory limit is a sampled threshold that triggers a D6 stop, not a hard allocation ceiling.",
 ];
@@ -43,7 +43,7 @@ const CAVEATS: &[&str] = &[
 #[cfg(target_os = "macos")]
 const CAVEATS: &[&str] = &[
     "Values come from periodic samples of the supervised process group; sampling can miss brief peaks, short-lived children, and descendants that leave the process group.",
-    "Only the first 4096 members of the process group are sampled.",
+    "Only the first 4096 members of the process group are sampled, and retained per-PID CPU state is bounded at 4096 entries; at capacity the stalest entry is folded and evicted, so an evicted live PID that reappears can double-count CPU time. PID reuse with an identical start timestamp can undercount CPU time.",
     "Summed RSS across group members double-counts pages shared between processes.",
     "A memory limit is a sampled threshold that triggers a D6 stop, not a hard allocation ceiling.",
 ];
@@ -65,12 +65,31 @@ pub fn empty_accounting(memory_limit_bytes: Option<u64>) -> Accounting {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity(u64, u64);
+
+#[derive(Clone, Copy)]
+struct SampleRow {
+    pid: libc::pid_t,
+    identity: ProcessIdentity,
+    memory_bytes: u64,
+    cpu_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TrackedProcess {
+    identity: ProcessIdentity,
+    cpu_ms: u64,
+    last_seen_sample: u64,
+}
+
 struct UnixAccounting {
     memory_limit_bytes: Option<u64>,
     samples: u64,
     peak_memory_bytes: Option<u64>,
     exited_cpu_ms: u64,
-    active_cpu_ms: HashMap<libc::pid_t, u64>,
+    tracked: HashMap<libc::pid_t, TrackedProcess>,
+    eviction_order: BTreeSet<(u64, libc::pid_t)>,
     seen_cpu: bool,
     memory_limit_exceeded: bool,
 }
@@ -82,32 +101,67 @@ impl UnixAccounting {
             samples: 0,
             peak_memory_bytes: None,
             exited_cpu_ms: 0,
-            active_cpu_ms: HashMap::new(),
+            tracked: HashMap::new(),
+            eviction_order: BTreeSet::new(),
             seen_cpu: false,
             memory_limit_exceeded: false,
         }
     }
 
-    fn record(&mut self, rows: Vec<(libc::pid_t, u64, u64)>, check_limit: bool) -> bool {
-        self.samples += 1;
-        let mut rss = 0_u64;
-        let mut next_active = HashMap::with_capacity(rows.len().min(MAX_TRACKED_PIDS));
-        for &(pid, mem, cpu_ms) in rows.iter().take(MAX_TRACKED_PIDS) {
-            rss = rss.saturating_add(mem);
-            if let Some(previous) = self.active_cpu_ms.remove(&pid) {
-                // If a PID was recycled between consecutive samples, fold the prior process's CPU.
-                self.exited_cpu_ms = self
-                    .exited_cpu_ms
-                    .saturating_add(previous * u64::from(cpu_ms < previous));
+    fn update_tracked(&mut self, row: SampleRow) -> bool {
+        let Some(existing) = self.tracked.get_mut(&row.pid) else {
+            return false;
+        };
+        self.eviction_order
+            .remove(&(existing.last_seen_sample, row.pid));
+        if existing.identity != row.identity {
+            self.exited_cpu_ms = self.exited_cpu_ms.saturating_add(existing.cpu_ms);
+            existing.identity = row.identity;
+            existing.cpu_ms = row.cpu_ms;
+        } else {
+            existing.cpu_ms = existing.cpu_ms.max(row.cpu_ms);
+        }
+        existing.last_seen_sample = self.samples;
+        self.eviction_order.insert((self.samples, row.pid));
+        true
+    }
+
+    fn insert_tracked(&mut self, row: SampleRow) {
+        if !self.update_tracked(row) {
+            if self.tracked.len() >= MAX_TRACKED_PIDS
+                && let Some((_, victim_pid)) = self.eviction_order.pop_first()
+                && let Some(victim) = self.tracked.remove(&victim_pid)
+            {
+                self.exited_cpu_ms = self.exited_cpu_ms.saturating_add(victim.cpu_ms);
             }
-            next_active.insert(pid, cpu_ms);
+            self.eviction_order.insert((self.samples, row.pid));
+            self.tracked.insert(
+                row.pid,
+                TrackedProcess {
+                    identity: row.identity,
+                    cpu_ms: row.cpu_ms,
+                    last_seen_sample: self.samples,
+                },
+            );
         }
-        for previous in self.active_cpu_ms.values() {
-            self.exited_cpu_ms = self.exited_cpu_ms.saturating_add(*previous);
+    }
+
+    fn record(&mut self, rows: &[SampleRow], check_limit: bool) -> bool {
+        self.samples += 1;
+        let sample = &rows[..rows.len().min(MAX_TRACKED_PIDS)];
+        let mut rss = 0_u64;
+        let mut pending = Vec::new();
+        for &row in sample {
+            rss = rss.saturating_add(row.memory_bytes);
+            if !self.update_tracked(row) {
+                pending.push(row);
+            }
         }
-        self.active_cpu_ms = next_active;
-        self.seen_cpu |= !rows.is_empty();
-        self.peak_memory_bytes = (!rows.is_empty())
+        for row in pending {
+            self.insert_tracked(row);
+        }
+        self.seen_cpu |= !sample.is_empty();
+        self.peak_memory_bytes = (!sample.is_empty())
             .then(|| self.peak_memory_bytes.unwrap_or(0).max(rss))
             .or(self.peak_memory_bytes);
         self.memory_limit_exceeded |=
@@ -117,9 +171,9 @@ impl UnixAccounting {
 
     fn snapshot(&self) -> Accounting {
         let cpu_time_ms = self.seen_cpu.then(|| {
-            self.active_cpu_ms
+            self.tracked
                 .values()
-                .fold(self.exited_cpu_ms, |acc, &ms| acc.saturating_add(ms))
+                .fold(self.exited_cpu_ms, |acc, p| acc.saturating_add(p.cpu_ms))
         });
         Accounting {
             method: METHOD,
@@ -365,7 +419,7 @@ async fn sample_once(
     state
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .record(rows, check_limit)
+        .record(&rows, check_limit)
 }
 
 #[cfg(target_os = "linux")]
@@ -389,15 +443,16 @@ fn parse_linux_header(stat: &str) -> Option<LinuxStat<'_>> {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_accounting(mut header: LinuxStat<'_>) -> Option<(u64, u64)> {
+fn parse_linux_accounting(mut header: LinuxStat<'_>) -> Option<(u64, u64, u64)> {
     let utime: u64 = header.rest.nth(8)?.parse().ok()?;
     let stime: u64 = header.rest.next()?.parse().ok()?;
-    let rss_pages: u64 = header.rest.nth(8)?.parse().ok()?;
-    Some((rss_pages, utime.saturating_add(stime)))
+    let starttime: u64 = header.rest.nth(6)?.parse().ok()?;
+    let rss_pages: u64 = header.rest.nth(1)?.parse().ok()?;
+    Some((rss_pages, utime.saturating_add(stime), starttime))
 }
 
 #[cfg(target_os = "linux")]
-fn sample_pgrp(pgrp: libc::pid_t) -> Vec<(libc::pid_t, u64, u64)> {
+fn sample_pgrp(pgrp: libc::pid_t) -> Vec<SampleRow> {
     // SAFETY: sysconf takes only a POSIX constant and has no memory safety requirements.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
     // SAFETY: sysconf takes only a POSIX constant and has no memory safety requirements.
@@ -413,12 +468,11 @@ fn sample_pgrp(pgrp: libc::pid_t) -> Vec<(libc::pid_t, u64, u64)> {
             (header.pgrp == pgrp)
                 .then(|| parse_linux_accounting(header))
                 .flatten()
-                .map(|(rss_pages, ticks)| {
-                    (
-                        pid,
-                        rss_pages.saturating_mul(page_size),
-                        ticks.saturating_mul(1000) / ticks_per_sec,
-                    )
+                .map(|(rss_pages, ticks, starttime)| SampleRow {
+                    pid,
+                    identity: ProcessIdentity(starttime, 0),
+                    memory_bytes: rss_pages.saturating_mul(page_size),
+                    cpu_ms: ticks.saturating_mul(1000) / ticks_per_sec,
                 })
         })
         .collect()
@@ -531,7 +585,7 @@ fn group_confirmed_empty(pgrp: libc::pid_t) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn sample_pgrp(pgrp: libc::pid_t) -> Vec<(libc::pid_t, u64, u64)> {
+fn sample_pgrp(pgrp: libc::pid_t) -> Vec<SampleRow> {
     let mut timebase = MachTimebaseInfo { numer: 1, denom: 1 };
     // SAFETY: timebase points to valid writable storage matching mach_timebase_info_data_t.
     let _ = unsafe { mach_timebase_info(&raw mut timebase) };
@@ -540,25 +594,183 @@ fn sample_pgrp(pgrp: libc::pid_t) -> Vec<(libc::pid_t, u64, u64)> {
     let (pids, _) = pgrp_pids(pgrp);
     pids.into_iter()
         .filter_map(|pid| {
-            let mut info = MaybeUninit::<libc::proc_taskinfo>::zeroed();
-            let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
-            // SAFETY: info points to valid writable storage of `size` bytes for PROC_PIDTASKINFO.
+            let mut info = MaybeUninit::<libc::proc_taskallinfo>::zeroed();
+            let size = size_of::<libc::proc_taskallinfo>() as libc::c_int;
+            // SAFETY: info is writable storage of `size` bytes for PROC_PIDTASKALLINFO.
             let got = unsafe {
                 libc::proc_pidinfo(
                     pid,
-                    libc::PROC_PIDTASKINFO,
+                    libc::PROC_PIDTASKALLINFO,
                     0,
                     info.as_mut_ptr().cast(),
                     size,
                 )
             };
             (got == size).then(|| {
-                // SAFETY: proc_pidinfo wrote a complete proc_taskinfo struct.
+                // SAFETY: proc_pidinfo wrote a complete proc_taskallinfo struct.
                 let info = unsafe { info.assume_init() };
-                let cpu_ticks = u128::from(info.pti_total_user) + u128::from(info.pti_total_system);
+                let start = info.pbsd;
+                let task = info.ptinfo;
+                let cpu_ticks = u128::from(task.pti_total_user) + u128::from(task.pti_total_system);
                 let cpu_ms = ((cpu_ticks * numer / denom) / 1_000_000) as u64;
-                (pid, info.pti_resident_size, cpu_ms)
+                SampleRow {
+                    pid,
+                    identity: ProcessIdentity(start.pbi_start_tvsec, start.pbi_start_tvusec),
+                    memory_bytes: task.pti_resident_size,
+                    cpu_ms,
+                }
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(pid: libc::pid_t, start: u64, memory_bytes: u64, cpu_ms: u64) -> SampleRow {
+        SampleRow {
+            pid,
+            identity: ProcessIdentity(start, 0),
+            memory_bytes,
+            cpu_ms,
+        }
+    }
+
+    fn rows_range(pids: std::ops::RangeInclusive<libc::pid_t>) -> Vec<SampleRow> {
+        pids.map(|pid| row(pid, 1, 100, 10)).collect()
+    }
+
+    #[test]
+    fn omission_preserves_previous_cpu_without_double_counting() {
+        let mut accounting = UnixAccounting::new(None);
+
+        assert!(!accounting.record(&[], false));
+        let initial = accounting.snapshot();
+        assert_eq!(initial.samples, Some(1));
+        assert_eq!(initial.cpu_time_ms, None);
+        assert_eq!(initial.peak_memory_bytes, None);
+
+        assert!(!accounting.record(&[row(100, 1, 4096, 100)], false));
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(100));
+        assert_eq!(accounting.snapshot().peak_memory_bytes, Some(4096));
+
+        // Temporary omissions keep the retained entry and must not fold it into exited_cpu_ms.
+        assert!(!accounting.record(&[], false));
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(100));
+        assert_eq!(accounting.snapshot().peak_memory_bytes, Some(4096));
+
+        assert!(!accounting.record(&[], false));
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(100));
+
+        // Reappearing with the same identity updates to 120 ms instead of 220 ms.
+        assert!(!accounting.record(&[row(100, 1, 8192, 120)], false));
+        let after = accounting.snapshot();
+        assert_eq!(after.samples, Some(5));
+        assert_eq!(after.cpu_time_ms, Some(120));
+        assert_eq!(after.peak_memory_bytes, Some(8192));
+
+        // Minor non-monotonic counter jitter with the same identity neither drops nor folds.
+        assert!(!accounting.record(&[row(100, 1, 8192, 115)], false));
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(120));
+        assert!(!accounting.record(&[row(100, 1, 8192, 125)], false));
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(125));
+
+        // A duplicate PID within a single sample updates without creating a second tracked slot.
+        let dup = [row(101, 2, 512, 10), row(101, 2, 512, 25)];
+        assert!(!accounting.record(&dup, false));
+        assert_eq!(accounting.tracked.len(), 2);
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(150));
+    }
+
+    #[test]
+    fn same_pid_new_identity_folds_prior_cpu_for_higher_equal_and_lower_counters() {
+        let mut accounting = UnixAccounting::new(None);
+
+        assert!(!accounting.record(&[row(200, 10, 1024, 100)], false));
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(100));
+
+        // Reused PID with a higher counter still folds the prior process's 100 ms.
+        assert!(!accounting.record(&[row(200, 20, 2048, 150)], false));
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(250));
+
+        // Reused PID after an omission with a lower counter folds 150 ms and tracks 40 ms.
+        assert!(!accounting.record(&[], false));
+        assert!(!accounting.record(&[row(200, 30, 1024, 40)], false));
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(290));
+
+        // Reused PID differing only in sub-second start identity with an equal counter folds 40 ms.
+        let reused_subsec = SampleRow {
+            pid: 200,
+            identity: ProcessIdentity(30, 1),
+            memory_bytes: 512,
+            cpu_ms: 40,
+        };
+        assert!(!accounting.record(&[reused_subsec], false));
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(330));
+        assert_eq!(accounting.tracked.len(), 1);
+    }
+
+    #[test]
+    fn capacity_bounds_state_and_evicts_stalest_unseen_pid() {
+        let limit = (MAX_TRACKED_PIDS as u64) * 100 - 1;
+        let mut accounting = UnixAccounting::new(Some(limit));
+        let max_pid = MAX_TRACKED_PIDS as libc::pid_t;
+
+        let initial = rows_range(1..=max_pid);
+        assert!(!accounting.record(&initial, false));
+        assert_eq!(accounting.tracked.len(), MAX_TRACKED_PIDS);
+        assert_eq!(accounting.eviction_order.len(), MAX_TRACKED_PIDS);
+        let expected = (MAX_TRACKED_PIDS as u64) * 10;
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(expected));
+
+        // Refresh PID 1 and PIDs 3..=4096 while omitting PID 2, making PID 2 the stalest entry.
+        let mut refresh_except_2 = vec![row(1, 1, 100, 10)];
+        refresh_except_2.extend(rows_range(3..=max_pid));
+        assert!(!accounting.record(&refresh_except_2, false));
+        assert_eq!(accounting.tracked.len(), MAX_TRACKED_PIDS);
+
+        // Put a brand-new PID (4097) first, plus a 4098th row beyond MAX_TRACKED_PIDS.
+        // Two-pass recording updates all currently present PIDs first so PID 2 (absent) is
+        // evicted rather than PID 1, and RSS remains capped at MAX_TRACKED_PIDS rows.
+        let added_pid = max_pid + 1;
+        let dropped_pid = max_pid + 2;
+        let mut with_new = vec![row(added_pid, 1, 100, 15), row(1, 1, 100, 10)];
+        with_new.extend(rows_range(3..=max_pid));
+        with_new.push(row(dropped_pid, 1, 100, 999));
+        assert!(accounting.record(&with_new, true));
+        assert_eq!(accounting.tracked.len(), MAX_TRACKED_PIDS);
+        assert_eq!(accounting.eviction_order.len(), MAX_TRACKED_PIDS);
+        assert!(!accounting.tracked.contains_key(&2));
+        assert!(accounting.tracked.contains_key(&1));
+        assert!(accounting.tracked.contains_key(&added_pid));
+        assert!(!accounting.tracked.contains_key(&dropped_pid));
+        let expected_evicted = expected + 15;
+        let snapshot = accounting.snapshot();
+        assert_eq!(snapshot.cpu_time_ms, Some(expected_evicted));
+        assert_eq!(snapshot.peak_memory_bytes, Some(limit + 1));
+        assert!(snapshot.memory_limit_exceeded);
+
+        // Honest limitation at capacity: if evicted live PID 2 later reappears while PID 4097 is
+        // omitted and evicted, PID 2's earlier 10 ms remains folded and is counted again.
+        let mut reappear_2 = vec![row(2, 1, 100, 12), row(1, 1, 100, 10)];
+        reappear_2.extend(rows_range(3..=max_pid));
+        assert!(accounting.record(&reappear_2, true));
+        assert_eq!(accounting.tracked.len(), MAX_TRACKED_PIDS);
+        let reappeared = expected_evicted + 12;
+        assert_eq!(accounting.snapshot().cpu_time_ms, Some(reappeared));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_stat_parser_extracts_pgrp_cpu_starttime_and_rss() {
+        let stat = "4242 (stub ) worker) S 4200 4242 4242 0 -1 4194304 10 0 0 0 125 35 0 0 20 0 1 0 987654321 1048576 256 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        let header = parse_linux_header(stat).unwrap();
+        assert!(!header.is_zombie);
+        assert_eq!(header.pgrp, 4242);
+        let (rss_pages, ticks, starttime) = parse_linux_accounting(header).unwrap();
+        assert_eq!(ticks, 160);
+        assert_eq!(starttime, 987_654_321);
+        assert_eq!(rss_pages, 256);
+    }
 }
