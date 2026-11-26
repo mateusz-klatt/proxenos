@@ -1,31 +1,34 @@
 //! Grok Build writes one JSON object for a headless turn.
 
+use std::path::Path;
+
 use serde_json::Value;
 
 use super::{
-    CommandLine, Failure, Provider, Report, is_canonical_uuid, is_valid_model, token_usage,
+    CommandLine, Failure, Provider, Report, Turn, is_canonical_uuid, is_valid_model, token_usage,
 };
 use crate::envelope::FailureKind;
 use crate::supervise::Finished;
 
-pub(super) const SPEC: Provider = Provider::full_access_print(
-    "grok",
-    &[("HOME", ".local/bin"), ("HOME", ".grok/bin")],
-    &["low", "medium", "high", "xhigh"],
-    &[(
-        "full",
-        "Grok auto-approves tool executions with --always-approve. We have not verified a read-only configuration across its tools.",
-    )],
-    |turn| turn.require_session_uuid("Grok"),
-    |turn, _| {
-        let resume = turn
-            .thread_id
-            .iter()
-            .flat_map(|id| ["--resume".into(), id.into()]);
-        CommandLine::for_print_turn(turn, &["--always-approve"], resume)
-    },
-    parse,
-);
+pub(super) const SPEC: Provider = super::full_access_print! {
+    name: "grok",
+    unix_dirs: &[("HOME", ".local/bin"), ("HOME", ".grok/bin")],
+    efforts: &["low", "medium", "high", "xhigh"],
+    full_access: "Grok auto-approves tool executions with --always-approve. We have not verified a read-only configuration across its tools.",
+    handlers: (prepare, argv, parse),
+};
+
+fn prepare(turn: &mut Turn) -> Result<(), String> {
+    turn.require_session_uuid("Grok")
+}
+
+fn argv(turn: &Turn, _output: &Path) -> CommandLine {
+    let resume = turn
+        .thread_id
+        .iter()
+        .flat_map(|id| ["--resume".into(), id.into()]);
+    CommandLine::for_print_turn(turn, &["--always-approve"], resume)
+}
 
 // A model usage entry records model calls. Multiple entries do not identify one answer model.
 fn sole_model(usage: &Value) -> Option<String> {

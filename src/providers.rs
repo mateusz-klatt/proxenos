@@ -48,6 +48,37 @@ pub struct Provider {
     pub parse: fn(&Finished, &str, Option<&str>) -> Report,
 }
 
+// A static provider declaration. The callbacks contain all executable behaviour.
+macro_rules! full_access_print {
+    (
+        name: $name:literal, unix_dirs: $dirs:expr, efforts: $efforts:expr,
+        full_access: $access:literal, handlers: ($prepare:path, $argv:path, $parse:path),
+    ) => {
+        $crate::providers::Provider {
+            name: $name,
+            cli: $name,
+            #[cfg(unix)]
+            install_dirs: $dirs,
+            #[cfg(windows)]
+            install_dirs: &[],
+            efforts: $efforts,
+            start_settings: $crate::providers::PRINT_SETTINGS,
+            reply_settings: $crate::providers::PRINT_SETTINGS,
+            access: &[("full", $access)],
+            fixed_instructions: false,
+            reply_model: false,
+            not_claimed: &[],
+            read_only_not_claimed: &[],
+            prepare: $prepare,
+            argv: $argv,
+            parse: $parse,
+        }
+    };
+}
+use full_access_print;
+
+const PRINT_SETTINGS: &[&str] = &["model", "effort", "cwd", "access", "mode", "instructions"];
+
 pub struct CommandLine {
     pub args: Vec<OsString>,
     pub cli_timeout_ms: Option<u64>,
@@ -167,35 +198,6 @@ pub struct Report {
 }
 
 impl Provider {
-    /// Both full-access print CLIs accept the same start and reply settings.
-    const fn full_access_print(
-        name: &'static str,
-        unix_dirs: &'static [(&'static str, &'static str)],
-        efforts: &'static [&'static str],
-        access: &'static [(&'static str, &'static str)],
-        prepare: fn(&mut Turn) -> Result<(), String>,
-        argv: fn(&Turn, &Path) -> CommandLine,
-        parse: fn(&Finished, &str, Option<&str>) -> Report,
-    ) -> Self {
-        const SETTINGS: &[&str] = &["model", "effort", "cwd", "access", "mode", "instructions"];
-        Self {
-            name,
-            cli: name,
-            install_dirs: if cfg!(unix) { unix_dirs } else { &[] },
-            efforts,
-            start_settings: SETTINGS,
-            reply_settings: SETTINGS,
-            access,
-            fixed_instructions: false,
-            reply_model: false,
-            not_claimed: &[],
-            read_only_not_claimed: &[],
-            prepare,
-            argv,
-            parse,
-        }
-    }
-
     pub fn supported_settings(&self, reply: bool) -> &'static [&'static str] {
         if reply {
             self.reply_settings

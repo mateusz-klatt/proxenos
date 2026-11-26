@@ -1,33 +1,36 @@
 //! Copilot print mode emits events followed by a result for the session.
 
+use std::path::Path;
+
 use serde_json::{Value, json};
 
-use super::{CommandLine, Failure, Provider, Report, is_canonical_uuid, is_valid_model};
+use super::{CommandLine, Failure, Provider, Report, Turn, is_canonical_uuid, is_valid_model};
 use crate::envelope::FailureKind;
 use crate::supervise::Finished;
 
-pub(super) const SPEC: Provider = Provider::full_access_print(
-    "copilot",
-    &[("HOME", ".local/bin")],
-    &["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-    &[(
-        "full",
-        "Copilot runs with --allow-all. CLI deny rules and organization policy still apply. No read-only configuration has been verified across its tools.",
-    )],
-    |turn| turn.require_session_uuid("Copilot"),
-    |turn, _| {
-        let resume = turn
-            .thread_id
-            .as_ref()
-            .map(|id| format!("--resume={id}").into());
-        CommandLine::for_print_turn(
-            turn,
-            &["--stream", "off", "--no-custom-instructions", "--allow-all"],
-            resume,
-        )
-    },
-    parse,
-);
+pub(super) const SPEC: Provider = super::full_access_print! {
+    name: "copilot",
+    unix_dirs: &[("HOME", ".local/bin")],
+    efforts: &["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    full_access: "Copilot runs with --allow-all. CLI deny rules and organization policy still apply. No read-only configuration has been verified across its tools.",
+    handlers: (prepare, argv, parse),
+};
+
+fn prepare(turn: &mut Turn) -> Result<(), String> {
+    turn.require_session_uuid("Copilot")
+}
+
+fn argv(turn: &Turn, _output: &Path) -> CommandLine {
+    let resume = turn
+        .thread_id
+        .as_ref()
+        .map(|id| format!("--resume={id}").into());
+    CommandLine::for_print_turn(
+        turn,
+        &["--stream", "off", "--no-custom-instructions", "--allow-all"],
+        resume,
+    )
+}
 
 fn cli_failure(stderr: &[u8], expected: Option<&str>) -> Option<Failure> {
     let text = String::from_utf8_lossy(stderr);
