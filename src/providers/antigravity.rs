@@ -172,28 +172,90 @@ fn classify(message: &str) -> Option<Failure> {
 }
 
 const DIAGNOSTIC_LIMIT: usize = 2048;
+const OMITTED_URL: &str = "[sign-in URL omitted]";
+
+fn redact_urls_in_line(line: &str) -> (String, bool) {
+    let lower = line.to_ascii_lowercase();
+    let mut out = String::with_capacity(line.len());
+    let mut cursor = 0;
+    let mut found = false;
+    while let Some(offset) = ["https://", "http://"]
+        .into_iter()
+        .filter_map(|scheme| lower[cursor..].find(scheme))
+        .min()
+    {
+        let start = cursor + offset;
+        let end = line[start..]
+            .find(char::is_whitespace)
+            .map_or(line.len(), |len| start + len);
+        out.push_str(&line[cursor..start]);
+        out.push_str(OMITTED_URL);
+        cursor = end;
+        found = true;
+    }
+    out.push_str(&line[cursor..]);
+    (out, found)
+}
+
+fn is_url_continuation(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b':'
+                        | b'/'
+                        | b'?'
+                        | b'#'
+                        | b'['
+                        | b']'
+                        | b'@'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b'%'
+                )
+        })
+}
 
 fn omit_sign_in_urls(text: &str) -> String {
-    let mut after_visit_prompt = false;
+    let mut in_url_continuation = false;
     let mut out = String::with_capacity(text.len());
     for chunk in text.split_inclusive('\n') {
         let line = chunk.strip_suffix('\n').unwrap_or(chunk);
         let eol = &chunk[line.len()..];
-        let lower = line.to_ascii_lowercase();
-        after_visit_prompt |= lower.contains("visit the url");
-        let has_url = lower.contains("http://") || lower.contains("https://");
-        let trimmed = lower.trim_start();
-        let is_sign_in_url = (after_visit_prompt && has_url)
-            || trimmed.starts_with("http://")
-            || trimmed.starts_with("https://");
-        if is_sign_in_url {
-            out.push_str("[sign-in URL omitted]");
+        let (redacted, had_url) = redact_urls_in_line(line);
+        if had_url {
+            out.push_str(&redacted);
+            out.push_str(eol);
+            in_url_continuation = redacted.trim_end().ends_with(OMITTED_URL);
+        } else if in_url_continuation && is_url_continuation(line) {
+            continue;
         } else {
             out.push_str(line);
+            out.push_str(eol);
+            in_url_continuation = false;
         }
-        out.push_str(eol);
     }
     out
+}
+
+fn stderr_auth_fallback(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("authentication required. please visit the url to log in")
+        || lower.contains("authentication failed")
 }
 
 fn finish_report(mut report: Report, stderr: &str) -> Report {
@@ -253,11 +315,9 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
             reason
         };
         let failure = classify(reason).or_else(|| {
-            error.and_then(|_| {
-                let mut from_stderr = classify(stderr)?;
-                from_stderr.message = reason.to_owned();
-                Some(from_stderr)
-            })
+            error
+                .filter(|_| stderr_auth_fallback(stderr))
+                .map(|_| Failure::new(FailureKind::Authentication, reason))
         });
         report.failure =
             Some(failure.unwrap_or_else(|| Failure::new(FailureKind::Unknown, reason)));
