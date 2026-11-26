@@ -88,6 +88,12 @@ fn cli_failure(stderr: &[u8], expected: Option<&str>) -> Option<Failure> {
 
 fn parse(run: &Finished, _output: &str, expected: Option<&str>) -> Report {
     let mut report = Report::default();
+    if run.stdout.total > run.stdout.bytes.len() as u64 {
+        if run.code != Some(0) {
+            report.failure = cli_failure(&run.stderr.bytes, expected);
+        }
+        return report;
+    }
     let mut lines = run
         .stdout
         .bytes

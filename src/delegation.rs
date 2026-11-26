@@ -368,7 +368,7 @@ impl Registry {
                 if finished.stdout.total > finished.stdout.bytes.len() as u64 {
                     break Err(Failure::new(
                         FailureKind::Capture,
-                        "The captured prefix of stdout contains no terminal result. The CLI wrote beyond the capture limit.",
+                        "The CLI wrote beyond the capture limit. Its captured stdout cannot confirm a completed turn.",
                     ));
                 }
                 break Err(Failure::new(

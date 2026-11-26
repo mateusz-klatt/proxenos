@@ -188,6 +188,38 @@ fn stream(events: &[Value]) -> String {
 }
 
 #[test]
+fn a_result_in_a_truncated_stream_cannot_confirm_a_turn() {
+    let fleet = Fleet::new(&["copilot"]);
+    let stdout = format!(
+        "{START}{}\n{{\"type\":\"assistant.idle\"}}\n",
+        " ".repeat(4 << 20)
+    );
+    fleet.script(
+        "copilot",
+        json!([
+            {"stdout":stdout},
+            {"code":1,"stdout":stdout,"stderr":LOGIN_ERR}
+        ]),
+    );
+    let mut server = fleet.server("codex");
+    let result = call(&mut server, "copilot", json!({"prompt":"check"}));
+    assert_observed_failure(&result, "capture", "capture limit");
+    let attempt = &result["observed"]["attempts"][0];
+    assert_eq!(attempt["stdout_bytes"], stdout.len());
+    assert_eq!(attempt["stdout_captured"], 4 << 20);
+    assert!(result["reported"]["content"].is_null());
+    assert!(result["reported"]["thread_id"].is_null());
+    let failed = call(&mut server, "copilot", json!({"prompt":"check"}));
+    assert_reported_failure(
+        &failed,
+        Some(("abnormal_exit", "exit code 1")),
+        "authentication",
+        "No authentication information found",
+    );
+    assert!(failed["reported"]["content"].is_null());
+}
+
+#[test]
 fn only_the_final_completed_main_turn_can_supply_answer_bytes() {
     let fleet = Fleet::new(&["copilot"]);
     let start = json!({"type":"assistant.turn_start","data":{"turnId":"main"}});
