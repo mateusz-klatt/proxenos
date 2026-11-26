@@ -200,6 +200,11 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
     if let Some(path) = step["hold_file"].as_str() {
         hold_lock(path)?;
     }
+    if let Some(path) = step["pipe_holding_descendant"].as_str() {
+        let mut descendant = grandchild(path, false)?;
+        descendant.env_remove("PROXENOS_STUB_DIR");
+        spawn_and_wait_ready(&mut descendant, path)?;
+    }
     let mut held_memory = Vec::<u8>::new();
     if let Some(bytes) = step["alloc_bytes"].as_u64() {
         held_memory = alloc_and_touch(bytes as usize)?;

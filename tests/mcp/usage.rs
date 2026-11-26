@@ -289,18 +289,76 @@ fn a_timeout_releases_the_process_for_each_account_source() {
 }
 
 #[test]
+fn an_exited_account_reader_cannot_leave_its_output_pipes_with_a_descendant() {
+    let fleet = Fleet::new(&["codex"]);
+    let lock = fleet.root.join("descendant");
+    let release = fleet.root.join("release-leader");
+    let mut step = rpc(json!({"id":2,"result":{"rateLimits":{}}}));
+    step["pipe_holding_descendant"] = json!(lock);
+    step["wait_for"] = json!(release);
+    fleet.script("codex", json!([step]));
+    let mut server = fleet.server("codex");
+    server.start_call(13, "usage", json!({"providers":["codex"]}));
+    let until = Instant::now() + WAIT;
+    while !lock.with_extension("ready").exists() {
+        assert!(
+            Instant::now() < until,
+            "descendant did not acquire its lock"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let witness = std::fs::File::options().write(true).open(&lock).unwrap();
+    assert!(matches!(
+        witness.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    std::fs::write(release, []).unwrap();
+    let started = Instant::now();
+    let report: Value = serde_json::from_str(text(&server.response(13))).unwrap();
+    assert_eq!(
+        report["providers"]["codex"],
+        json!({"status":"unavailable","reason":"timeout"})
+    );
+    assert!(started.elapsed() >= Duration::from_millis(1900));
+    let until = Instant::now() + WAIT;
+    loop {
+        match witness.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                assert!(Instant::now() < until, "the descendant survived its parent");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("could not verify the descendant lock: {error}"),
+        }
+    }
+}
+
+#[test]
 fn an_unlaunchable_account_cli_does_not_disclose_os_diagnostics() {
     let fleet = Fleet::new(&[]);
-    for cli in ["codex", "cursor-agent"] {
+    let mut server = fleet.server("cursor");
+    for (source, cli) in [("codex", "codex"), ("cursor", "cursor-agent")] {
         let path = fleet
             .root
             .join("bin")
             .join(format!("{cli}{}", std::env::consts::EXE_SUFFIX));
-        std::fs::write(path, b"invalid program").unwrap();
-    }
-    let mut server = fleet.server("cursor");
-    let reports = usage(&mut server, json!({"providers":["cursor","codex"]}));
-    for source in ["codex", "cursor"] {
+        std::fs::copy(crate::provider_support::stub(), &path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        let _locked_image = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::File::options()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap()
+        };
+        assert!(path.is_file(), "CLI discovery should see the private copy");
+        let reports = usage(&mut server, json!({"providers":[source]}));
         assert_eq!(
             reports[source],
             json!({"status":"unavailable","reason":"unavailable"})

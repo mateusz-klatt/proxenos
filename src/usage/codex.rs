@@ -13,10 +13,15 @@ use tokio_util::sync::CancellationToken;
 use crate::discovery::Executable;
 use crate::mcp::Activity;
 use crate::platform;
-use crate::supervise::{Ending, StartError, check_start, write_stdin};
+use crate::supervise::{StartError, check_start, write_stdin};
 
 type Output = Take<BufReader<ChildStdout>>;
 type ReadResult<T> = Result<T, &'static str>;
+
+// Transport diagnostics may contain private account or installation details.
+fn unavailable(_: impl Into<StartError>) -> &'static str {
+    "unavailable"
+}
 
 async fn response(reader: &mut Output, id: i64) -> ReadResult<Value> {
     let mut line = Vec::new();
@@ -25,7 +30,7 @@ async fn response(reader: &mut Output, id: i64) -> ReadResult<Value> {
         let size = reader
             .read_until(b'\n', &mut line)
             .await
-            .map_err(|_| "unavailable")?;
+            .map_err(unavailable)?;
         if reader.limit() == 0 {
             return Err("capture");
         }
@@ -57,7 +62,7 @@ async fn response(reader: &mut Output, id: i64) -> ReadResult<Value> {
 async fn drain<R: AsyncRead + Unpin>(reader: &mut Take<R>) -> ReadResult<()> {
     tokio::io::copy(reader, &mut tokio::io::sink())
         .await
-        .map_err(|_| "unavailable")?;
+        .map_err(unavailable)?;
     (reader.limit() != 0).then_some(()).ok_or("capture")
 }
 
@@ -68,13 +73,13 @@ async fn exchange(mut reader: Output, writer: io::PipeWriter) -> ReadResult<Valu
     }}});
     write_stdin(&mut writer, format!("{init}\n"))
         .await
-        .map_err(|_| "unavailable")?;
+        .map_err(unavailable)?;
     response(&mut reader, 1).await?;
     let ready = json!({"method":"initialized"});
     let limits = json!({"id":2, "method":"account/rateLimits/read", "params":{"excludeResetCreditDetails":true}});
     write_stdin(&mut writer, format!("{ready}\n{limits}\n"))
         .await
-        .map_err(|_| "unavailable")?;
+        .map_err(unavailable)?;
     let result = response(&mut reader, 2).await?;
     drop(writer);
     drain(&mut reader).await?;
@@ -92,7 +97,8 @@ async fn bounded<T>(
         () = tokio::time::sleep_until(deadline.into()) => None,
         result = operation => Some(result),
     };
-    // A native spawn can observe expiry before Tokio delivers the timer tick.
+    // A worker can skip the launch before Tokio delivers the timer tick. The token and
+    // monotonic clock still identify why it skipped when its result wins the select.
     if cancel.is_cancelled() {
         return Err("cancelled");
     }
@@ -132,11 +138,7 @@ pub(super) async fn read(
         launched
             .await
             .expect("usage spawn worker finished")
-            .map_err(|reason| match reason {
-                StartError::Skipped(Ending::Cancelled) => "cancelled",
-                StartError::Skipped(_) => "timeout",
-                StartError::Io(_) => "unavailable",
-            })
+            .map_err(unavailable)
     })
     .await?;
     let writer = child.stdin.take().expect("stdin was piped");
@@ -156,11 +158,11 @@ pub(super) async fn read(
         tokio::select! {
             answer = &mut pipes => {
                 let answer = answer?;
-                wait.await.map_err(|_| "unavailable")?;
+                wait.await.map_err(unavailable)?;
                 Ok(answer)
             }
             status = &mut wait => {
-                status.map_err(|_| "unavailable")?;
+                status.map_err(unavailable)?;
                 // A descendant may hold the pipes open even after the app-server exits.
                 tokio::time::timeout(Duration::from_secs(2), pipes).await.map_err(|_| "timeout")?
             }
