@@ -210,6 +210,10 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
     thread::sleep(Duration::from_millis(
         step["sleep_ms"].as_u64().unwrap_or(0),
     ));
+    io::stdout().write_all(step["after_sleep_stdout"].as_str().unwrap_or("").as_bytes())?;
+    io::stdout().flush()?;
+    io::stderr().write_all(step["after_sleep_stderr"].as_str().unwrap_or("").as_bytes())?;
+    io::stderr().flush()?;
     std::hint::black_box(&held_memory);
     Ok(ExitCode::from(step["code"].as_u64().unwrap_or(0) as u8))
 }

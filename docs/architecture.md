@@ -301,10 +301,30 @@ Measured on 2026-11-26 on Linux x86_64 against Claude Code `2.1.332`:
   `error_during_execution` / `permission_denials` JSON payloads (synthetic fixtures), managed
   settings and `CLAUDE.md` behavior under `--setting-sources user`, and Windows/macOS execution.
 
-Not measured: Proxenos has not yet captured the real Codex or `agy` CLI output shape; the
-fixtures are synthetic, derived from claude-delegator's code. Capturing real CLI output—including
-pre-turn errors that spend no model call (such as `codex exec` with an invalid model while logged
-out) as well as live turn output—is the next step.
+Measured on 2026-11-26 with `agy` 1.5.18 on macOS `x86_64` while logged out:
+`agy --output-format json --disable-slash-commands --print ...` exits with code 1 after about
+60 s, writes an OAuth prompt (`"Authentication required. Please visit the URL to log in:"` plus
+URL) to standard error, and writes a single JSON object to standard output with fields
+`conversation_id` (`""`), `status` (`"ERROR"`), `response` (`""`), `error`
+(`"authentication failed or timed out"`), `duration_seconds` (`0` despite the ~60 s wait),
+`num_turns`, `usage` (`input_tokens`, `output_tokens`, `thinking_tokens`, `cache_read_tokens`,
+`total_tokens`), and `finished_reason` (`"error"`).
+
+For a failed Antigravity turn, a classified top-level JSON `error` takes precedence. Standard
+error can establish an authentication failure when that field is absent, blank or unclassified
+and a line starts with the exact `agy` sign-in prompt above. When both the JSON error and the
+sign-in prompt are absent, Proxenos reads other failure kinds from standard error. It never
+classifies agent-authored `response` text. On a non-zero exit or incomplete turn, up to 2 KiB of
+standard error normally goes into `reported.diagnostic`. An authentication failure uses fixed
+`reported.failure.message` and `reported.diagnostic` text that omits the CLI's sign-in output.
+The diagnostic tells the caller to run `agy` to sign in. The observed byte counts still include
+the captured output.
+
+Not measured: Proxenos has not yet captured live `agy` `SUCCESS` turn output, print-timeout
+output, or any real Codex CLI output; those fixtures remain synthetic, derived from
+claude-delegator's code. Capturing real Codex CLI output—including pre-turn errors that spend no
+model call (such as `codex exec` with an invalid model while logged out)—and live turn output for
+both CLIs is the next step.
 
 Measured for Kimi (`kimi 2.8.0` on Linux x86_64, 2026-11-26):
 
@@ -767,6 +787,11 @@ Proxenos never updates itself.
 
 What this cannot do:
 
+- The macOS binary is notarized but cannot be stapled: `stapler` accepts only `.app`, `.pkg` and
+  `.dmg`, not a bare Mach-O executable. A first launch of a quarantined binary while offline may
+  therefore be unable to confirm the notarization. On a real Mac `spctl -t install` reported
+  "accepted, source=Notarized Developer ID"; `spctl -t exec` rejects any bare command-line tool as
+  "not an app", which is expected and says nothing about the signature.
 - Ruleset `28030033` on `main` requires a pull request and the four CI checks, but
   `required_approving_review_count` is `0`. A session holding the owner's token can open a pull
   request, wait for green checks, merge it into `main` and dispatch `release.yml`. Saying `main` is

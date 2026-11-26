@@ -134,7 +134,15 @@ fn response(bytes: &[u8]) -> Option<Value> {
     object(bytes).or_else(|| bytes.rsplit(|b| *b == b'\n').find_map(object))
 }
 
-fn classify(message: &str) -> Option<Failure> {
+const SIGN_IN_PROMPT: &str = "Authentication required. Please visit the URL to log in";
+const SIGN_IN_DIAGNOSTIC: &str = "agy is not signed in. Run `agy` to sign in. The CLI's sign-in output was omitted because it contains a one-time login URL.";
+
+fn authentication_failure() -> Failure {
+    Failure::new(FailureKind::Authentication, "Antigravity requires sign-in")
+}
+
+// Only CLI error channels reach this classifier, never agent-authored `response` text.
+fn classify(message: &str, from_json: bool) -> Option<Failure> {
     let lower = message.to_ascii_lowercase();
     let kind = if lower.contains("quota")
         && ["exhaust", "exceed", "quota limit reached"]
@@ -142,15 +150,17 @@ fn classify(message: &str) -> Option<Failure> {
             .any(|s| lower.contains(s))
     {
         FailureKind::Quota
-    } else if [
-        "unauthenticated",
-        "authentication required",
-        "not authenticated",
-    ]
-    .iter()
-    .any(|s| lower.contains(s))
+    } else if from_json
+        && [
+            "unauthenticated",
+            "authentication required",
+            "authentication failed",
+            "not authenticated",
+        ]
+        .iter()
+        .any(|s| lower.contains(s))
     {
-        FailureKind::Authentication
+        return Some(authentication_failure());
     } else if lower.contains("timeout waiting for response") {
         FailureKind::Timeout
     } else if lower.contains("a tool required the \"command\" permission") {
@@ -168,11 +178,36 @@ fn classify(message: &str) -> Option<Failure> {
     Some(failure)
 }
 
+fn turn_failure(error: Option<&str>, stderr: &str) -> Option<Failure> {
+    if let Some(failure) = error.and_then(|message| classify(message, true)) {
+        return Some(failure);
+    }
+    if stderr.lines().any(|line| line.starts_with(SIGN_IN_PROMPT)) {
+        return Some(authentication_failure());
+    }
+    if error.is_none() {
+        return classify(stderr.trim(), false);
+    }
+    None
+}
+
 fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
     let stderr = String::from_utf8_lossy(&finished.stderr.bytes);
-    let Some(value) = response(&finished.stdout.bytes) else {
+    let mut report = parse_report(response(&finished.stdout.bytes), &stderr, expected);
+    if report
+        .failure
+        .as_ref()
+        .is_some_and(|failure| failure.kind == FailureKind::Authentication)
+    {
+        report.diagnostic = Some(SIGN_IN_DIAGNOSTIC.to_owned());
+    }
+    report
+}
+
+fn parse_report(value: Option<Value>, stderr: &str, expected: Option<&str>) -> Report {
+    let Some(value) = value else {
         return Report {
-            failure: classify(stderr.trim()),
+            failure: turn_failure(None, stderr),
             ..Report::default()
         };
     };
@@ -199,16 +234,18 @@ fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
             .map(|s| s.trim().to_owned());
     }
     if !success {
-        let reason = text("error").unwrap_or(stderr.trim());
-        let reason = if reason.is_empty() {
-            "Antigravity returned an unsuccessful status"
-        } else {
-            reason
-        };
-        report.failure =
-            Some(classify(reason).unwrap_or_else(|| Failure::new(FailureKind::Unknown, reason)));
+        let error = text("error");
+        report.failure = Some(turn_failure(error, stderr).unwrap_or_else(|| {
+            let reason = error.unwrap_or_else(|| stderr.trim());
+            let reason = if reason.is_empty() {
+                "Antigravity returned an unsuccessful status"
+            } else {
+                reason
+            };
+            Failure::new(FailureKind::Unknown, reason)
+        }));
     } else if report.content.is_none() {
-        report.failure = Some(classify(stderr.trim()).unwrap_or_else(|| {
+        report.failure = Some(turn_failure(None, stderr).unwrap_or_else(|| {
             Failure::new(
                 FailureKind::Unknown,
                 "Antigravity returned an empty response",
