@@ -3,7 +3,7 @@
 pub(crate) mod cleanup;
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::process::{Command, ExitStatus, Stdio};
@@ -140,6 +140,33 @@ pub(crate) async fn finish_reap(
     Ok(status)
 }
 
+pub(crate) fn check_start(cancel: &CancellationToken, deadline: Instant) -> Result<(), StartError> {
+    if cancel.is_cancelled() {
+        return Err(StartError::Skipped(Ending::Cancelled));
+    }
+    if Instant::now() >= deadline {
+        return Err(StartError::Skipped(Ending::TimedOut));
+    }
+    Ok(())
+}
+
+pub(crate) async fn write_stdin(
+    writer: &mut Option<io::PipeWriter>,
+    payload: String,
+) -> io::Result<()> {
+    let mut pipe = writer.take().expect("stdin is open");
+    let (pipe, result) = tokio::task::spawn_blocking(move || {
+        let result = pipe
+            .write_all(payload.as_bytes())
+            .and_then(|()| pipe.flush());
+        (pipe, result)
+    })
+    .await
+    .expect("child stdin writer finished");
+    *writer = Some(pipe);
+    result
+}
+
 pub async fn run(
     mut launch: Launch,
     cancel: &CancellationToken,
@@ -149,7 +176,6 @@ pub async fn run(
     let mut command = Command::new(&launch.program);
     command
         .args(&launch.args)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(cwd) = &launch.cwd {
@@ -169,18 +195,11 @@ pub async fn run(
     tokio::task::spawn_blocking(move || {
         let child = platform::spawn(
             command,
+            platform::Input::Closed,
             &mut launch.temporary_files,
             memory_limit_bytes,
             activity.clone(),
-            || {
-                if queued.is_cancelled() {
-                    return Err(StartError::Skipped(Ending::Cancelled));
-                }
-                if Instant::now() >= launch.deadline {
-                    return Err(StartError::Skipped(Ending::TimedOut));
-                }
-                Ok(())
-            },
+            || check_start(&queued, launch.deadline),
         );
         let _ = publish.send(child);
         // Only failed or skipped launches have files left here. This worker holds its

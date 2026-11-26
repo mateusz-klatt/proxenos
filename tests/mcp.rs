@@ -57,7 +57,8 @@ fn an_earlier_revision_is_served_after_initialize() {
                 "test_run",
                 "test_wait",
                 "await",
-                "cancel"
+                "cancel",
+                "usage"
             ]
         );
         // The schema goes out as it was written.

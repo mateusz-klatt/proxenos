@@ -464,7 +464,7 @@ fn await_outcome(
     }
 }
 
-fn invalid_request(message: &str) -> ToolOutcome {
+pub(crate) fn invalid_request(message: &str) -> ToolOutcome {
     ToolOutcome {
         is_error: true,
         text: json!({

@@ -10,7 +10,7 @@ use crate::supervise::Finished;
 
 const SETTINGS: &[&str] = &["model", "cwd", "access", "mode", "instructions", "effort"];
 
-pub(super) const SPEC: Provider = Provider {
+pub(crate) const SPEC: Provider = Provider {
     name: "codex",
     cli: "codex",
     #[cfg(unix)]

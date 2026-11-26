@@ -18,6 +18,8 @@ use crate::envelope::Failure;
 use crate::mcp::ToolSpec;
 use crate::supervise::Finished;
 
+pub(crate) use codex::SPEC as CODEX;
+
 pub const ALL: &[Provider] = &[
     codex::SPEC,
     antigravity::SPEC,

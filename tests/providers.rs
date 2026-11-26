@@ -28,6 +28,8 @@ mod kimi;
 mod provider_support;
 #[path = "mcp/sessions.rs"]
 mod sessions;
+#[path = "mcp/usage.rs"]
+mod usage;
 
 #[path = "mcp/git.rs"]
 mod git;
@@ -47,13 +49,13 @@ fn both_pairs_and_shared_tools_are_listed_with_their_own_capabilities() {
         .iter()
         .filter(|s| !s["name"].as_str().unwrap().starts_with("test_"))
         .collect();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
     let mut provider_count = 0;
     let mut shared = Vec::new();
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
         let fields = &tool["inputSchema"]["properties"];
-        if matches!(name, "await" | "cancel") {
+        if matches!(name, "await" | "cancel" | "usage") {
             shared.push(name);
             continue;
         }
@@ -74,7 +76,7 @@ fn both_pairs_and_shared_tools_are_listed_with_their_own_capabilities() {
         assert!(fields["expert"].is_null());
     }
     assert_eq!(provider_count, 4);
-    assert_eq!(shared, ["await", "cancel"]);
+    assert_eq!(shared, ["await", "cancel", "usage"]);
 }
 
 #[test]

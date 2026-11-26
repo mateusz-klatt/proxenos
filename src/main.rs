@@ -14,6 +14,7 @@ mod sessions;
 mod state;
 mod supervise;
 mod tools;
+mod usage;
 
 use std::ffi::OsString;
 use std::io::Write;

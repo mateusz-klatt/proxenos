@@ -539,6 +539,25 @@ client over a child's pipes and one HTTP request to a loopback address. It makes
 so Proxenos has no TLS stack. The Moonshot API-key balance that claude-delegator read is not
 supported: Kimi is used through its subscription.
 
+The shared MCP tool currently accepts `providers: ["codex", "cursor"]` or either name alone.
+It can read the calling client's own subscription. Each provider has its own status and a
+ten-second deadline including CLI lookup, followed by D6 process cleanup. Failure to read one
+account leaves the other result available.
+
+- Codex CLI 0.172.0 accepts `account/rateLimits/read` over `app-server --listen stdio://`
+  after initialization. Proxenos asks for windows without reset credit details. It prefers the
+  per-bucket map and falls back to the single bucket on older responses. Window percentages
+  are used percentages. Resets are Unix seconds. A signed-out profile returned an
+  authentication error. [Codex app-server protocol](https://developers.openai.com/codex/app-server/)
+- `cursor-agent about --format json` exposes the subscription tier. Its measured response
+  included no usage windows. The tool returns `plan_only` for a supplied tier and
+  `plan_not_reported` when the tier is null. It discards email, machine details and request IDs.
+
+Set `full: true` to include Codex's reported permission for ordinary usage when available.
+Neither source supplies prices per model, so the full report returns `model_prices: null`.
+Proxenos communicates with these CLIs through child pipes. Account network access belongs
+to each CLI.
+
 ### D10. Proxenos registers itself with each client
 
 `proxenos integrate <client>` writes the registration and `--remove` takes it out. It changes only

@@ -64,7 +64,7 @@ fn claude_tools_and_capabilities_are_listed_for_other_clients_and_hidden_from_cl
         .unwrap()
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
-        .filter(|name| !name.starts_with("test_") && !matches!(*name, "await" | "cancel"))
+        .filter(|name| !name.starts_with("test_") && !matches!(*name, "await" | "cancel" | "usage"))
         .collect();
     assert!(self_names.is_empty(), "{self_names:?}");
     for tool in ["claude", "claude-reply"] {
@@ -84,7 +84,7 @@ fn claude_tools_and_capabilities_are_listed_for_other_clients_and_hidden_from_cl
         .iter()
         .filter(|tool| {
             let name = tool["name"].as_str().unwrap();
-            !name.starts_with("test_") && !matches!(name, "await" | "cancel")
+            !name.starts_with("test_") && !matches!(name, "await" | "cancel" | "usage")
         })
         .collect();
     assert_eq!(tools.len(), 2);

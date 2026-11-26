@@ -177,6 +177,26 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
         step
     };
     drop(log);
+    if let Some(frames) = step["rpc"].as_array() {
+        use std::io::BufRead;
+        let mut input = io::stdin().lock();
+        let mut record = File::options()
+            .create(true)
+            .append(true)
+            .open(root.join(format!("{cli}.rpc.jsonl")))?;
+        for frame in frames {
+            let mut line = String::new();
+            input.read_line(&mut line)?;
+            let request: Value = serde_json::from_str(&line)?;
+            assert_eq!(
+                request["method"], frame["expect"],
+                "unexpected JSON-RPC method"
+            );
+            record.write_all(line.as_bytes())?;
+            io::stdout().write_all(frame["send"].as_str().unwrap_or("").as_bytes())?;
+            io::stdout().flush()?;
+        }
+    }
     if let Some(path) = step["hold_file"].as_str() {
         hold_lock(path)?;
     }
