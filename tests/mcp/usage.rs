@@ -80,13 +80,13 @@ fn shared_usage_reports_selected_windows_and_plan_without_private_fields() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(frames.len(), 6);
-    for round in frames.chunks_exact(3) {
-        assert_eq!(round[0]["id"], 1);
-        assert_eq!(round[0]["method"], "initialize");
-        assert_eq!(round[1]["method"], "initialized");
+    for [initialize, initialized, read] in frames.as_chunks::<3>().0 {
+        assert_eq!(initialize["id"], 1);
+        assert_eq!(initialize["method"], "initialize");
+        assert_eq!(initialized["method"], "initialized");
         assert_eq!(
-            round[2],
-            json!({"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}})
+            read,
+            &json!({"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}})
         );
     }
     for invocation in fleet.records() {
