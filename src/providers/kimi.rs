@@ -44,7 +44,7 @@ fn is_valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
 }
 
-fn prepare(turn: &Turn) -> Result<(), String> {
+fn prepare(turn: &mut Turn) -> Result<(), String> {
     if let Some(id) = &turn.thread_id
         && !is_valid_id(id)
     {

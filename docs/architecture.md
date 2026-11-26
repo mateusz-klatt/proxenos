@@ -243,7 +243,13 @@ with `--permission-mode plan --setting-sources user` for `read-only`, `--permiss
 bypassPermissions` for `full` (because `acceptEdits` leaves non-allowlisted shell commands denied
 in non-interactive print mode), `--append-system-prompt` on starts, `--resume <uuid>` on replies
 (never `--continue`), optional `--model` and `--effort` (`low`, `medium`, `high`, `xhigh`, `max`),
-and `-- <prompt>`. Because `--resume` accepts session titles as well as UUIDs, Proxenos requires a
+and `-- <prompt>`. Under `read-only`, because `--setting-sources user` omits project and local
+settings files, Proxenos reads `.claude/settings.json` and `.claude/settings.local.json` in `cwd`
+as untrusted data (regular files only, capped at 64 KiB each, at most 128 `permissions.deny` string
+entries of at most 512 bytes each, rejecting control characters including NUL and entries starting
+with `-`, and failing closed with `invalid_request` if a file is unreadable, non-regular,
+oversized, or malformed) and forwards those deny rules as repeated `--disallowedTools <rule>`
+arguments. Because `--resume` accepts session titles as well as UUIDs, Proxenos requires a
 canonical UUID before dispatch and confirms the returned `session_id` before accepting response
 content, model, usage, or cost. Because Claude Code retains the initial `--append-system-prompt`
 across `--resume`, `fixed_instructions` is `true` and Proxenos refuses mode or instructions changes
@@ -252,20 +258,23 @@ model when `--model` is omitted, `reply_model` is `false` (D19 reapplies an expl
 and passes no `--model` on a model-less start). With `--print`, Claude Code skips workspace trust;
 without `--setting-sources user`, project `.claude/settings.json` and `.claude/settings.local.json`
 `SessionStart` hooks and `.mcp.json` servers execute even under `--permission-mode plan`. Passing
-`--setting-sources user` under `read-only` excludes project and local settings sources, but does
-not create an OS sandbox and does not prevent user or managed settings, hooks, or permission
-allow-lists from interacting with plan mode (and under `full`, project settings still load). Both
-non-claims are stated in `not_claimed` (with the plan-mode non-claim added only under `read-only`)
-and in the tool schema. Self-delegation and recursive delegation are stopped by D1 (`--client
-claude` omits `claude` and `claude-reply`) and the D13 depth guard (`PROXENOS_DEPTH=1` and
-`CLAUDE_DELEGATOR_*_DEPTH=1` set on child processes and refused before discovery when present, with
-`CLAUDECODE` stripped from delegated children); a provider with full access can still invoke another
-CLI directly or clear environment variables. The JSON result object is mapped into `reported`
-(`thread_id`, `content`, single-entry `modelUsage` model, allowlisted `usage` token counters, and
-`session_cost_usd` from `total_cost_usd`, which is cumulative for the session rather than per-turn).
-`is_error: true` (emitted even alongside `subtype: "success"` on API and login errors),
-non-`"success"` subtypes (preferring the `errors` array over `result`), empty results, and
-zero-turn exits (`num_turns: 0`, such as local slash commands) are reported as failures.
+`--setting-sources user` under `read-only` excludes project and local settings sources (including
+project and local sandbox settings), does not create an OS sandbox, and does not prevent user or
+managed settings, hooks, or permission allow-lists from interacting with plan mode (and under
+`full`, project settings still load). Both non-claims are stated in `not_claimed` (with the
+plan-mode and project-sandbox non-claim added only under `read-only`) and in the tool schema.
+Self-delegation and recursive delegation are stopped by D1 (`--client claude` omits `claude` and
+`claude-reply`) and the D13 depth guard (`PROXENOS_DEPTH=1` and `CLAUDE_DELEGATOR_*_DEPTH=1` set on
+child processes and refused before discovery when present, with `CLAUDECODE` stripped from
+delegated children); a provider with full access can still invoke another CLI directly or clear
+environment variables. The JSON result object is mapped into `reported` (`thread_id`, `content`,
+single-entry `modelUsage` model, allowlisted `usage` token counters, and `session_cost_usd` from
+`total_cost_usd`, which is cumulative for the session rather than per-turn). `is_error: true`
+(emitted even alongside `subtype: "success"` on API and login errors), non-`"success"` subtypes
+(preferring the `errors` array, falling back to `result` only when `is_error: true` and otherwise
+classifying from `stderr` or reporting `unknown` with the subtype so agent draft text in `result`
+cannot set failure kind or `reset_at`), empty results, and zero-turn exits (`num_turns: 0`, such as
+local slash commands) are reported as failures.
 
 Measured on 2026-11-26 on Linux x86_64 against Claude Code `2.1.332`:
 - Live model captures (4 turns with `--model haiku` and `--permission-mode plan` in empty `/tmp`
@@ -279,11 +288,15 @@ Measured on 2026-11-26 on Linux x86_64 against Claude Code `2.1.332`:
   `captured-not-logged-in.stdout.json`), unknown `--resume` UUID and session-title lookup
   (`captured-bogus-resume.stderr.txt`), `num_turns: 0` local slash command exit
   (`captured-local-command.stdout.json`) and `--disable-slash-commands` blocking `/cost` execution,
-  `--effort` valid values (`low`, `medium`, `high`, `xhigh`, `max`), and project
+  `--effort` valid values (`low`, `medium`, `high`, `xhigh`, `max`), project
   `.claude/settings.json` / `.claude/settings.local.json` `SessionStart` hooks plus `.mcp.json`
-  executing under default settings in `--permission-mode plan` but not under `--setting-sources user`.
+  executing under default settings in `--permission-mode plan` but not under `--setting-sources user`,
+  and `--disallowedTools` accepted with `--print` and `--setting-sources user` (repeated
+  `--disallowedTools` flags unioning and removing denied tool names from the `stream-json --verbose`
+  init tool list, including right before `-- <prompt>`).
 - Documented only (not live-measured): model persistence across `--resume` when `--model` is
   omitted, `--effort` effect on live turns, `--disable-slash-commands` on non-canary tool turns,
+  path-scoped `--disallowedTools` rule enforcement (e.g. `Read(./.env)`) on a live tool call,
   `--permission-mode bypassPermissions` vs `acceptEdits` tool approval behavior, `error_max_turns` /
   `error_during_execution` / `permission_denials` JSON payloads (synthetic fixtures), managed
   settings and `CLAUDE.md` behavior under `--setting-sources user`, and Windows/macOS execution.

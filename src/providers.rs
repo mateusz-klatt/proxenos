@@ -34,7 +34,7 @@ pub struct Provider {
     pub reply_model: bool,
     pub not_claimed: &'static [&'static str],
     pub read_only_not_claimed: &'static [&'static str],
-    pub prepare: fn(&Turn) -> Result<(), String>,
+    pub prepare: fn(&mut Turn) -> Result<(), String>,
     pub argv: fn(&Turn, &Path) -> CommandLine,
     pub parse: fn(&Finished, &str, Option<&str>) -> Report,
 }
@@ -84,6 +84,7 @@ pub struct Turn {
     pub guidance: String,
     pub wait: bool,
     pub memory_limit_bytes: Option<u64>,
+    pub denied_tools: Vec<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -327,6 +328,7 @@ impl Provider {
             guidance,
             wait: args.get("wait").and_then(Value::as_bool).unwrap_or(true),
             memory_limit_bytes: args.get("memory_limit_bytes").and_then(Value::as_u64),
+            denied_tools: Vec::new(),
         })
     }
 }

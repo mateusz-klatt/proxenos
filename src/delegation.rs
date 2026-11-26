@@ -230,11 +230,11 @@ impl Registry {
         } else {
             None
         };
-        let turn = p
+        let mut turn = p
             .turn(args, reply, start)
             .map_err(|message| Failure::new(FailureKind::InvalidRequest, message))?;
         let call_deadline = started + Duration::from_millis(turn.timeout_ms);
-        prepare(p, &turn, call_deadline, cancel, activity).await?;
+        prepare(p, &mut turn, call_deadline, cancel, activity).await?;
         Ok((turn, call_deadline))
     }
 
@@ -275,7 +275,8 @@ impl Registry {
         let outcome = loop {
             // Discovery and workspace inspection can outlast a conversation store entry.
             if turn.thread_id.is_some()
-                && let Err(error) = prepare(p, &turn, call_deadline, cancel, activity.clone()).await
+                && let Err(error) =
+                    prepare(p, &mut turn, call_deadline, cancel, activity.clone()).await
             {
                 break Err(error);
             }
@@ -527,28 +528,31 @@ async fn await_bounded<T>(
 
 async fn prepare(
     p: &'static Provider,
-    turn: &Turn,
+    turn: &mut Turn,
     deadline: Instant,
     cancel: &CancellationToken,
     activity: Activity,
 ) -> Result<(), Failure> {
-    let check = turn.clone();
+    let mut check = turn.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let result = (p.prepare)(&check);
+        let result = (p.prepare)(&mut check);
         drop(activity);
-        result
+        (check, result)
     });
-    await_bounded(
+    let prepared = await_bounded(
         async {
-            task.await
-                .expect("preflight worker finished")
+            let (check, result) = task.await.expect("preflight worker finished");
+            result
+                .map(|()| check)
                 .map_err(|reason| Failure::new(FailureKind::InvalidRequest, reason))
         },
         deadline,
         cancel,
         "Provider preflight",
     )
-    .await
+    .await?;
+    *turn = prepared;
+    Ok(())
 }
 
 pub struct Attempt {

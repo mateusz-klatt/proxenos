@@ -108,6 +108,8 @@ fn claude_tools_and_capabilities_are_listed_for_other_clients_and_hidden_from_cl
             access_desc.contains("--setting-sources user"),
             "{access_desc}"
         );
+        assert!(access_desc.contains("--disallowedTools"), "{access_desc}");
+        assert!(access_desc.contains("sandbox settings"), "{access_desc}");
         assert!(access_desc.contains("not an OS sandbox"), "{access_desc}");
         assert!(props["expert"].is_null());
         if reply {
@@ -204,6 +206,10 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
     );
     assert!(
         not_claimed.contains("plan mode enforced an OS sandbox"),
+        "{not_claimed}"
+    );
+    assert!(
+        not_claimed.contains("project or local sandbox settings"),
         "{not_claimed}"
     );
     assert!(
@@ -663,6 +669,15 @@ fn claude_classifies_captured_and_synthetic_errors_and_ignores_error_text_in_ans
         "session_id": SESSION_ID
     })
     .to_string();
+    let max_turns_draft_quota = json!({
+        "type": "result",
+        "subtype": "error_max_turns",
+        "is_error": false,
+        "num_turns": 3,
+        "session_id": SESSION_ID,
+        "result": "You've hit your limit · resets at 9am."
+    })
+    .to_string();
     let empty_success = json!({
         "type": "result",
         "subtype": "success",
@@ -699,6 +714,8 @@ fn claude_classifies_captured_and_synthetic_errors_and_ignores_error_text_in_ans
             {"stdout": auth_type, "code": 1},
             {"stdout": content_refusal, "code": 1},
             {"stdout": ERROR_MAX_TURNS, "code": 0},
+            {"stdout": max_turns_draft_quota, "code": 0},
+            {"stdout": max_turns_draft_quota, "stderr": "401 Unauthorized", "code": 0},
             {"stdout": err_stderr_fallback, "stderr": "runtime aborted", "code": 1},
             {"stdout": err_subtype_fallback, "code": 1},
             {"stdout": err_bare_fallback, "code": 1},
@@ -793,6 +810,21 @@ fn claude_classifies_captured_and_synthetic_errors_and_ignores_error_text_in_ans
     assert_eq!(max_turns["reported"]["model"], "claude-haiku-4-5");
     assert_eq!(max_turns["reported"]["usage"]["thinking_tokens"], 12);
     assert_eq!(max_turns["reported"]["session_cost_usd"], 0.015);
+
+    // 11b. Non-success subtype without errors ignores agent draft text in result (never sets quota/reset_at).
+    let draft_only = call(&mut server, "claude", json!({"prompt": "11b"}));
+    assert_reported_failure(
+        &draft_only,
+        None,
+        "unknown",
+        "Claude stopped with subtype error_max_turns.",
+    );
+    assert!(draft_only["reported"]["failure"]["reset_at"].is_null());
+
+    // 11c. Non-success subtype without errors classifies from stderr instead of agent draft text.
+    let draft_stderr = call(&mut server, "claude", json!({"prompt": "11c"}));
+    assert_reported_failure(&draft_stderr, None, "authentication", "401 Unauthorized");
+    assert!(draft_stderr["reported"]["failure"]["reset_at"].is_null());
 
     // 12-14. Error reason fallback chain (stderr -> subtype -> generic).
     for (label, detail) in [
@@ -969,4 +1001,213 @@ fn claude_maps_not_found_depth_limit_timeout_cancellation_and_capture_failures()
     let cancelled: Value = serde_json::from_str(text(&server.response(11))).unwrap();
     assert_observed_failure(&cancelled, "cancellation", "was cancelled");
     fleet.assert_steps_remaining("claude", 0);
+}
+
+fn flag_values<'a>(args: &[&'a str], flag: &str) -> Vec<&'a str> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1])
+        .collect()
+}
+
+#[test]
+fn claude_forwards_project_deny_rules_under_read_only_and_fails_closed_on_bad_settings() {
+    let fleet = Fleet::new(&["claude"]);
+    let cwd = fleet.root.join("repo");
+    let claude_dir = cwd.join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    let project = claude_dir.join("settings.json");
+    let local = claude_dir.join("settings.local.json");
+    fleet.script(
+        "claude",
+        json!([
+            {"stdout": START_OK},
+            {"stdout": RESUME_OK},
+            {"stdout": START_OK},
+            {"stdout": RESUME_OK}
+        ]),
+    );
+    let mut server = fleet.server("codex");
+
+    // 1. Valid project + local permissions.deny rules are forwarded as repeated --disallowedTools
+    //    on both start and reply without duplication.
+    fs::write(
+        &project,
+        json!({"permissions": {"deny": ["Read(./.env)", "Edit(./secrets/**)"]}}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        &local,
+        json!({"permissions": {"deny": ["Bash(rm -rf *)"]}}).to_string(),
+    )
+    .unwrap();
+    let start = call(
+        &mut server,
+        "claude",
+        json!({"prompt": "review", "cwd": cwd, "access": "read-only"}),
+    );
+    assert_eq!(start["observed"]["state"], "finished", "{start}");
+    let reply = call(
+        &mut server,
+        "claude-reply",
+        json!({"thread_id": SESSION_ID, "prompt": "more"}),
+    );
+    assert_eq!(reply["observed"]["state"], "finished", "{reply}");
+
+    // 2. Settings files without permissions or without deny are accepted with no --disallowedTools.
+    fs::write(&project, "{}").unwrap();
+    fs::write(&local, r#"{"permissions":{"allow":["Read"]}}"#).unwrap();
+    let no_deny = call(
+        &mut server,
+        "claude",
+        json!({"prompt": "clean", "cwd": cwd, "access": "read-only"}),
+    );
+    assert_eq!(no_deny["observed"]["state"], "finished", "{no_deny}");
+    fs::remove_file(&local).unwrap();
+
+    // 3. Malformed, non-object, bad-schema, flag-like, NUL, oversized, over-limit, non-regular,
+    //    and unreadable settings files fail closed with invalid_request before dispatch.
+    let before_failures = invocations(&fleet).len();
+    let too_long_rule = "R".repeat(513);
+    let too_many_rules: Vec<String> = (0..129).map(|i| format!("Read(./secret-{i})")).collect();
+    let oversized_json = format!("{{\"note\":\"{}\"}}", "a".repeat(65 * 1024));
+    for (body, detail) in [
+        (
+            "{not valid json".to_owned(),
+            "Malformed Claude settings file",
+        ),
+        ("[]".to_owned(), "must contain a JSON object"),
+        (
+            r#"{"permissions":"none"}"#.to_owned(),
+            "non-object permissions field",
+        ),
+        (
+            r#"{"permissions":{"deny":"Read(./.env)"}}"#.to_owned(),
+            "non-array permissions.deny field",
+        ),
+        (
+            r#"{"permissions":{"deny":["--model"]}}"#.to_owned(),
+            "invalid permissions.deny entry",
+        ),
+        (
+            r#"{"permissions":{"deny":["  -x"]}}"#.to_owned(),
+            "invalid permissions.deny entry",
+        ),
+        (
+            r#"{"permissions":{"deny":["Read(\u0000)"]}}"#.to_owned(),
+            "invalid permissions.deny entry",
+        ),
+        (
+            r#"{"permissions":{"deny":[123]}}"#.to_owned(),
+            "invalid permissions.deny entry",
+        ),
+        (
+            r#"{"permissions":{"deny":["   "]}}"#.to_owned(),
+            "invalid permissions.deny entry",
+        ),
+        (
+            json!({"permissions": {"deny": [too_long_rule]}}).to_string(),
+            "invalid permissions.deny entry",
+        ),
+        (
+            json!({"permissions": {"deny": too_many_rules}}).to_string(),
+            "exceed the limit of 128 permissions.deny entries",
+        ),
+        (oversized_json, "exceeds size limit"),
+    ] {
+        fs::write(&project, body).unwrap();
+        let rejected = call(
+            &mut server,
+            "claude",
+            json!({"prompt": "blocked", "cwd": cwd, "access": "read-only"}),
+        );
+        assert_observed_failure(&rejected, "invalid_request", detail);
+    }
+
+    // Non-regular settings path (directory).
+    fs::remove_file(&project).unwrap();
+    fs::create_dir(&project).unwrap();
+    let dir_err = call(
+        &mut server,
+        "claude",
+        json!({"prompt": "dir", "cwd": cwd, "access": "read-only"}),
+    );
+    assert_observed_failure(&dir_err, "invalid_request", "not a regular file");
+    fs::remove_dir(&project).unwrap();
+
+    // Unreadable settings file and symlink (Unix) / exclusively locked file (Windows).
+    fs::write(&project, r#"{"permissions":{"deny":["Read(./.env)"]}}"#).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = call(
+            &mut server,
+            "claude",
+            json!({"prompt": "unreadable", "cwd": cwd, "access": "read-only"}),
+        );
+        assert_observed_failure(
+            &unreadable,
+            "invalid_request",
+            "Cannot read Claude settings",
+        );
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let target = fleet.root.join("outside.json");
+        fs::write(&target, "{}").unwrap();
+        fs::remove_file(&project).unwrap();
+        std::os::unix::fs::symlink(&target, &project).unwrap();
+        let symlink_err = call(
+            &mut server,
+            "claude",
+            json!({"prompt": "symlink", "cwd": cwd, "access": "read-only"}),
+        );
+        assert_observed_failure(&symlink_err, "invalid_request", "not a regular file");
+        fs::remove_file(&project).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _locked = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&project)
+            .unwrap();
+        let unreadable = call(
+            &mut server,
+            "claude",
+            json!({"prompt": "locked", "cwd": cwd, "access": "read-only"}),
+        );
+        assert_observed_failure(
+            &unreadable,
+            "invalid_request",
+            "Cannot read Claude settings",
+        );
+    }
+    assert_eq!(invocations(&fleet).len(), before_failures);
+
+    // 4. Full-access override does not parse project settings or pass --disallowedTools.
+    fs::write(&project, "{not valid json").unwrap();
+    let full = call(
+        &mut server,
+        "claude-reply",
+        json!({"thread_id": SESSION_ID, "prompt": "full", "access": "full"}),
+    );
+    assert_eq!(full["observed"]["state"], "finished", "{full}");
+    fleet.assert_steps_remaining("claude", 0);
+
+    let records = invocations(&fleet);
+    assert_eq!(records.len(), 4);
+    for record in &records[..2] {
+        let args = argv(record);
+        assert_eq!(flag_value(&args, "--setting-sources"), Some("user"));
+        assert_eq!(
+            flag_values(&args, "--disallowedTools"),
+            vec!["Read(./.env)", "Edit(./secrets/**)", "Bash(rm -rf *)"]
+        );
+    }
+    assert!(flag_values(&argv(&records[2]), "--disallowedTools").is_empty());
+    assert!(flag_value(&argv(&records[3]), "--setting-sources").is_none());
+    assert!(flag_values(&argv(&records[3]), "--disallowedTools").is_empty());
 }

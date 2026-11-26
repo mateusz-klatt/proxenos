@@ -2,6 +2,8 @@
 //! Replies resume an explicit session UUID with `--resume`.
 
 use std::ffi::OsString;
+use std::fs;
+use std::io::{self, Read};
 use std::path::Path;
 
 use serde_json::Value;
@@ -11,6 +13,9 @@ use crate::envelope::FailureKind;
 use crate::supervise::Finished;
 
 const SETTINGS: &[&str] = &["model", "cwd", "access", "mode", "instructions", "effort"];
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+const MAX_DENY_RULES: usize = 128;
+const MAX_DENY_RULE_LEN: usize = 512;
 
 pub(super) const SPEC: Provider = Provider {
     name: "claude",
@@ -29,7 +34,7 @@ pub(super) const SPEC: Provider = Provider {
         ),
         (
             "read-only",
-            "Claude Code runs with --permission-mode plan and --setting-sources user. Plan mode is a provider-side policy, not an OS sandbox; --setting-sources user excludes project and local settings files, while user/managed settings and allow-lists still apply.",
+            "Claude Code runs with --permission-mode plan and --setting-sources user, forwarding project and local permissions.deny entries as --disallowedTools. Plan mode is a provider-side policy, not an OS sandbox; user/managed settings and allow-lists still apply, while project and local sandbox settings are not applied.",
         ),
     ],
     fixed_instructions: true,
@@ -38,7 +43,7 @@ pub(super) const SPEC: Provider = Provider {
         "Project settings in the working directory (hooks, env, MCP servers) were not applied; with --print Claude Code skips workspace trust.",
     ],
     read_only_not_claimed: &[
-        "Claude Code's plan mode enforced an OS sandbox or prevented user and managed settings or permission allow-lists from interacting with it.",
+        "Claude Code's plan mode enforced an OS sandbox, applied project or local sandbox settings, or prevented user and managed settings or permission allow-lists from interacting with it.",
     ],
     prepare,
     argv,
@@ -49,11 +54,136 @@ fn is_canonical_uuid(id: &str) -> bool {
     uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
 }
 
-fn prepare(turn: &Turn) -> Result<(), String> {
+fn is_regular_file(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        meta.file_type().is_file() && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_file()
+    }
+}
+
+fn require_regular(meta: &fs::Metadata) -> io::Result<()> {
+    if !is_regular_file(meta) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "settings path is not a regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn read_settings_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    require_regular(&fs::symlink_metadata(path)?)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NONBLOCK | libc::O_NOFOLLOW,
+    );
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    let file = options.open(path)?;
+    require_regular(&file.metadata()?)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SETTINGS_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "settings file exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn is_valid_deny_rule(rule: &str) -> bool {
+    let trimmed = rule.trim();
+    !trimmed.is_empty()
+        && rule.len() <= MAX_DENY_RULE_LEN
+        && !rule.contains(char::is_control)
+        && !trimmed.starts_with('-')
+}
+
+fn parse_deny_rules(bytes: &[u8], path: &Path, rules: &mut Vec<String>) -> Result<(), String> {
+    let parsed: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("Malformed Claude settings file {}: {error}", path.display()))?;
+    let Some(root) = parsed.as_object() else {
+        return Err(format!(
+            "Claude settings file {} must contain a JSON object.",
+            path.display()
+        ));
+    };
+    let Some(permissions) = root.get("permissions").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let Some(permissions) = permissions.as_object() else {
+        return Err(format!(
+            "Claude settings file {} has a non-object permissions field.",
+            path.display()
+        ));
+    };
+    let Some(deny) = permissions.get("deny").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let Some(entries) = deny.as_array() else {
+        return Err(format!(
+            "Claude settings file {} has a non-array permissions.deny field.",
+            path.display()
+        ));
+    };
+    for entry in entries {
+        let Some(rule) = entry.as_str().filter(|rule| is_valid_deny_rule(rule)) else {
+            return Err(format!(
+                "Claude settings file {} contains an invalid permissions.deny entry.",
+                path.display()
+            ));
+        };
+        if rules.len() == MAX_DENY_RULES {
+            return Err(format!(
+                "Claude project settings exceed the limit of {MAX_DENY_RULES} permissions.deny entries."
+            ));
+        }
+        rules.push(rule.to_owned());
+    }
+    Ok(())
+}
+
+fn read_project_deny_rules(cwd: &Path) -> Result<Vec<String>, String> {
+    let mut rules = Vec::new();
+    for relative in [".claude/settings.json", ".claude/settings.local.json"] {
+        let path = cwd.join(relative);
+        let bytes = match read_settings_bytes(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Cannot read Claude settings file {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        parse_deny_rules(&bytes, &path, &mut rules)?;
+    }
+    Ok(rules)
+}
+
+fn prepare(turn: &mut Turn) -> Result<(), String> {
     if let Some(id) = &turn.thread_id
         && !is_canonical_uuid(id)
     {
         return Err("Claude thread_id must be a canonical UUID.".into());
+    }
+    turn.denied_tools.clear();
+    if turn.settings.access == "read-only" {
+        turn.denied_tools = read_project_deny_rules(&turn.settings.cwd)?;
     }
     Ok(())
 }
@@ -75,6 +205,9 @@ fn argv(turn: &Turn, _output: &Path) -> CommandLine {
     ];
     if read_only {
         args.extend(["--setting-sources".into(), "user".into()]);
+        for rule in &turn.denied_tools {
+            args.extend(["--disallowedTools".into(), rule.into()]);
+        }
     }
     if let Some(id) = &turn.thread_id {
         args.extend(["--resume".into(), id.into()]);
@@ -209,7 +342,7 @@ fn classify(message: &str, api_status: Option<u64>, api_type: Option<&str>) -> O
     Some(failure)
 }
 
-fn error_reason(value: &Value, stderr: &str, subtype: Option<&str>) -> String {
+fn error_reason(value: &Value, stderr: &str, subtype: Option<&str>, is_error: bool) -> String {
     if let Some(joined) = value["errors"].as_array().and_then(|items| {
         let messages: Vec<&str> = items
             .iter()
@@ -220,7 +353,7 @@ fn error_reason(value: &Value, stderr: &str, subtype: Option<&str>) -> String {
     }) {
         return joined;
     }
-    if let Some(message) = text(value, "result") {
+    if is_error && let Some(message) = text(value, "result") {
         return message.to_owned();
     }
     if let Some(detail) = nonempty(stderr) {
@@ -269,7 +402,7 @@ fn parse(finished: &Finished, _output: &str, expected: Option<&str>) -> Report {
             "Claude exited without running a turn.",
         ));
     } else if !success {
-        let reason = error_reason(&value, stderr.trim(), subtype);
+        let reason = error_reason(&value, stderr.trim(), subtype, is_error);
         let api_status = value["api_error_status"].as_u64();
         let api_type = text(&value, "api_error_type");
         report.failure = Some(
