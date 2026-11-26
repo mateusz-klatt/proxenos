@@ -476,7 +476,15 @@ fn retained_background_results_are_bounded_and_evict_the_oldest() {
 #[test]
 fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
     let fleet = Fleet::new(&["agy"]);
-    fleet.script("agy", json!([turn("ok1"), turn("ok2"), turn("ok3")]));
+    let release = fleet.root.join("after-panic.go");
+    let locks = [1, 2, 3].map(|i| fleet.root.join(format!("after-panic-{i}.lock")));
+    let steps = locks.each_ref().map(|lock| {
+        let mut step = turn("completed after panic");
+        step["hold_file"] = json!(lock);
+        step["wait_for"] = json!(release);
+        step
+    });
+    fleet.script("agy", json!(steps));
     let mut server = fleet.server("claude");
 
     let (started, is_error) = raw_call(&mut server, 1, "test_panic", json!({"background": true}));
@@ -510,16 +518,19 @@ fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
         r#"{"alive":true}"#
     );
     let mut handles = Vec::new();
-    for i in 0..3 {
+    for (i, lock) in locks.iter().enumerate() {
         let (bg, is_error) = raw_call(
             &mut server,
-            10 + i,
+            10 + i as i64,
             "antigravity",
             json!({"prompt": format!("after panic {i}"), "wait": false}),
         );
         assert!(!is_error, "{bg}");
+        assert_eq!(bg["state"], "running", "{bg}");
         handles.push(bg["handle"].as_str().unwrap().to_owned());
+        assert!(!is_free(&lock_file(lock)), "stub {i} must hold its slot");
     }
+    fs::write(release, []).unwrap();
     let (done, _) = raw_call(
         &mut server,
         20,
