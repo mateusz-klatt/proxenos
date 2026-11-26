@@ -229,7 +229,11 @@ For Codex, a completed turn and a final answer are separate evidence. Codex acce
 as well as a UUID in the resume position, so Proxenos requires a canonical UUID before dispatch,
 including on the automatic missing-final retry. A turn that explicitly
 lacks its answer can be asked once for that answer in the same confirmed thread. The server
-does not repeat the original task. Antigravity's print command can direct an unknown ID to a
+does not repeat the original task. On explicit resume, Codex CLI 0.172.0 reported cumulative
+thread token counts. Proxenos returns the CLI's counters in `reported.usage`.
+See the [measured Codex start and resume](../tests/fixtures/codex/README.md#captured-start-and-resume).
+
+Antigravity's print command can direct an unknown ID to a
 different conversation. The server requires an exact regular `<id>.db` or `<id>.pb` entry,
 checks again after discovery and the initial git snapshot, and compares the ID the CLI reports
 before accepting or archiving any response content (returning no content on a mismatch).

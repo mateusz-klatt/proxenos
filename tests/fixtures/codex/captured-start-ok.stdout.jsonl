@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a21913-d6f6-7432-81cc-171517698e9e"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `proxenos-local` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"First Proxenos fixture answer."}}
+{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1}}
