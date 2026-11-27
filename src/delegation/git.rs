@@ -36,6 +36,8 @@ pub(super) async fn find_git(
                     publish
                         .send(search_path())
                         .expect("git lookup cache lives for the process");
+                    #[cfg(feature = "test-tools")]
+                    gated_lookup_event("published");
                 });
                 done
             })
@@ -43,12 +45,34 @@ pub(super) async fn find_git(
         done.changed().await.expect("git lookup worker published");
         done.borrow_and_update().clone()
     };
-    let deadline = call_deadline.min(Instant::now() + GIT_TIMEOUT);
+    #[cfg(feature = "test-tools")]
+    gated_lookup_event("waiting");
+    let wait_started = Instant::now();
+    let deadline = call_deadline.min(wait_started + GIT_TIMEOUT);
     tokio::select! {
         biased;
-        () = cancel.cancelled() => None,
-        () = tokio::time::sleep_until(deadline.into()) => None,
+        () = cancel.cancelled() => {
+            #[cfg(feature = "test-tools")]
+            gated_lookup_event("cancelled");
+            None
+        },
+        () = tokio::time::sleep_until(deadline.into()) => {
+            #[cfg(feature = "test-tools")]
+            {
+                let elapsed_ms = wait_started.elapsed().as_millis();
+                let budget = if deadline == call_deadline { "call" } else { "lookup" };
+                gated_lookup_event(format_args!("{budget} deadline elapsed_ms={elapsed_ms}"));
+            }
+            None
+        },
         path = lookup => path,
+    }
+}
+
+#[cfg(feature = "test-tools")]
+fn gated_lookup_event(event: impl std::fmt::Display) {
+    if std::env::var_os("PROXENOS_TEST_GIT_LOOKUP_LOCK").is_some() {
+        eprintln!("proxenos test git lookup: {event}");
     }
 }
 

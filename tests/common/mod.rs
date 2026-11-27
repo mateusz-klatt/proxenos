@@ -266,6 +266,27 @@ impl Server {
         self.wait_for_stderr_count_within(needle, count, WAIT);
     }
 
+    /// Reads the integer after `prefix` on the `occurrence`-th matching stderr line.
+    pub fn wait_for_stderr_u64(&self, prefix: &str, occurrence: usize, limit: Duration) -> u64 {
+        self.wait_for_stderr_count_within(prefix, occurrence, limit);
+        let (lock, _) = &*self.stderr;
+        let state = lock.lock().expect("stderr lock");
+        let value = state
+            .text
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .nth(occurrence - 1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing stderr line {occurrence} starting with {prefix:?}: {}",
+                    state.text
+                )
+            });
+        value
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid value on stderr: {prefix}{value}: {error}"))
+    }
+
     fn wait_for_stderr_count_within(&self, needle: &str, count: usize, limit: Duration) {
         let deadline = Instant::now() + limit;
         let (lock, cvar) = &*self.stderr;
