@@ -1,6 +1,9 @@
 use serde_json::{Value, json};
 
-use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_failure, call};
+use crate::provider_support::{
+    AUTHENTICATION_DIAGNOSTIC, AUTHENTICATION_FAILURE_MESSAGE, Fleet, assert_observed_failure,
+    assert_reported_failure, call,
+};
 
 const START: &str = include_str!("../fixtures/grok/captured-start.stdout.json");
 const REPLY: &str = include_str!("../fixtures/grok/captured-reply.stdout.json");
@@ -138,9 +141,15 @@ fn native_failure_json_preserves_the_difference_between_login_and_unsearched_rem
         &login,
         Some(("abnormal_exit", "exit code 1")),
         "authentication",
-        "Not signed in.",
+        AUTHENTICATION_FAILURE_MESSAGE,
     );
-    assert_eq!(login["reported"]["diagnostic"], LOGIN_ERR);
+    assert_eq!(login["reported"]["diagnostic"], AUTHENTICATION_DIAGNOSTIC);
+    for raw in ["Not signed in", "grok login --device-code", "XAI_API_KEY"] {
+        assert!(
+            !login.to_string().contains(raw),
+            "login text {raw:?} leaked: {login}"
+        );
+    }
     let missing = call(
         &mut server,
         "grok-reply",

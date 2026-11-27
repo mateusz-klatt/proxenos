@@ -1,6 +1,9 @@
 use serde_json::{Value, json};
 
-use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_failure, call};
+use crate::provider_support::{
+    AUTHENTICATION_DIAGNOSTIC, AUTHENTICATION_FAILURE_MESSAGE, Fleet, assert_observed_failure,
+    assert_reported_failure, call,
+};
 
 const START: &str = include_str!("../fixtures/copilot/captured-start-suffix.stdout.jsonl");
 const REPLY: &str = include_str!("../fixtures/copilot/captured-reply-suffix.stdout.jsonl");
@@ -157,11 +160,17 @@ fn native_failures_remain_separate_from_process_status_and_requested_session() {
         &auth,
         Some(("abnormal_exit", "exit code 1")),
         "authentication",
-        "No authentication information found",
+        AUTHENTICATION_FAILURE_MESSAGE,
     );
     assert!(auth["reported"]["content"].is_null());
     assert!(auth["reported"]["thread_id"].is_null());
-    assert_eq!(auth["reported"]["diagnostic"], LOGIN_ERR);
+    assert_eq!(auth["reported"]["diagnostic"], AUTHENTICATION_DIAGNOSTIC);
+    assert!(
+        !auth
+            .to_string()
+            .contains("No authentication information found")
+    );
+    assert!(!auth.to_string().contains("COPILOT_GITHUB_TOKEN"));
     let missing = call(
         &mut server,
         "copilot-reply",
@@ -225,7 +234,7 @@ fn a_result_in_a_truncated_stream_cannot_confirm_a_turn() {
         &failed,
         Some(("abnormal_exit", "exit code 1")),
         "authentication",
-        "No authentication information found",
+        AUTHENTICATION_FAILURE_MESSAGE,
     );
     assert!(failed["reported"]["content"].is_null());
 }

@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 
 use crate::common::{Server, WAIT, text};
 use crate::provider_support::{
-    AUTHENTICATION_FAILURE_MESSAGE, Fleet, assert_observed_failure, assert_reported_failure, call,
+    AUTHENTICATION_DIAGNOSTIC, AUTHENTICATION_FAILURE_MESSAGE, Fleet, assert_observed_failure,
+    assert_reported_failure, call,
 };
 
 const AGY_FINISHED: &str = include_str!("../fixtures/antigravity/finished.json");
@@ -113,52 +114,52 @@ fn top_level_failure_covers_authentication_across_all_six_providers_and_exit_zer
 
     // Non-zero exit with authentication across all 6 providers:
     // top-level `failure` has kind=authentication, source=reported, fixed message;
-    // `observed.failure` keeps abnormal_exit; `reported.failure` keeps provider classification/text.
-    for (tool, expected_reported_detail, forbidden_in_top_message) in [
-        (
-            "antigravity",
-            "Antigravity requires sign-in",
-            "Antigravity requires",
-        ),
-        ("claude", "Not logged in", "Please run /login"),
-        ("codex", "sk-should-not-surface", "sk-should-not-surface"),
-        (
-            "copilot",
-            "No authentication information found",
-            "No authentication information",
-        ),
-        ("grok", "Not signed in", "grok login"),
-        ("kimi", "/login to sign in", "No model configured"),
+    // `observed.failure` keeps abnormal_exit; `reported.failure` and `reported.diagnostic` omit raw login text.
+    for (tool, forbidden_in_envelope) in [
+        ("antigravity", "Antigravity requires"),
+        ("claude", "Please run /login"),
+        ("codex", "sk-should-not-surface"),
+        ("copilot", "No authentication information"),
+        ("grok", "grok login"),
+        ("kimi", "No model configured"),
     ] {
         let result = call(&mut server, tool, json!({"prompt": "auth"}));
         assert_reported_failure(
             &result,
             Some(("abnormal_exit", "exit code 1")),
             "authentication",
-            expected_reported_detail,
+            AUTHENTICATION_FAILURE_MESSAGE,
         );
         let top_message = result["failure"]["message"].as_str().unwrap();
         assert_eq!(top_message, AUTHENTICATION_FAILURE_MESSAGE, "{result}");
+        assert_eq!(
+            result["reported"]["diagnostic"], AUTHENTICATION_DIAGNOSTIC,
+            "{result}"
+        );
         assert!(
-            !top_message.contains(forbidden_in_top_message),
-            "top-level authentication message leaked provider text: {result}"
+            !result.to_string().contains(forbidden_in_envelope),
+            "authentication envelope leaked provider text: {result}"
         );
     }
 
-    // Oversized authentication error still uses fixed top-level message while archiving reported.failure.
+    // Oversized authentication error replaces reported.failure before archiving, so no failure_file is created.
     let long_auth = call(&mut server, "claude", json!({"prompt": "long auth"}));
     assert_reported_failure(
         &long_auth,
         Some(("abnormal_exit", "exit code 1")),
         "authentication",
-        "Token rejected:",
+        AUTHENTICATION_FAILURE_MESSAGE,
     );
     assert_eq!(
         long_auth["failure"]["message"], AUTHENTICATION_FAILURE_MESSAGE,
         "{long_auth}"
     );
     assert!(
-        long_auth["observed"]["failure_file"].is_string(),
+        long_auth["observed"]["failure_file"].is_null(),
+        "{long_auth}"
+    );
+    assert!(
+        !long_auth.to_string().contains("Token rejected"),
         "{long_auth}"
     );
 
@@ -180,7 +181,16 @@ fn top_level_failure_covers_authentication_across_all_six_providers_and_exit_zer
     );
 
     let auth_exit_zero = call(&mut server, "kimi", json!({"prompt": "auth exit 0"}));
-    assert_reported_failure(&auth_exit_zero, None, "authentication", "401 Unauthorized");
+    assert_reported_failure(
+        &auth_exit_zero,
+        None,
+        "authentication",
+        AUTHENTICATION_FAILURE_MESSAGE,
+    );
+    assert!(
+        !auth_exit_zero.to_string().contains("401 Unauthorized"),
+        "{auth_exit_zero}"
+    );
 
     for cli in ["agy", "claude", "codex", "copilot", "grok", "kimi"] {
         fleet.assert_steps_remaining(cli, 0);
@@ -367,8 +377,9 @@ fn wait_false_calls_collected_through_await_carry_top_level_failure() {
         r_auth,
         Some(("abnormal_exit", "exit code 1")),
         "authentication",
-        "Not logged in",
+        AUTHENTICATION_FAILURE_MESSAGE,
     );
+    assert!(!r_auth.to_string().contains("Not logged in"), "{r_auth}");
     assert_reported_failure(r_quota, None, "quota", "hit your limit");
     assert_eq!(r_quota["failure"]["reset_at"], "5pm (UTC)", "{r_quota}");
 

@@ -112,11 +112,34 @@ in `error.data`, while other protocol-level errors carry no D2 summary.
 | 3 | Otherwise, `observed.failure` is present (`abnormal_exit` or any remaining kind) | `observed.failure` | `"observed"` |
 | 4 | Otherwise (`observed.state` is `"finished"`) | `null` | — |
 
-When the top-level `failure` comes from `reported` with kind `authentication`, its `message` is
-replaced by the fixed sentence `"The provider reported that it is not signed in."` instead of
-provider text. What this cannot do: `reported.failure` itself (and `reported.diagnostic` for
-providers other than Antigravity's sign-in handling) still carries provider text until redaction
-lands, and nothing stops a client that inspects `reported` directly from reading it there.
+Before any envelope is serialized (and before `reported.failure.message` is excerpted or archived
+to `observed.failure_file`), a shared redaction pass (`envelope::redact`) runs centrally over the
+result:
+
+- When `reported.failure.kind` is `authentication`, both `reported.failure.message` and top-level
+  `failure.message` (when `source` is `"reported"`) become the fixed sentence `"The provider
+  reported that it is not signed in."`, the raw stderr fallback into `reported.diagnostic` is
+  skipped, and `reported.diagnostic` becomes the unified provider-neutral sentence `"The provider
+  CLI is not signed in. Its sign-in output was omitted because it can contain one-time login URLs
+  or codes."` (replacing Antigravity's earlier provider-specific sign-in diagnostic).
+- For every other failure kind, a pure-Rust heuristic filter replaces matches in
+  `reported.failure.message`, `reported.failure.reset_at`, `reported.diagnostic` (including failed
+  version-probe diagnostics), and `observed.failure.message` with `"[redacted]"`:
+  - `http://` and `https://` URLs whose path or query contains `auth`, `login`, `oauth`, `device`,
+    `token`, `code`, `session`, or `verify` (case-insensitive), or that carry any query string;
+  - device-code shapes (`XXXX-XXXX` 4-4 uppercase alphanumeric groups and 6–9 character uppercase
+    alphanumeric codes) adjacent to the words `code` or `enter`;
+  - well-known secret prefixes (`sk-`, `sk-ant-`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `github_pat_`,
+    `xai-`, `AIza`) and `Bearer <token>`.
+- `observed.redacted` records whether any text was omitted or replaced (`true` or `false`), and
+  removed text is never emitted anywhere by Proxenos, including its own standard-error diagnostics.
+
+What this cannot do: diagnostic redaction is a heuristic filter, not a guarantee. Unknown token
+formats, login URLs without query strings or the listed path words, wrapped or encoded secrets,
+and sign-in prompts phrased outside these patterns pass through unchanged. `reported.content` (the
+provider's answer, and any `observed.content_file` archive of a long answer) is not filtered, and
+provider output files on disk (including logs or session files written by the provider CLI itself,
+as well as `observed.content_file`) are unchanged.
 
 A long answer is returned as an excerpt with the path of a file that holds what was captured, up
 to the capture limit. That file is kept apart from the child's temporary files, which D6 removes
@@ -349,10 +372,10 @@ error can establish an authentication failure when that field is absent, blank o
 and a line starts with the exact `agy` sign-in prompt above. When both the JSON error and the
 sign-in prompt are absent, Proxenos reads other failure kinds from standard error. It never
 classifies agent-authored `response` text. On a non-zero exit or incomplete turn, up to 2 KiB of
-standard error normally goes into `reported.diagnostic`. An authentication failure uses fixed
-`reported.failure.message` and `reported.diagnostic` text that omits the CLI's sign-in output.
-The diagnostic tells the caller to run `agy` to sign in. The observed byte counts still include
-the captured output.
+standard error normally goes into `reported.diagnostic` (omitted when the turn classifies as
+`authentication`). An authentication failure uses the unified fixed `reported.failure.message` and
+provider-neutral `reported.diagnostic` text from D2 that omits the CLI's sign-in output. The
+observed byte counts still include the captured output.
 
 Two offline failures were captured with Codex CLI 0.172.0 on Linux x86_64. With a missing
 credential for a local custom provider, `codex exec --json` emitted a thread ID and
@@ -1288,6 +1311,10 @@ scope of Iris claims.
   reports it.
 - A call with `wait: true` lasts as long as its delegation. A client that limits the time of one
   call may end it first and leave the caller without a handle (D17).
+- Diagnostic redaction (D2) is a heuristic filter over failure messages and diagnostics, not a
+  guarantee: unknown token formats and unrecognised sign-in prompts pass through, `reported.content`
+  (the answer, including `observed.content_file`) is not filtered, and files written on disk by
+  provider CLIs remain unchanged.
 
 ## 5. Not yet known
 

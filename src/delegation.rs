@@ -314,6 +314,11 @@ impl Registry {
             if (finished.code != Some(0) || !result.report.completed)
                 && !finished.stderr.bytes.is_empty()
                 && result.report.diagnostic.is_none()
+                && !result
+                    .report
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == FailureKind::Authentication)
             {
                 let diagnostic = &finished.stderr.bytes[..finished.stderr.bytes.len().min(2048)];
                 result.report.diagnostic = Some(String::from_utf8_lossy(diagnostic).into_owned());
