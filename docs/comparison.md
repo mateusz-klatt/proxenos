@@ -87,17 +87,20 @@ a WSL session that carried a light load, a code review, during the runs. Inputs,
 | harness and stub | built from main `16bd004`; `proxenos-stub` `ce10b551e197674753dc510a96673ca35a074d20cc4747e92fcc1cde90b3a58b` |
 
 **Summary.**
-- Proxenos returns `initialize` about 9× sooner, using one process for six providers where
-  the baseline runs one Node process per provider. Each process has a working set about 7×
-  smaller and private memory about 4.5× smaller.
+- In `compare_init`, one Proxenos server returns `initialize` about 9× sooner than one
+  claude-delegator Codex bridge (p50 11.1 ms against 101.2 ms).
+- One Proxenos process serves every provider. claude-delegator runs one Node process per
+  provider. In the measured processes, the Proxenos working set is about 7× smaller and
+  private memory about 4.5× smaller.
 - Process-tree cleanup left no survivors in every scenario tried.
 - The **first `tools/list` is slower**: 721 ms against 163 ms at p50. The client waits for that
   list before it can call a tool, so this is a regression to fix, tracked in #57.
 
 ### Initialize
 
-`compare_init` with 100 pairs at revision `2024-11-05`, as described above. Latency runs from
-spawn to the complete initialize response, in milliseconds.
+`compare_init` with 100 pairs at revision `2024-11-05`, as described above. Latency covers the
+interval defined above, from just before process spawn until the complete response line reaches
+the harness, in milliseconds.
 
 | target | ok / failed | min | p10 | p50 | p90 | max | p50 run first / second |
 |---|---|---|---|---|---|---|---|
@@ -117,8 +120,10 @@ alone.
 | shutdown by closing standard input | 3 | server exited after 9 ms, code 0 | 0 | 0 |
 | `TerminateProcess` of the server alone | 3 | killed after 3 ms | 0 | 0 |
 
-The D6 Job Object kills its whole tree when its last handle closes. That covers a hard kill of
-the server too.
+Under D6, every process already assigned to the Proxenos kill-on-close job dies when the job's
+last handle closes, which also happens when the server is killed outright. That is what the
+`TerminateProcess` row shows. D6 also names the limit: a process created but not yet assigned
+to the job can survive if Proxenos dies in that window.
 
 ### Footprint
 
@@ -131,11 +136,17 @@ then took 3 samples after 60 s idle. Same caveat as above: the verifier's own sc
 | claude-delegator Codex server | 2 | 1 (node) | 162 / 223 ms | 163 / 224 ms | 26.5 MiB | 59.4 MiB | 24.0 / 57.5 MiB |
 | claude-delegator Antigravity server | 2 | 1 (node) | 322 / 378 ms | 323 / 378 ms | 26.6 MiB | 59.4 MiB | 23.5 / 57.2 MiB |
 
-claude-delegator registers one server per provider, so seven providers mean seven Node
-processes, about 7 × 59 MiB of working set. One Proxenos process serves six providers.
+claude-delegator registers one server per provider, and its 3.5.1 configuration also
+registers a usage server. Seven Node servers at the measured 59.4 MiB working set each come to
+about 7 × 59 MiB. That figure is arithmetic on two measured samples, not a measured total.
+Working set also counts shared pages in every process. Private memory was 26.5–26.6 MiB per
+measured server. One Proxenos process lists 13 tools: five providers (the calling client's own
+provider is omitted), plus `await`, `cancel` and `usage`, with six CLIs installed.
 
-The first `tools/list` in Proxenos waits for D7 discovery of every installed CLI. On the same
-host, an earlier measurement on 2026-11-25, with four tools, gave about 223 ms. See #57.
+`initialize` does not wait for discovery. The first `tools/list` does: it waits for the
+parallel D7 search on `PATH` and the `--version` probe of each provider CLI other than the
+client's own, each with its own time limit. On the same host, an earlier measurement on
+2026-11-25, with four tools, gave about 223 ms. See #57.
 
 ### What these results do not measure
 
