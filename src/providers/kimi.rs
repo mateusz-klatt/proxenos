@@ -140,6 +140,7 @@ fn classify(stderr: &str) -> Option<Failure> {
                 let when = message[start..].trim().trim_end_matches('.');
                 (!when.is_empty()).then(|| when.to_owned())
             });
+        failure.reset_at_from_text = failure.reset_at.is_some();
     }
     Some(failure)
 }

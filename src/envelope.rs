@@ -4,7 +4,7 @@ mod content;
 mod redact;
 
 pub use content::{AnswerArchive, CAPTURE_LIMIT};
-pub(crate) use redact::{redact_excerpt, redact_text};
+pub(crate) use redact::{diagnostic_excerpt, probe_version_excerpt};
 
 use std::time::Instant;
 
@@ -110,6 +110,8 @@ pub struct Failure {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<String>,
+    #[serde(skip)]
+    pub reset_at_from_text: bool,
 }
 
 impl Failure {
@@ -118,6 +120,7 @@ impl Failure {
             kind,
             message: message.into(),
             reset_at: None,
+            reset_at_from_text: false,
         }
     }
 }
@@ -226,7 +229,7 @@ impl Envelope {
     }
 
     pub fn session_save_failure(&mut self, mut failure: Failure) -> String {
-        if redact::redact_failure(&mut failure) {
+        if redact::redact_session_save_failure(&mut failure) {
             self.redacted = true;
         }
         self.observed["session_save_failure"] = json!(&failure);
@@ -268,7 +271,7 @@ impl Envelope {
     pub fn finalize(mut self) -> (&'static str, Value) {
         self.redact_report();
         if let Some(failure) = &mut self.observed_failure
-            && redact::redact_failure(failure)
+            && redact::redact_observed_failure(failure)
         {
             self.redacted = true;
             self.observed["failure"] = json!(&*failure);

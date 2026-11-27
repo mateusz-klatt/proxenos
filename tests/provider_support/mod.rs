@@ -109,6 +109,11 @@ impl Drop for Fleet {
 
 pub const AUTHENTICATION_FAILURE_MESSAGE: &str = "The provider reported that it is not signed in.";
 pub const AUTHENTICATION_DIAGNOSTIC: &str = "The provider CLI is not signed in. Its sign-in output was omitted because it can contain one-time login URLs or codes.";
+pub const WITHHELD_FAILURE_MESSAGE: &str = "The provider's failure text was withheld because it may contain sign-in material; run the CLI directly to see it.";
+pub const WITHHELD_DIAGNOSTIC: &str = "The provider CLI's diagnostic output was withheld because it may contain sign-in material; run the CLI directly to see it.";
+pub const WITHHELD_OBSERVED_FAILURE_MESSAGE: &str = "Failure details were withheld because they matched a sign-in or secret pattern; check the configuration and environment directly.";
+pub const WITHHELD_SESSION_SAVE_MESSAGE: &str = "Session-save failure details were withheld because they may contain sign-in or secret material; inspect the state directory directly.";
+pub const WITHHELD_PROBE_VERSION: &str = "Provider version output was withheld because it may contain sign-in material; run the CLI directly to see it.";
 
 #[track_caller]
 pub fn assert_observed_failure(envelope: &Value, kind: &str, detail: &str) {

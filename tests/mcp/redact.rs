@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 
 use crate::common::{Server, WAIT, text};
 use crate::provider_support::{
-    AUTHENTICATION_DIAGNOSTIC, AUTHENTICATION_FAILURE_MESSAGE, Fleet, assert_observed_failure,
-    assert_reported_failure, call,
+    AUTHENTICATION_DIAGNOSTIC, AUTHENTICATION_FAILURE_MESSAGE, Fleet, WITHHELD_DIAGNOSTIC,
+    WITHHELD_FAILURE_MESSAGE, WITHHELD_OBSERVED_FAILURE_MESSAGE, WITHHELD_PROBE_VERSION,
+    WITHHELD_SESSION_SAVE_MESSAGE, assert_observed_failure, assert_reported_failure, call,
 };
 
 const AGY_AUTH: &str = include_str!("../fixtures/antigravity/captured-auth-failed.stdout.json");
@@ -278,127 +279,205 @@ fn authentication_omits_login_material_across_all_six_providers_and_background_a
 }
 
 #[test]
-fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preserving_context() {
-    let fleet = Fleet::new(&["agy", "codex", "kimi"]);
+fn all_detector_patterns_trigger_all_or_nothing_withholding_without_leaks() {
+    let fleet = Fleet::new(&["agy", "codex"]);
 
-    // Synthetic non-auth failures exercising every heuristic shape across JSON errors, stderr,
-    // reset_at, oversized archived failures, failed discovery probes, observed paths, and await.
-    let synthetic_codex_json_error = json!({
-        "type": "turn.failed",
-        "error": {
-            "message": concat!(
-                "Prefix context: visit https://auth.example.invalid/oauth/start?client_id=abc ",
-                "and http://127.0.0.1:8080/login and https://example.invalid/café?code=NA1 ",
-                "and https://exämple.invalid/login and https://example.invalid/üser/auth. ",
-                "Check (https://example.invalid/Device/Verify) or [https://example.invalid/session#step1] ",
-                "or https://example.invalid/token or https://example.invalid/code ",
-                "or https://example.invalid/foo_(bar)?x=1 or https://example.invalid/foo_[bar]?x=1 ",
-                "or https://example.invalid/v1/status?q=1. ",
-                "Copy one-time code: ABCD-1234, enter A1B2C3D4, use code 123456, ",
-                "device_code=WXYZ-9876; ZYXW-4321 (enter this code), ",
-                "copy code:\n  QWER9876Z.\n",
-                "Open the link above and enter your one-time verification code when prompted by the browser.\n  BNMK-4567\n",
-                "HJKL-8910\nPlease paste this verification code in your browser before it expires.\n",
-                "Documented trade-off: error code EACCES.\n",
-                "Tokens: sk-proj-secret1, sk-ant-api03-secret2, ghp_secret3, gho_secret4, ",
-                "ghu_secret5, ghs_secret6, ghr_secret9, github_pat_11AAA_bbb, xai-secret7, AIzaSyDemoKey8, ",
-                "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig., ",
-                "Bearer dGVzdA==, Bearer aBcDeF, Bearer MYSECRET, Bearer\ttok-123, ",
-                "Bearer abcdefghijklmnop. Suffix context."
-            )
-        }
-    })
-    .to_string();
+    let codex_error = |message: &str| {
+        json!({
+            "stdout": json!({
+                "type": "turn.failed",
+                "error": { "message": message }
+            })
+            .to_string(),
+            "stderr": "Stderr detail\n",
+            "code": 1
+        })
+    };
 
-    let synthetic_stderr = concat!(
-        "Stderr lead (café): open https://example.invalid/auth?code=999, ",
-        "enter code EFGH-5678, key sk-stderr-secret. Stderr tail.\n"
-    );
+    // Exercise each detector shape in its own message because first-hit detection short-circuits on
+    // the first matching token and withholds the entire Report.
+    let secret_cases: &[(&str, &str, &str)] = &[
+        (
+            "https auth",
+            "Prefix context: visit https://auth.example.invalid/oauth/start?client_id=abc.",
+            "auth.example.invalid",
+        ),
+        (
+            "http login",
+            "Visit http://127.0.0.1:8080/login to proceed.",
+            "127.0.0.1",
+        ),
+        (
+            "non-ascii query url",
+            "See https://example.invalid/café?code=NA1 now.",
+            "café?code=NA1",
+        ),
+        (
+            "non-ascii host url",
+            "See https://exämple.invalid/login now.",
+            "exämple.invalid",
+        ),
+        (
+            "non-ascii path auth url",
+            "See https://example.invalid/üser/auth now.",
+            "üser/auth",
+        ),
+        (
+            "paren url",
+            "Check (https://example.invalid/Device/Verify) today.",
+            "Device/Verify",
+        ),
+        (
+            "bracket session fragment url",
+            "Check [https://example.invalid/session#step1] today.",
+            "session#step1",
+        ),
+        (
+            "token path url",
+            "Open https://example.invalid/token now.",
+            "/token",
+        ),
+        (
+            "code path url",
+            "Open https://example.invalid/code now.",
+            "/code",
+        ),
+        (
+            "balanced parens query url",
+            "Open https://example.invalid/foo_(bar)?x=1 now.",
+            "foo_(bar)",
+        ),
+        (
+            "balanced brackets query url",
+            "Open https://example.invalid/foo_[bar]?x=1 now.",
+            "foo_[bar]",
+        ),
+        (
+            "query only url",
+            "Open https://example.invalid/v1/status?q=1.",
+            "status?q=1",
+        ),
+        ("sk-", "Token sk-proj-secret1 rejected.", "sk-proj-secret1"),
+        (
+            "sk-ant-",
+            "Token sk-ant-api03-secret2 rejected.",
+            "sk-ant-api03-secret2",
+        ),
+        ("ghp_", "Token ghp_secret3 rejected.", "ghp_secret3"),
+        ("gho_", "Token gho_secret4 rejected.", "gho_secret4"),
+        ("ghu_", "Token ghu_secret5 rejected.", "ghu_secret5"),
+        ("ghs_", "Token ghs_secret6 rejected.", "ghs_secret6"),
+        ("ghr_", "Token ghr_secret9 rejected.", "ghr_secret9"),
+        (
+            "github_pat_",
+            "Token github_pat_11AAA_bbb rejected.",
+            "github_pat_11AAA_bbb",
+        ),
+        ("xai-", "Token xai-secret7 rejected.", "xai-secret7"),
+        ("AIza", "Token AIzaSyDemoKey8 rejected.", "AIzaSyDemoKey8"),
+        (
+            "bearer jwt",
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig.",
+            "eyJhbGci",
+        ),
+        ("bearer pad", "Header Bearer dGVzdA== rejected.", "dGVzdA=="),
+        (
+            "bearer mixed case",
+            "Header Bearer aBcDeF rejected.",
+            "aBcDeF",
+        ),
+        (
+            "bearer upper",
+            "Header Bearer MYSECRET rejected.",
+            "MYSECRET",
+        ),
+        ("bearer tab", "Header Bearer\ttok-123 rejected.", "tok-123"),
+        (
+            "bearer long opaque",
+            "Header Bearer abcdefghijklmnop rejected.",
+            "abcdefghijklmnop",
+        ),
+        (
+            "device 4-4 code",
+            "Copy one-time code: ABCD-1234.",
+            "ABCD-1234",
+        ),
+        (
+            "device 8-char enter",
+            "Please enter A1B2C3D4 now.",
+            "A1B2C3D4",
+        ),
+        ("device 6-digit code", "Use code 123456 now.", "123456"),
+        (
+            "device next-line after cue",
+            "Copy code:\n  QWER9876Z.\n",
+            "QWER9876Z",
+        ),
+        (
+            "device same-paragraph after cue",
+            "Open link and enter your verification code.\n  BNMK-4567\n",
+            "BNMK-4567",
+        ),
+        (
+            "device same-line before cue",
+            "ZYXW-4321 (enter this code).\n",
+            "ZYXW-4321",
+        ),
+        (
+            "device same-paragraph before cue",
+            "HJKL-8910\nPlease paste this verification code.\n",
+            "HJKL-8910",
+        ),
+        (
+            "documented conservative code trigger",
+            "Documented trade-off: error code EACCES.\n",
+            "EACCES",
+        ),
+    ];
 
-    let synthetic_long_error = json!({
-        "status": "ERROR",
-        "response": "",
-        "error": format!(
-            "Long failure lead: sk-long-secret-123 and https://example.invalid/device?k=1. {} Archive secret: sk-archive-only-secret and https://archive.example.invalid/oauth?code=ARCH-1 and enter code: ARCH-9999. Tail.",
-            "p".repeat(17 << 10)
-        )
-    })
-    .to_string();
+    let mut codex_steps: Vec<Value> = secret_cases
+        .iter()
+        .map(|(_, msg, _)| codex_error(msg))
+        .collect();
+    // Add one extra copy of the first secret case for wait:false + await verification.
+    codex_steps.push(codex_error(secret_cases[0].1));
 
-    let synthetic_quota_with_secret_reset = "error: failed to run prompt: Quota exhausted. Try again at https://quota.example.invalid/status?token=leak123 or sk-quota-secret.\n";
-
-    fleet.script(
-        "codex",
-        json!([
-            {"stdout": synthetic_codex_json_error, "stderr": synthetic_stderr, "code": 1},
-            {"stdout": synthetic_codex_json_error, "stderr": synthetic_stderr, "code": 1}
-        ]),
-    );
+    fleet.script("codex", json!(codex_steps));
     fleet.script(
         "agy",
         json!([
-            {"stdout": synthetic_long_error, "code": 1},
             {"stderr": "Plain error with https://example.invalid/docs?q=nonauth and code: UVWX-9999.", "code": 2}
-        ]),
-    );
-    fleet.script(
-        "kimi",
-        json!([
-            {"stderr": synthetic_quota_with_secret_reset, "code": 1}
         ]),
     );
 
     let mut server = fleet.server("claude");
 
-    // 1. Foreground Codex non-auth failure with all URL/device-code/secret patterns in JSON & stderr.
-    let fg = call(&mut server, "codex", json!({"prompt": "non-auth fg"}));
-    assert_eq!(fg["observed"]["state"], "failed", "{fg}");
-    assert_eq!(fg["observed"]["redacted"], true, "{fg}");
-    assert_eq!(fg["failure"]["kind"], "unknown");
-    assert_eq!(fg["failure"]["source"], "reported");
-    let fg_msg = fg["reported"]["failure"]["message"].as_str().unwrap();
-    let fg_diag = fg["reported"]["diagnostic"].as_str().unwrap();
-    assert_eq!(fg["failure"]["message"], fg_msg);
-    assert!(
-        fg_msg.starts_with("Prefix context: visit [redacted] "),
-        "{fg_msg}"
-    );
-    assert!(fg_msg.ends_with(" Suffix context."), "{fg_msg}");
-    assert!(!fg_msg.contains("http"), "{fg_msg}");
-    assert!(fg_msg.contains("([redacted])"), "{fg_msg}");
-    assert!(fg_msg.contains("[[redacted]]"), "{fg_msg}");
-    assert!(
-        fg_msg.contains("code: [redacted], enter [redacted], use code [redacted]"),
-        "{fg_msg}"
-    );
-    assert!(
-        fg_msg.contains("device_code=[redacted]; [redacted] (enter this code)"),
-        "{fg_msg}"
-    );
-    assert!(
-        fg_msg.contains("when prompted by the browser.\n  [redacted]\n"),
-        "{fg_msg}"
-    );
-    assert!(
-        fg_msg.contains("\n[redacted]\nPlease paste this verification code"),
-        "{fg_msg}"
-    );
-    assert!(
-        fg_msg.contains("Documented trade-off: error code [redacted]."),
-        "{fg_msg}"
-    );
-    assert!(
-        fg_msg.contains(
-            "Authorization: [redacted]., [redacted], [redacted], [redacted], [redacted], [redacted]."
-        ),
-        "{fg_msg}"
-    );
-    assert_eq!(
-        fg_diag,
-        "Stderr lead (café): open [redacted], enter code [redacted], key [redacted]. Stderr tail.\n"
-    );
+    for &(label, _, forbidden) in secret_cases {
+        let res = call(&mut server, "codex", json!({"prompt": label}));
+        assert_eq!(res["observed"]["state"], "failed", "{label}: {res}");
+        assert_eq!(res["observed"]["redacted"], true, "{label}: {res}");
+        assert_eq!(res["failure"]["kind"], "unknown", "{label}: {res}");
+        assert_eq!(res["failure"]["source"], "reported", "{label}: {res}");
+        assert_eq!(
+            res["reported"]["failure"]["message"], WITHHELD_FAILURE_MESSAGE,
+            "{label}: {res}"
+        );
+        assert_eq!(
+            res["failure"]["message"], WITHHELD_FAILURE_MESSAGE,
+            "{label}: {res}"
+        );
+        assert_eq!(
+            res["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC,
+            "{label}: {res}"
+        );
+        let raw = res.to_string();
+        assert!(
+            !raw.contains(forbidden),
+            "{label} leaked {forbidden:?} in {raw}"
+        );
+    }
 
-    // 2. Background wait:false + await redacts non-auth failures identically across whole envelope.
+    // Background wait:false + await withholds identically across the whole envelope.
     let started = server.call(20, "codex", json!({"prompt": "non-auth bg", "wait": false}));
     let handle = serde_json::from_str::<Value>(text(&started)).unwrap()["handle"]
         .as_str()
@@ -408,118 +487,27 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
     let awaited_raw = text(&awaited);
     let bg_item = &serde_json::from_str::<Value>(awaited_raw).unwrap()["results"][0]["result"];
     assert_eq!(bg_item["observed"]["redacted"], true, "{bg_item}");
-    assert_eq!(bg_item["reported"]["failure"]["message"], fg_msg);
-    assert_eq!(bg_item["reported"]["diagnostic"], fg_diag);
-
-    let fg_raw = fg.to_string();
-    let leaked_tokens = [
-        "auth.example.invalid",
-        "127.0.0.1",
-        "café?code=NA1",
-        "exämple.invalid",
-        "üser/auth",
-        "ABCD-1234",
-        "A1B2C3D4",
-        "123456",
-        "WXYZ-9876",
-        "ZYXW-4321",
-        "QWER9876Z",
-        "BNMK-4567",
-        "HJKL-8910",
-        "EACCES",
-        "sk-proj-secret1",
-        "sk-ant-api03-secret2",
-        "ghp_secret3",
-        "gho_secret4",
-        "ghu_secret5",
-        "ghs_secret6",
-        "ghr_secret9",
-        "github_pat_11AAA_bbb",
-        "xai-secret7",
-        "AIzaSyDemoKey8",
-        "eyJhbGci",
-        "dGVzdA==",
-        "aBcDeF",
-        "MYSECRET",
-        "tok-123",
-        "abcdefghijklmnop",
-        "EFGH-5678",
-        "sk-stderr-secret",
-    ];
-    for leaked in leaked_tokens {
-        assert!(!fg_raw.contains(leaked), "leaked {leaked:?} in {fg_raw}");
-        assert!(
-            !awaited_raw.contains(leaked),
-            "leaked {leaked:?} in await envelope: {awaited_raw}"
-        );
-    }
-
-    // 3. Oversized (>16 KiB) non-auth failure redacts BEFORE archiving to failure_file, including
-    // archive-only secrets beyond the 16 KiB inline excerpt.
-    let long_err = call(
-        &mut server,
-        "antigravity",
-        json!({"prompt": "long non-auth"}),
+    assert_eq!(
+        bg_item["reported"]["failure"]["message"],
+        WITHHELD_FAILURE_MESSAGE
     );
-    assert_eq!(long_err["observed"]["redacted"], true, "{long_err}");
-    let long_raw = long_err.to_string();
-    for leaked in [
-        "sk-long-secret-123",
-        "example.invalid/device",
-        "sk-archive-only-secret",
-        "archive.example.invalid",
-        "ARCH-1",
-        "ARCH-9999",
-    ] {
-        assert!(
-            !long_raw.contains(leaked),
-            "leaked {leaked:?} in {long_raw}"
-        );
-    }
-    let failure_file = PathBuf::from(long_err["observed"]["failure_file"].as_str().unwrap());
-    let archived = fs::read_to_string(&failure_file).unwrap();
+    assert_eq!(bg_item["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
     assert!(
-        archived.starts_with("Long failure lead: [redacted] and [redacted]. "),
-        "{archived}"
+        !awaited_raw.contains("auth.example.invalid"),
+        "background await leaked URL: {awaited_raw}"
     );
-    assert!(
-        archived.ends_with(
-            " Archive secret: [redacted] and [redacted] and enter code: [redacted]. Tail."
-        ),
-        "{archived}"
-    );
-    for leaked in [
-        "sk-long-secret-123",
-        "example.invalid/device",
-        "sk-archive-only-secret",
-        "archive.example.invalid",
-        "ARCH-1",
-        "ARCH-9999",
-    ] {
-        assert!(
-            !archived.contains(leaked),
-            "leaked {leaked:?} in archive: {archived}"
-        );
-    }
 
-    // 4. Unclassified stderr-only non-zero exit redacts reported.diagnostic.
+    // Unclassified stderr-only non-zero exit withholds reported.diagnostic.
     let stderr_only = call(&mut server, "antigravity", json!({"prompt": "stderr only"}));
     assert_observed_failure(&stderr_only, "abnormal_exit", "exit code 2");
     assert_eq!(stderr_only["observed"]["redacted"], true, "{stderr_only}");
-    assert_eq!(
-        stderr_only["reported"]["diagnostic"],
-        "Plain error with [redacted] and code: [redacted]."
+    assert_eq!(stderr_only["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    assert!(
+        !stderr_only.to_string().contains("UVWX-9999"),
+        "{stderr_only}"
     );
 
-    // 5. Quota reset_at carrying a query URL or secret prefix is also redacted.
-    let quota = call(&mut server, "kimi", json!({"prompt": "quota reset"}));
-    assert_eq!(quota["observed"]["redacted"], true, "{quota}");
-    assert_eq!(quota["failure"]["kind"], "quota");
-    assert_eq!(quota["failure"]["reset_at"], "[redacted] or [redacted]");
-    assert!(!quota.to_string().contains("token=leak123"), "{quota}");
-    assert!(!quota.to_string().contains("sk-quota-secret"), "{quota}");
-
-    // 6. Observed failure message carrying a matching secret token (via path) is also redacted.
+    // Observed failure message: clean passes verbatim; detector hit replaces the whole field.
     let obs_err = call(
         &mut server,
         "antigravity-reply",
@@ -535,7 +523,6 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
     assert_observed_failure(&obs_err, "invalid_request", "Cannot inspect");
     assert_eq!(obs_err["observed"]["redacted"], false, "{obs_err}");
 
-    // Trigger observed.failure.message redaction with PROXENOS_AGY_CONVERSATIONS_DIR containing sk-...
     let mut cmd = fleet.command("claude");
     cmd.env(
         "PROXENOS_AGY_CONVERSATIONS_DIR",
@@ -548,7 +535,7 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
         "antigravity-reply",
         json!({
             "thread_id": AGY_ID,
-            "prompt": "bad store redacted",
+            "prompt": "bad store withheld",
             "cwd": fleet.root,
             "access": "full",
             "mode": "advisory",
@@ -557,19 +544,21 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
     );
     assert_eq!(obs_redacted["observed"]["redacted"], true, "{obs_redacted}");
     assert_eq!(obs_redacted["failure"]["kind"], "invalid_request");
-    assert!(
-        obs_redacted["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("[redacted]"),
-        "{obs_redacted}"
+    assert_eq!(
+        obs_redacted["failure"]["message"],
+        WITHHELD_OBSERVED_FAILURE_MESSAGE
+    );
+    assert_eq!(
+        obs_redacted["observed"]["failure"]["message"],
+        WITHHELD_OBSERVED_FAILURE_MESSAGE
     );
     assert!(
         !obs_redacted.to_string().contains("sk-obs-secret99"),
         "{obs_redacted}"
     );
+    assert!(obs_server.finish().0.success());
 
-    // 7. Failed discovery --version probe diagnostic is redacted centrally too.
+    // Failed discovery --version probe diagnostic is withheld with the fixed sentence.
     fs::write(
         fleet.root.join("codex.version"),
         json!({"stderr": "Probe failed: sk-probe-secret https://probe.invalid/login", "code": 3})
@@ -580,23 +569,522 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
     let probe_failed = call(&mut probe_server, "codex", json!({"prompt": "probe"}));
     assert_observed_failure(&probe_failed, "launch", "exit code 3");
     assert_eq!(probe_failed["observed"]["redacted"], true, "{probe_failed}");
-    assert_eq!(
-        probe_failed["reported"]["diagnostic"],
-        "Probe failed: [redacted] [redacted]"
+    assert_eq!(probe_failed["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    assert!(
+        !probe_failed.to_string().contains("sk-probe-secret")
+            && !probe_failed.to_string().contains("probe.invalid"),
+        "{probe_failed}"
     );
 
     assert!(server.finish().0.success());
     let server_stderr = server.stderr();
-    for leaked in leaked_tokens {
+    for &(_, _, forbidden) in secret_cases {
         assert!(
-            !server_stderr.contains(leaked),
-            "server stderr leaked {leaked:?}: {server_stderr}"
+            !server_stderr.contains(forbidden),
+            "server stderr leaked {forbidden:?}: {server_stderr}"
         );
     }
 
-    for cli in ["agy", "codex", "kimi"] {
+    for cli in ["agy", "codex"] {
         fleet.assert_steps_remaining(cli, 0);
     }
+}
+
+#[test]
+fn all_six_providers_withhold_on_hit_and_preserve_verbatim_on_no_hit() {
+    let fleet = Fleet::new(&["agy", "claude", "codex", "copilot", "grok", "kimi"]);
+
+    let agy_oversized_hit = json!({
+        "status": "ERROR",
+        "response": "",
+        "error": format!(
+            "Long lead: sk-agy-long and https://agy.example.invalid/device?k=1. {} Archive tail: sk-agy-arch.",
+            "p".repeat(17 << 10)
+        )
+    })
+    .to_string();
+    let agy_oversized_clean = format!("Clean quota error: {}", "q".repeat(17 << 10));
+    let agy_oversized_clean_json = json!({
+        "status": "ERROR",
+        "response": "",
+        "error": agy_oversized_clean
+    })
+    .to_string();
+
+    let claude_hit = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": true,
+        "num_turns": 1,
+        "session_id": "76655224-21a2-4670-925b-2681c62f95a3",
+        "result": "Limit hit · resets at 5pm (UTC).",
+        "api_error_type": "rate_limit_error"
+    })
+    .to_string();
+    let claude_clean = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": true,
+        "num_turns": 1,
+        "session_id": "76655224-21a2-4670-925b-2681c62f95a3",
+        "result": "You've hit your limit · resets 5pm (UTC).",
+        "api_error_type": "rate_limit_error"
+    })
+    .to_string();
+
+    let codex_structured_quota_hit = json!({
+        "type": "turn.failed",
+        "error": {
+            "message": json!({
+                "error": {
+                    "type": "insufficient_quota",
+                    "resets_at": "2030-01-01T00:00:00Z",
+                    "message": "Quota exceeded; visit https://codex.example.invalid/login?code=CDX-1."
+                }
+            })
+            .to_string()
+        }
+    })
+    .to_string();
+    let codex_structured_reset_code_hit = json!({
+        "type": "turn.failed",
+        "error": {
+            "message": json!({
+                "error": {
+                    "type": "insufficient_quota",
+                    "resets_at": "ABCD-1234",
+                    "message": "Quota exceeded."
+                }
+            })
+            .to_string()
+        }
+    })
+    .to_string();
+    let codex_clean = json!({
+        "type": "turn.failed",
+        "error": {
+            "message": json!({
+                "error": {
+                    "type": "insufficient_quota",
+                    "resets_at": "2030-01-01T00:00:00Z",
+                    "message": "Monthly budget reached."
+                }
+            })
+            .to_string()
+        }
+    })
+    .to_string();
+
+    fleet.script(
+        "agy",
+        json!([
+            {
+                "stdout": json!({
+                    "status": "ERROR",
+                    "response": "",
+                    "error": "Upstream failure at https://agy.example.invalid/oauth?code=AGY-H"
+                })
+                .to_string(),
+                "stderr": "Stderr token sk-agy-stderr\n",
+                "code": 1
+            },
+            {"stdout": agy_oversized_hit, "stderr": "Clean agy stderr\n", "code": 1},
+            {
+                "stdout": json!({
+                    "status": "ERROR",
+                    "response": "",
+                    "error": "Upstream maintenance window."
+                })
+                .to_string(),
+                "stderr": "Clean agy diagnostic\n",
+                "code": 1
+            },
+            {"stdout": agy_oversized_clean_json, "code": 1}
+        ]),
+    );
+    fleet.script(
+        "claude",
+        json!([
+            {
+                "stdout": claude_hit,
+                "stderr": "Auth hint https://claude.example.invalid/device\n",
+                "code": 1
+            },
+            {
+                "stdout": claude_clean,
+                "stderr": "Clean claude diagnostic\n",
+                "code": 1
+            }
+        ]),
+    );
+    fleet.script(
+        "codex",
+        json!([
+            {"stdout": codex_structured_quota_hit, "stderr": "Clean codex stderr\n", "code": 1},
+            {"stdout": codex_structured_reset_code_hit, "code": 1},
+            {"stdout": codex_clean, "stderr": "Clean codex diagnostic\n", "code": 1}
+        ]),
+    );
+    fleet.script(
+        "copilot",
+        json!([
+            {
+                "stdout": "{\"type\":\"result\",\"sessionId\":\"76655224-21a2-4670-925b-2681c62f95a3\",\"exitCode\":0}\n",
+                "stderr": "Login url https://github.com/login/device and enter code: COP-9999\n",
+                "code": 0
+            },
+            {"stderr": "Clean copilot diagnostic\n", "code": 2}
+        ]),
+    );
+    fleet.script(
+        "grok",
+        json!([
+            {
+                "stdout": json!({"type": "error", "message": "Grok failed: xai-grok-secret"}).to_string(),
+                "stderr": "Header Bearer grok-opaque-token\n",
+                "code": 1
+            },
+            {
+                "stdout": json!({"type": "error", "message": "Grok upstream unavailable."}).to_string(),
+                "stderr": "Clean grok diagnostic\n",
+                "code": 1
+            }
+        ]),
+    );
+    fleet.script(
+        "kimi",
+        json!([
+            {
+                "stderr": "Quota exhausted for sk-kimi-secret; try again at 2030-06-01T09:00:00Z.\n",
+                "code": 1
+            },
+            {
+                "stderr": "Quota exhausted; try again at 2030-06-01T09:00:00Z.\n",
+                "code": 1
+            }
+        ]),
+    );
+
+    let mut server = fleet.server("cursor");
+
+    // 1. Antigravity: detector hit + oversized hit never writes secrets to archive, clean preserves
+    // verbatim + clean oversized writes original text to archive.
+    let agy_hit = call(&mut server, "antigravity", json!({"prompt": "agy hit"}));
+    assert_reported_failure(
+        &agy_hit,
+        Some(("abnormal_exit", "exit code 1")),
+        "unknown",
+        WITHHELD_FAILURE_MESSAGE,
+    );
+    assert_eq!(agy_hit["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    assert_eq!(agy_hit["observed"]["redacted"], true, "{agy_hit}");
+    assert!(agy_hit["observed"]["failure_file"].is_null());
+    assert!(
+        !agy_hit.to_string().contains("AGY-H") && !agy_hit.to_string().contains("sk-agy-stderr")
+    );
+
+    let agy_long_hit = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "agy long hit"}),
+    );
+    assert_reported_failure(
+        &agy_long_hit,
+        Some(("abnormal_exit", "exit code 1")),
+        "unknown",
+        WITHHELD_FAILURE_MESSAGE,
+    );
+    // Decision is report-wide: clean stderr diagnostic becomes withheld too.
+    assert_eq!(agy_long_hit["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    assert_eq!(agy_long_hit["observed"]["redacted"], true);
+    assert!(agy_long_hit["observed"]["failure_file"].is_null());
+    assert!(
+        !agy_long_hit.to_string().contains("sk-agy-long")
+            && !agy_long_hit.to_string().contains("sk-agy-arch")
+    );
+
+    let agy_ok = call(&mut server, "antigravity", json!({"prompt": "agy clean"}));
+    assert_reported_failure(
+        &agy_ok,
+        Some(("abnormal_exit", "exit code 1")),
+        "unknown",
+        "Upstream maintenance window.",
+    );
+    assert_eq!(agy_ok["reported"]["diagnostic"], "Clean agy diagnostic\n");
+    assert_eq!(agy_ok["observed"]["redacted"], false);
+
+    let agy_long_ok = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "agy long clean"}),
+    );
+    assert_eq!(agy_long_ok["observed"]["redacted"], false, "{agy_long_ok}");
+    let clean_archive =
+        fs::read_to_string(agy_long_ok["observed"]["failure_file"].as_str().unwrap()).unwrap();
+    assert_eq!(clean_archive, agy_oversized_clean);
+
+    // 2. Claude: hit only in stderr still taints the whole quota Report (including text reset_at),
+    // while clean stays verbatim with text-derived reset_at.
+    let claude_hit_res = call(&mut server, "claude", json!({"prompt": "claude hit"}));
+    assert_reported_failure(
+        &claude_hit_res,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        WITHHELD_FAILURE_MESSAGE,
+    );
+    assert_eq!(
+        claude_hit_res["reported"]["diagnostic"],
+        WITHHELD_DIAGNOSTIC
+    );
+    assert!(claude_hit_res["reported"]["failure"]["reset_at"].is_null());
+    assert!(claude_hit_res["failure"]["reset_at"].is_null());
+    assert_eq!(claude_hit_res["observed"]["redacted"], true);
+    assert!(
+        !claude_hit_res
+            .to_string()
+            .contains("claude.example.invalid")
+    );
+
+    let claude_ok_res = call(&mut server, "claude", json!({"prompt": "claude clean"}));
+    assert_reported_failure(
+        &claude_ok_res,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        "You've hit your limit · resets 5pm (UTC).",
+    );
+    assert_eq!(
+        claude_ok_res["reported"]["failure"]["reset_at"],
+        "5pm (UTC)"
+    );
+    assert_eq!(
+        claude_ok_res["reported"]["diagnostic"],
+        "Clean claude diagnostic\n"
+    );
+    assert_eq!(claude_ok_res["observed"]["redacted"], false);
+
+    // 3. Codex: structured JSON resets_at stays on a tainted report when clean, is removed when it
+    // carries a code itself, and clean reports pass verbatim.
+    let codex_hit_res = call(&mut server, "codex", json!({"prompt": "codex hit"}));
+    assert_reported_failure(
+        &codex_hit_res,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        WITHHELD_FAILURE_MESSAGE,
+    );
+    assert_eq!(
+        codex_hit_res["reported"]["failure"]["reset_at"],
+        "2030-01-01T00:00:00Z"
+    );
+    assert_eq!(codex_hit_res["failure"]["reset_at"], "2030-01-01T00:00:00Z");
+    assert_eq!(codex_hit_res["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    assert_eq!(codex_hit_res["observed"]["redacted"], true);
+    assert!(!codex_hit_res.to_string().contains("codex.example.invalid"));
+
+    let codex_reset_code = call(&mut server, "codex", json!({"prompt": "codex reset code"}));
+    assert_reported_failure(
+        &codex_reset_code,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        WITHHELD_FAILURE_MESSAGE,
+    );
+    assert!(codex_reset_code["reported"]["failure"]["reset_at"].is_null());
+    assert!(codex_reset_code["failure"]["reset_at"].is_null());
+    assert_eq!(codex_reset_code["observed"]["redacted"], true);
+    assert!(!codex_reset_code.to_string().contains("ABCD-1234"));
+
+    let codex_ok_res = call(&mut server, "codex", json!({"prompt": "codex clean"}));
+    assert_reported_failure(
+        &codex_ok_res,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        "Monthly budget reached.",
+    );
+    assert_eq!(
+        codex_ok_res["reported"]["failure"]["reset_at"],
+        "2030-01-01T00:00:00Z"
+    );
+    assert_eq!(
+        codex_ok_res["reported"]["diagnostic"],
+        "Clean codex diagnostic\n"
+    );
+    assert_eq!(codex_ok_res["observed"]["redacted"], false);
+
+    // 4. Copilot: stderr hit taints both reported.failure and reported.diagnostic; clean stays verbatim.
+    let copilot_hit_res = call(&mut server, "copilot", json!({"prompt": "copilot hit"}));
+    assert_reported_failure(&copilot_hit_res, None, "unknown", WITHHELD_FAILURE_MESSAGE);
+    assert_eq!(
+        copilot_hit_res["reported"]["diagnostic"],
+        WITHHELD_DIAGNOSTIC
+    );
+    assert_eq!(copilot_hit_res["observed"]["redacted"], true);
+    assert!(
+        !copilot_hit_res.to_string().contains("COP-9999")
+            && !copilot_hit_res
+                .to_string()
+                .contains("github.com/login/device")
+    );
+
+    let copilot_ok_res = call(&mut server, "copilot", json!({"prompt": "copilot clean"}));
+    assert_observed_failure(&copilot_ok_res, "abnormal_exit", "exit code 2");
+    assert_eq!(
+        copilot_ok_res["reported"]["diagnostic"],
+        "Clean copilot diagnostic\n"
+    );
+    assert_eq!(copilot_ok_res["observed"]["redacted"], false);
+
+    // 5. Grok: hit withholds message and diagnostic; clean passes verbatim.
+    let grok_hit_res = call(&mut server, "grok", json!({"prompt": "grok hit"}));
+    assert_reported_failure(
+        &grok_hit_res,
+        Some(("abnormal_exit", "exit code 1")),
+        "unknown",
+        WITHHELD_FAILURE_MESSAGE,
+    );
+    assert_eq!(grok_hit_res["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    assert_eq!(grok_hit_res["observed"]["redacted"], true);
+    assert!(
+        !grok_hit_res.to_string().contains("xai-grok-secret")
+            && !grok_hit_res.to_string().contains("grok-opaque-token")
+    );
+
+    let grok_ok_res = call(&mut server, "grok", json!({"prompt": "grok clean"}));
+    assert_reported_failure(
+        &grok_ok_res,
+        Some(("abnormal_exit", "exit code 1")),
+        "unknown",
+        "Grok upstream unavailable.",
+    );
+    assert_eq!(
+        grok_ok_res["reported"]["diagnostic"],
+        "Clean grok diagnostic\n"
+    );
+    assert_eq!(grok_ok_res["observed"]["redacted"], false);
+
+    // 6. Kimi: hit withholds failure & diagnostic and removes text-derived reset_at; clean passes verbatim.
+    let kimi_hit_res = call(&mut server, "kimi", json!({"prompt": "kimi hit"}));
+    assert_reported_failure(
+        &kimi_hit_res,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        WITHHELD_FAILURE_MESSAGE,
+    );
+    assert_eq!(kimi_hit_res["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    assert!(kimi_hit_res["reported"]["failure"]["reset_at"].is_null());
+    assert!(kimi_hit_res["failure"]["reset_at"].is_null());
+    assert_eq!(kimi_hit_res["observed"]["redacted"], true);
+    let kimi_hit_raw = kimi_hit_res.to_string();
+    assert!(
+        !kimi_hit_raw.contains("sk-kimi-secret") && !kimi_hit_raw.contains("2030-06-01T09:00:00Z"),
+        "{kimi_hit_raw}"
+    );
+
+    let kimi_ok_res = call(&mut server, "kimi", json!({"prompt": "kimi clean"}));
+    assert_reported_failure(
+        &kimi_ok_res,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        "Quota exhausted; try again at 2030-06-01T09:00:00Z.",
+    );
+    assert_eq!(
+        kimi_ok_res["reported"]["failure"]["reset_at"],
+        "2030-06-01T09:00:00Z"
+    );
+    assert_eq!(kimi_ok_res["observed"]["redacted"], false);
+
+    for cli in ["agy", "claude", "codex", "copilot", "grok", "kimi"] {
+        fleet.assert_steps_remaining(cli, 0);
+    }
+}
+
+#[test]
+fn claude_truncated_stderr_and_quota_reset_at_with_code_withhold_text_and_archive() {
+    let fleet = Fleet::new(&["claude"]);
+
+    // Codex (a): empty stdout + >4 MiB truncated stderr parsed into a quota failure, with the
+    // device code near the 4 MiB boundary and its "Enter" cue pushed beyond the capture limit.
+    let truncated_quota_stderr_with_code = format!(
+        "Rate limit reached; resets at 2030-04-02T15:00:00Z. {} ABCD-1234\nEnter this verification code",
+        "p".repeat((4 << 20) - 64),
+    );
+    assert!(truncated_quota_stderr_with_code.len() > (4 << 20));
+
+    // Clean truncated stderr on a failed turn is also withheld conservatively.
+    let truncated_clean_quota_stderr =
+        format!("Usage limit reached; {}", "q".repeat((4 << 20) + 128),);
+
+    // Codex (b): quota reset_at sliced from the suffix loses the earlier cue.
+    let reset_same_paragraph_json = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": true,
+        "num_turns": 1,
+        "session_id": "76655224-21a2-4670-925b-2681c62f95a3",
+        "result": "You've hit your limit. Enter your verification code · resets at ABCD-1234.",
+        "api_error_type": "rate_limit_error"
+    })
+    .to_string();
+    let reset_split_paragraph_json = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": true,
+        "num_turns": 1,
+        "session_id": "76655224-21a2-4670-925b-2681c62f95a3",
+        "result": "You've hit your limit.\n\nPlease enter code in browser.\n\nQuota resets at WXYZ-5678.",
+        "api_error_type": "rate_limit_error"
+    })
+    .to_string();
+
+    fleet.script(
+        "claude",
+        json!([
+            {"stderr": truncated_quota_stderr_with_code, "code": 1},
+            {"stderr": truncated_clean_quota_stderr, "code": 1},
+            {"stdout": reset_same_paragraph_json, "code": 1},
+            {"stdout": reset_split_paragraph_json, "code": 1}
+        ]),
+    );
+    let mut server = fleet.server("codex");
+
+    for (label, forbidden) in [
+        (
+            "truncated stderr quota with boundary code",
+            Some("ABCD-1234"),
+        ),
+        ("truncated clean stderr quota", None),
+        ("reset_at same paragraph with code", Some("ABCD-1234")),
+        ("reset_at split paragraph with code", Some("WXYZ-5678")),
+    ] {
+        let res = call(&mut server, "claude", json!({"prompt": label}));
+        assert_reported_failure(
+            &res,
+            Some(("abnormal_exit", "exit code 1")),
+            "quota",
+            WITHHELD_FAILURE_MESSAGE,
+        );
+        assert_eq!(res["observed"]["redacted"], true, "{label}: {res}");
+        assert!(
+            res["reported"]["failure"]["reset_at"].is_null(),
+            "{label}: {res}"
+        );
+        assert!(res["failure"]["reset_at"].is_null(), "{label}: {res}");
+        assert!(
+            res["observed"]["failure_file"].is_null(),
+            "{label} must not write an archive file for withheld failure: {res}"
+        );
+        if res["reported"]["diagnostic"].is_string() {
+            assert_eq!(
+                res["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC,
+                "{label}: {res}"
+            );
+        }
+        let raw = res.to_string();
+        assert!(!raw.contains("2030-04-02T15:00:00Z"), "{label}: {raw}");
+        if let Some(code) = forbidden {
+            assert!(!raw.contains(code), "{label} leaked {code}: {raw}");
+        }
+    }
+
+    fleet.assert_steps_remaining("claude", 0);
 }
 
 #[test]
@@ -610,7 +1098,7 @@ fn clean_diagnostics_and_non_auth_urls_are_not_over_redacted() {
             "Words: task-1234 disk-5678 bare sk- xai- AIza.\n",
             "Bearer prose: Invalid Bearer token; Bearer Token; Bearer abcdefghijklmno; bearer-only; the bearer of news; Bearer realm=\"example\".\n",
             "Non-codes: Exit code 1.\n\n",
-            "ID ABCDEFGH.\n\n",
+            "Upstream header.\nID ABCDEFGH.\n\n",
             "encode ABCD-1234.\n\n",
             "code: read-only; code: FOO-ABCD-1234; code: TOO1234567; status 2026-11-27.\n\n",
             "encode {far} NOTACODE {far} codex\n"
@@ -639,8 +1127,8 @@ fn clean_diagnostics_and_non_auth_urls_are_not_over_redacted() {
     assert_eq!(result["observed"]["redacted"], false, "{result}");
     assert_eq!(result["reported"]["diagnostic"], clean_stderr, "{result}");
     assert!(
-        !result.to_string().contains("[redacted]"),
-        "unexpected redaction in clean diagnostic: {result}"
+        !result.to_string().contains("withheld"),
+        "unexpected withholding in clean diagnostic: {result}"
     );
     fleet.assert_steps_remaining("agy", 0);
 }
@@ -764,12 +1252,12 @@ fn adversarial_four_mib_diagnostics_complete_in_linear_time() {
         );
         assert_eq!(result["observed"]["redacted"], expect_redacted, "{label}");
         if expect_redacted {
-            let msg = result["reported"]["failure"]["message"].as_str().unwrap();
-            assert!(msg.starts_with("[redacted])]"), "{msg}");
-            let archive = PathBuf::from(result["observed"]["failure_file"].as_str().unwrap());
-            let archived = fs::read_to_string(&archive).unwrap();
-            assert!(archived.starts_with("[redacted])]"));
-            assert!(!archived.contains("login?"));
+            assert_eq!(
+                result["reported"]["failure"]["message"], WITHHELD_FAILURE_MESSAGE,
+                "{result}"
+            );
+            assert!(result["observed"]["failure_file"].is_null(), "{result}");
+            assert!(!result.to_string().contains("login?"), "{result}");
         }
     }
 
@@ -777,18 +1265,27 @@ fn adversarial_four_mib_diagnostics_complete_in_linear_time() {
 }
 
 #[test]
-fn truncation_redacts_larger_captured_stderr_and_probe_text_first() {
+fn truncation_withholds_when_matched_before_2k_or_cut_at_capture_limit() {
     let fleet = Fleet::new(&["agy", "codex"]);
 
     let stderr_cut_ascii = format!("{} ABCD-1234\nEnter this code", "x".repeat(2037));
     let stderr_cut_multibyte = format!("{}é ABCD-1234\nEnter this code", "x".repeat(2035));
     let stderr_secret_past_limit = format!("{}ésk-past-2k-secret", "x".repeat(2047));
+    // Capture-truncated (>4 MiB) stderr even with the cue cut past 4 MiB triggers conservative
+    // withholding on failed turns and failed probes.
+    let capture_cut_stderr = format!(
+        "Failed with {} ABCD-1234\n{}Enter this code",
+        "p".repeat((4 << 20) - 64),
+        "q".repeat(128),
+    );
+    assert!(capture_cut_stderr.len() > (4 << 20));
     fleet.script(
         "agy",
         json!([
             {"stderr": stderr_cut_ascii, "code": 2},
             {"stderr": stderr_cut_multibyte, "code": 2},
-            {"stderr": stderr_secret_past_limit, "code": 2}
+            {"stderr": stderr_secret_past_limit, "code": 2},
+            {"stderr": capture_cut_stderr, "code": 2}
         ]),
     );
 
@@ -808,9 +1305,10 @@ fn truncation_redacts_larger_captured_stderr_and_probe_text_first() {
         let result = call(&mut server, "antigravity", json!({"prompt": label}));
         assert_observed_failure(&result, "abnormal_exit", "exit code 2");
         assert_eq!(result["observed"]["redacted"], true, "{label}: {result}");
-        let diag = result["reported"]["diagnostic"].as_str().unwrap();
-        assert!(diag.len() <= 2048, "{label}: len {}", diag.len());
-        assert!(diag.contains("[redacted]"), "{label}: {diag}");
+        assert_eq!(
+            result["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC,
+            "{label}: {result}"
+        );
         assert!(
             !result.to_string().contains(forbidden),
             "{label} leaked {forbidden}: {result}"
@@ -823,22 +1321,49 @@ fn truncation_redacts_larger_captured_stderr_and_probe_text_first() {
     assert_eq!(past_diag.len(), 2047);
     assert!(!past.to_string().contains("sk-past-2k-secret"), "{past}");
 
+    let capture_cut = call(&mut server, "antigravity", json!({"prompt": "capture cut"}));
+    assert_observed_failure(&capture_cut, "abnormal_exit", "exit code 2");
+    assert_eq!(capture_cut["observed"]["redacted"], true, "{capture_cut}");
+    assert_eq!(capture_cut["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    assert!(
+        !capture_cut.to_string().contains("ABCD-1234"),
+        "{capture_cut}"
+    );
+
     let probe_failed = call(&mut server, "codex", json!({"prompt": "probe cut"}));
     assert_observed_failure(&probe_failed, "launch", "exit code 3");
     assert_eq!(probe_failed["observed"]["redacted"], true, "{probe_failed}");
-    let probe_diag = probe_failed["reported"]["diagnostic"].as_str().unwrap();
-    assert!(probe_diag.len() <= 2048, "len {}", probe_diag.len());
-    assert!(probe_diag.contains("[redacted]"), "{probe_diag}");
+    assert_eq!(probe_failed["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
     assert!(
         !probe_failed.to_string().contains("WXYZ-5678"),
         "{probe_failed}"
     );
 
+    // Capture-truncated probe stderr is also withheld on ProbeFailed.
+    fs::write(
+        fleet.root.join("codex.version"),
+        json!({"stderr": capture_cut_stderr, "code": 3}).to_string(),
+    )
+    .unwrap();
+    let mut probe_cut_server = fleet.server("claude");
+    let probe_capture_cut = call(
+        &mut probe_cut_server,
+        "codex",
+        json!({"prompt": "probe capture cut"}),
+    );
+    assert_observed_failure(&probe_capture_cut, "launch", "exit code 3");
+    assert_eq!(probe_capture_cut["observed"]["redacted"], true);
+    assert_eq!(
+        probe_capture_cut["reported"]["diagnostic"],
+        WITHHELD_DIAGNOSTIC
+    );
+    assert!(!probe_capture_cut.to_string().contains("ABCD-1234"));
+
     fleet.assert_steps_remaining("agy", 0);
 }
 
 #[test]
-fn session_save_serde_errors_redact_in_envelope_and_server_stderr() {
+fn session_save_serde_errors_withhold_in_envelope_and_server_stderr() {
     let fleet = Fleet::new(&["agy"]);
     let agy_finished = json!({
         "status": "SUCCESS",
@@ -900,10 +1425,10 @@ fn session_save_serde_errors_redact_in_envelope_and_server_stderr() {
         );
         assert_eq!(saved["observed"]["state"], "finished", "{saved}");
         assert_eq!(saved["observed"]["redacted"], true, "{saved}");
-        let save_msg = saved["observed"]["session_save_failure"]["message"]
-            .as_str()
-            .unwrap();
-        assert!(save_msg.contains("[redacted]"), "{save_msg}");
+        assert_eq!(
+            saved["observed"]["session_save_failure"]["message"],
+            WITHHELD_SESSION_SAVE_MESSAGE
+        );
         assert!(
             !saved.to_string().contains(forbidden),
             "envelope leaked {forbidden}: {saved}"
@@ -920,8 +1445,9 @@ fn session_save_serde_errors_redact_in_envelope_and_server_stderr() {
         );
     }
     assert!(
-        server_stderr.contains("could not save session settings:")
-            && server_stderr.contains("[redacted]"),
+        server_stderr.contains(&format!(
+            "could not save session settings: {WITHHELD_SESSION_SAVE_MESSAGE}"
+        )),
         "{server_stderr}"
     );
     fleet.assert_steps_remaining("agy", 0);
@@ -1005,8 +1531,8 @@ fn antigravity_error_record_drops_response_content_and_urls() {
 }
 
 #[test]
-fn doctor_filters_sign_in_prompts_from_zero_exit_probes() {
-    let fleet = Fleet::new(&["codex", "agy"]);
+fn doctor_withholds_sign_in_prompts_from_zero_exit_probes() {
+    let fleet = Fleet::new(&["codex", "agy", "kimi"]);
     fs::write(
         fleet.root.join("codex.version"),
         json!({
@@ -1020,6 +1546,15 @@ fn doctor_filters_sign_in_prompts_from_zero_exit_probes() {
         fleet.root.join("agy.version"),
         json!({
             "stderr": "DOCX-9999\nEnter this code with sk-doctor-secret\n",
+            "code": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        fleet.root.join("kimi.version"),
+        json!({
+            "stdout": format!("2.8.0\n{}", "k".repeat((4 << 20) + 64)),
             "code": 0
         })
         .to_string(),
@@ -1046,70 +1581,15 @@ fn doctor_filters_sign_in_prompts_from_zero_exit_probes() {
             "DOCX-1234",
             "DOCX-9999",
             "sk-doctor-secret",
+            "2.8.0",
         ] {
             assert!(
                 !stdout.contains(forbidden) && !stderr.contains(forbidden),
                 "doctor ({args:?}) leaked {forbidden:?}:\nstdout: {stdout}\nstderr: {stderr}"
             );
         }
-        assert!(stdout.contains("[redacted]"), "{stdout}");
+        assert!(stdout.contains(WITHHELD_PROBE_VERSION), "{stdout}");
     }
-}
-
-#[test]
-fn capture_truncation_redacts_device_code_pulled_into_excerpt_without_cue() {
-    let fleet = Fleet::new(&["agy", "codex"]);
-
-    // A >4 MiB URL shrinks to `[redacted]`, pulling `ABCD-1234` from near the 4 MiB capture
-    // limit into the 2 KiB excerpt while its `Enter this code` cue is dropped beyond 4 MiB.
-    let capture_cut_stderr = format!(
-        "https://auth.example.invalid/login?{} ABCD-1234\n{}Enter this code",
-        "a".repeat((4 << 20) - 64),
-        "p".repeat(128),
-    );
-    assert!(capture_cut_stderr.len() > (4 << 20));
-
-    let probe_capture_cut = format!(
-        "https://probe.example.invalid/login?{} WXYZ-9876\n{}Enter this code",
-        "a".repeat((4 << 20) - 65),
-        "p".repeat(128),
-    );
-    assert!(probe_capture_cut.len() > (4 << 20));
-
-    fleet.script("agy", json!([{"stderr": capture_cut_stderr, "code": 2}]));
-    fs::write(
-        fleet.root.join("codex.version"),
-        json!({"stderr": probe_capture_cut, "code": 3}).to_string(),
-    )
-    .unwrap();
-
-    let mut server = fleet.server("claude");
-
-    let stderr_res = call(&mut server, "antigravity", json!({"prompt": "capture cut"}));
-    assert_observed_failure(&stderr_res, "abnormal_exit", "exit code 2");
-    assert_eq!(stderr_res["observed"]["redacted"], true, "{stderr_res}");
-    assert_eq!(
-        stderr_res["reported"]["diagnostic"],
-        format!("[redacted] [redacted]\n{}", "p".repeat(18)),
-        "{stderr_res}"
-    );
-    let stderr_raw = stderr_res.to_string();
-    assert!(!stderr_raw.contains("ABCD-1234"), "{stderr_raw}");
-    assert!(!stderr_raw.contains("login?"), "{stderr_raw}");
-
-    let probe_res = call(&mut server, "codex", json!({"prompt": "probe capture cut"}));
-    assert_observed_failure(&probe_res, "launch", "exit code 3");
-    assert_eq!(probe_res["observed"]["redacted"], true, "{probe_res}");
-    assert_eq!(
-        probe_res["reported"]["diagnostic"],
-        format!("[redacted] [redacted]\n{}", "p".repeat(18)),
-        "{probe_res}"
-    );
-    let probe_raw = probe_res.to_string();
-    assert!(!probe_raw.contains("WXYZ-9876"), "{probe_raw}");
-    assert!(!probe_raw.contains("login?"), "{probe_raw}");
-
-    fleet.assert_steps_remaining("agy", 0);
 }
 
 #[test]
@@ -1118,7 +1598,7 @@ fn already_scanned_truncated_diagnostic_does_not_rescan_cut_identifier() {
 
     // Build ID `LONGBUILDID12345` (16 chars) sits across byte 2048 with `code:` nearby.
     // The 2048-byte excerpt cuts it to 8 uppercase chars (`LONGBUIL`), which must not be
-    // rescanned and falsely redacted during envelope finalization.
+    // rescanned and falsely flagged during envelope finalization.
     let stderr_cut_id = format!(
         "{} code: {} LONGBUILDID12345 tail",
         "x".repeat(1994),
@@ -1147,10 +1627,7 @@ fn already_scanned_truncated_diagnostic_does_not_rescan_cut_identifier() {
     let diag = stderr_res["reported"]["diagnostic"].as_str().unwrap();
     assert_eq!(diag.len(), 2048);
     assert!(diag.ends_with(" LONGBUIL"), "{diag}");
-    assert!(
-        !stderr_res.to_string().contains("[redacted]"),
-        "{stderr_res}"
-    );
+    assert!(!stderr_res.to_string().contains("withheld"), "{stderr_res}");
 
     let probe_res = call(&mut server, "codex", json!({"prompt": "probe cut id"}));
     assert_observed_failure(&probe_res, "launch", "exit code 3");
@@ -1158,42 +1635,55 @@ fn already_scanned_truncated_diagnostic_does_not_rescan_cut_identifier() {
     let probe_diag = probe_res["reported"]["diagnostic"].as_str().unwrap();
     assert_eq!(probe_diag.len(), 2048);
     assert!(probe_diag.ends_with(" LONGPROB"), "{probe_diag}");
-    assert!(!probe_res.to_string().contains("[redacted]"), "{probe_res}");
+    assert!(!probe_res.to_string().contains("withheld"), "{probe_res}");
 
     fleet.assert_steps_remaining("agy", 0);
 }
 
 #[test]
-fn unicode_whitespace_terminates_urls_and_preserves_localized_instructions() {
+fn unicode_whitespace_terminates_urls_and_withholds_only_auth_urls() {
     let fleet = Fleet::new(&["agy"]);
-    let localized_stderr = concat!(
-        "認証が必要です: https://auth.example.invalid/café/login?next=1\u{3000}",
-        "再試行する前にブラウザでログインしてください。\n",
-        "通常案内: https://example.invalid/ヘルプ\u{00a0}https://login.example.invalid/oauth\u{2003}続行します。\n"
+    let clean_localized_stderr = concat!(
+        "通常案内: https://example.invalid/ヘルプ\u{3000}auth や login と code の説明です。\n",
+        "詳細: https://example.invalid/café\u{00a0}device\u{2003}続行します。\n"
     );
-    fleet.script("agy", json!([{"stderr": localized_stderr, "code": 2}]));
+    let auth_localized_stderr = concat!(
+        "認証が必要です: https://auth.example.invalid/café/login?next=1\u{3000}",
+        "再試行する前にブラウザでログインしてください。\n"
+    );
+    fleet.script(
+        "agy",
+        json!([
+            {"stderr": clean_localized_stderr, "code": 2},
+            {"stderr": auth_localized_stderr, "code": 2}
+        ]),
+    );
 
     let mut server = fleet.server("claude");
-    let res = call(&mut server, "antigravity", json!({"prompt": "localized"}));
-    assert_observed_failure(&res, "abnormal_exit", "exit code 2");
-    assert_eq!(res["observed"]["redacted"], true, "{res}");
+
+    let clean_res = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "localized clean"}),
+    );
+    assert_observed_failure(&clean_res, "abnormal_exit", "exit code 2");
+    assert_eq!(clean_res["observed"]["redacted"], false, "{clean_res}");
     assert_eq!(
-        res["reported"]["diagnostic"],
-        concat!(
-            "認証が必要です: [redacted]\u{3000}",
-            "再試行する前にブラウザでログインしてください。\n",
-            "通常案内: https://example.invalid/ヘルプ\u{00a0}[redacted]\u{2003}続行します。\n"
-        )
+        clean_res["reported"]["diagnostic"], clean_localized_stderr,
+        "{clean_res}"
     );
-    let raw = res.to_string();
+
+    let auth_res = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "localized auth"}),
+    );
+    assert_observed_failure(&auth_res, "abnormal_exit", "exit code 2");
+    assert_eq!(auth_res["observed"]["redacted"], true, "{auth_res}");
+    assert_eq!(auth_res["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    let raw = auth_res.to_string();
     assert!(!raw.contains("auth.example.invalid"), "{raw}");
-    assert!(!raw.contains("login.example.invalid"), "{raw}");
     assert!(!raw.contains("café"), "{raw}");
-    assert!(
-        raw.contains("再試行する前にブラウザでログインしてください。"),
-        "{raw}"
-    );
-    assert!(raw.contains("続行します。"), "{raw}");
 
     fleet.assert_steps_remaining("agy", 0);
 }

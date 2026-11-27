@@ -173,6 +173,7 @@ fn classify(message: &str, from_json: bool) -> Option<Failure> {
             let start = lower.find(marker)? + marker.len();
             Some(message[start..].trim().trim_end_matches('.').to_owned())
         });
+        failure.reset_at_from_text = failure.reset_at.is_some();
     }
     Some(failure)
 }

@@ -198,6 +198,8 @@ pub struct Report {
     #[serde(skip)]
     pub diagnostic_scanned: bool,
     #[serde(skip)]
+    pub from_truncated_capture: bool,
+    #[serde(skip)]
     pub completed: bool,
     #[serde(skip)]
     pub retry_missing_final: bool,

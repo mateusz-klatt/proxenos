@@ -1,19 +1,23 @@
-//! Heuristic redaction of sign-in output and well-known secret formats in failure diagnostics.
+//! Heuristic detection and all-or-nothing withholding of sign-in material in failure fields.
 //!
-//! Redaction is a best-effort filter over failure messages, failure archives, diagnostics, and
-//! session-save diagnostics, never a guarantee: unknown token formats pass through,
-//! `reported.content` of successful turns is not filtered, files written on disk by provider CLIs
-//! remain untouched, and widened context matching (such as device-code cues within a short
-//! paragraph) can over-redact benign text such as `"error code EACCES"`.
-
-use std::borrow::Cow;
+//! Detection is a best-effort filter over failure messages, diagnostics, version probes, and
+//! session-save diagnostics, never a guarantee: unknown token formats pass verbatim,
+//! `reported.content` of turns without `reported.failure` is not filtered, files written on disk by
+//! provider CLIs remain untouched, and conservative triggers (such as `"error code EACCES"`, text
+//! near `"code"`/`"enter"`, or any failed turn with a truncated capture) withhold the entire text
+//! field with a fixed explanation instead of redacting substrings in place.
 
 use crate::providers::Report;
 
 use super::{AUTHENTICATION_FAILURE_MESSAGE, Failure, FailureKind};
 
 pub(super) const AUTHENTICATION_DIAGNOSTIC: &str = "The provider CLI is not signed in. Its sign-in output was omitted because it can contain one-time login URLs or codes.";
-const REDACTED: &str = "[redacted]";
+const WITHHELD_FAILURE_MESSAGE: &str = "The provider's failure text was withheld because it may contain sign-in material; run the CLI directly to see it.";
+const WITHHELD_DIAGNOSTIC: &str = "The provider CLI's diagnostic output was withheld because it may contain sign-in material; run the CLI directly to see it.";
+const WITHHELD_OBSERVED_FAILURE_MESSAGE: &str = "Failure details were withheld because they matched a sign-in or secret pattern; check the configuration and environment directly.";
+const WITHHELD_SESSION_SAVE_MESSAGE: &str = "Session-save failure details were withheld because they may contain sign-in or secret material; inspect the state directory directly.";
+const WITHHELD_PROBE_VERSION: &str = "Provider version output was withheld because it may contain sign-in material; run the CLI directly to see it.";
+const DIAGNOSTIC_LIMIT: usize = 2048;
 const DEVICE_CODE_CONTEXT_BYTES: usize = 160;
 
 // Longest prefixes first so `sk-ant-` matches before `sk-`.
@@ -31,78 +35,110 @@ const SECRET_PREFIXES: &[&str] = &[
 ];
 
 pub(super) fn redact_report(report: &mut Report) -> bool {
-    let mut redacted = report.diagnostic_redacted;
-    if let Some(failure) = &mut report.failure {
-        if failure.kind == FailureKind::Authentication {
-            failure.message = AUTHENTICATION_FAILURE_MESSAGE.to_owned();
-            report.diagnostic = Some(AUTHENTICATION_DIAGNOSTIC.to_owned());
-            report.content = None;
-            return true;
-        }
-        redacted |= filter_in_place(&mut failure.message);
-        if let Some(reset_at) = &mut failure.reset_at {
-            redacted |= filter_in_place(reset_at);
-        }
-    }
-    if !report.diagnostic_scanned
-        && let Some(diagnostic) = &mut report.diagnostic
+    if let Some(failure) = &mut report.failure
+        && failure.kind == FailureKind::Authentication
     {
-        report.diagnostic_scanned = true;
-        redacted |= filter_in_place(diagnostic);
+        failure.message = AUTHENTICATION_FAILURE_MESSAGE.to_owned();
+        failure.reset_at = None;
+        report.diagnostic = Some(AUTHENTICATION_DIAGNOSTIC.to_owned());
+        report.content = None;
+        return true;
     }
-    redacted
+    let failure_matched = report
+        .failure
+        .as_ref()
+        .is_some_and(|failure| first_match_start(&failure.message, true).is_some());
+    let reset_at_matched = report.failure.as_ref().is_some_and(|failure| {
+        failure
+            .reset_at
+            .as_deref()
+            .is_some_and(|reset| first_match_start(reset, false).is_some())
+    });
+    let diagnostic_matched = !report.diagnostic_scanned
+        && report.diagnostic.as_deref().is_some_and(|diag| {
+            let kept = diag.floor_char_boundary(DIAGNOSTIC_LIMIT);
+            first_match_start(diag, true).is_some_and(|start| start < kept)
+        });
+    let tainted = report.from_truncated_capture
+        || report.diagnostic_redacted
+        || failure_matched
+        || reset_at_matched
+        || diagnostic_matched;
+    if tainted {
+        let mut omitted = false;
+        if let Some(failure) = &mut report.failure {
+            failure.message = WITHHELD_FAILURE_MESSAGE.to_owned();
+            if failure.reset_at_from_text || reset_at_matched {
+                failure.reset_at = None;
+            }
+            omitted = true;
+        }
+        if let Some(diagnostic) = &mut report.diagnostic {
+            *diagnostic = WITHHELD_DIAGNOSTIC.to_owned();
+            omitted = true;
+        }
+        return omitted;
+    }
+    if let Some(diagnostic) = &mut report.diagnostic {
+        diagnostic.truncate(diagnostic.floor_char_boundary(DIAGNOSTIC_LIMIT));
+    }
+    report.diagnostic_scanned = true;
+    false
 }
 
-pub(super) fn redact_failure(failure: &mut Failure) -> bool {
-    filter_in_place(&mut failure.message)
+pub(super) fn redact_observed_failure(failure: &mut Failure) -> bool {
+    redact_single_failure(failure, WITHHELD_OBSERVED_FAILURE_MESSAGE)
 }
 
-/// Redacts `input` before truncating to at most `max_bytes` on a UTF-8 char boundary.
-/// When `capture_truncated` is `true`, device-code-shaped tokens are redacted even without an
-/// adjacent `"code"` or `"enter"` cue because the cue may have been cut at the capture limit.
-/// Returns the bounded string and whether any replacement occurred within the kept prefix.
-pub(crate) fn redact_excerpt(
+pub(super) fn redact_session_save_failure(failure: &mut Failure) -> bool {
+    redact_single_failure(failure, WITHHELD_SESSION_SAVE_MESSAGE)
+}
+
+fn redact_single_failure(failure: &mut Failure, replacement: &str) -> bool {
+    if first_match_start(&failure.message, true).is_none() {
+        return false;
+    }
+    failure.message = replacement.to_owned();
+    true
+}
+
+/// Inspects `input` before truncating to at most `max_bytes` on a UTF-8 char boundary.
+/// When `capture_truncated` is `true` or any heuristic match begins within the kept prefix,
+/// returns the fixed diagnostic withholding notice and `true`; otherwise returns the clean
+/// bounded excerpt and `false`.
+pub(crate) fn diagnostic_excerpt(
     input: &str,
     max_bytes: usize,
     capture_truncated: bool,
 ) -> (String, bool) {
-    match filter_text(input, !capture_truncated) {
-        Some((mut filtered, first_redacted)) => {
-            let kept = filtered.floor_char_boundary(max_bytes);
-            filtered.truncate(kept);
-            (filtered, first_redacted < kept)
-        }
-        None => {
-            let kept = input.floor_char_boundary(max_bytes);
-            (input[..kept].to_owned(), false)
-        }
+    let kept = input.floor_char_boundary(max_bytes);
+    if capture_truncated || first_match_start(input, true).is_some_and(|start| start < kept) {
+        (WITHHELD_DIAGNOSTIC.to_owned(), true)
+    } else {
+        (input[..kept].to_owned(), false)
     }
 }
 
-/// Runs the heuristic redaction filter over `input` without truncation.
-pub(crate) fn redact_text(input: &str, capture_truncated: bool) -> Cow<'_, str> {
-    match filter_text(input, !capture_truncated) {
-        Some((filtered, _)) => Cow::Owned(filtered),
-        None => Cow::Borrowed(input),
+/// Extracts the first non-empty trimmed line of a zero-exit version probe, or returns a fixed
+/// withholding notice when `capture_truncated` is `true` or the detector matches in `input`.
+pub(crate) fn probe_version_excerpt(
+    input: &str,
+    max_bytes: usize,
+    capture_truncated: bool,
+) -> Option<String> {
+    let line = input.lines().map(str::trim).find(|line| !line.is_empty())?;
+    if capture_truncated || first_match_start(input, true).is_some() {
+        Some(WITHHELD_PROBE_VERSION.to_owned())
+    } else {
+        Some(line[..line.floor_char_boundary(max_bytes)].to_owned())
     }
 }
 
-fn filter_in_place(text: &mut String) -> bool {
-    let Some((filtered, _)) = filter_text(text, true) else {
-        return false;
-    };
-    *text = filtered;
-    true
-}
-
-fn filter_text(input: &str, require_code_cue: bool) -> Option<(String, usize)> {
+fn first_match_start(input: &str, require_code_cue: bool) -> Option<usize> {
     let bytes = input.as_bytes();
-    let mut out: Option<(String, usize)> = None;
-    let mut copied = 0;
     let mut url_reject_until = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let matched = match bytes[i] {
+    for (i, &b) in bytes.iter().enumerate() {
+        let matched = match b {
             b's' | b'g' | b'x' => match_prefixed_secret_at(bytes, i),
             b'A' => match_prefixed_secret_at(bytes, i)
                 .or_else(|| match_device_code_at(bytes, i, require_code_cue)),
@@ -115,20 +151,11 @@ fn filter_text(input: &str, require_code_cue: bool) -> Option<(String, usize)> {
             b'C'..=b'Z' | b'0'..=b'9' => match_device_code_at(bytes, i, require_code_cue),
             _ => None,
         };
-        if let Some(end) = matched {
-            let (buf, _) = out.get_or_insert_with(|| (String::with_capacity(input.len()), i));
-            buf.push_str(&input[copied..i]);
-            buf.push_str(REDACTED);
-            copied = end;
-            i = end;
-        } else {
-            i += 1;
+        if matched.is_some() {
+            return Some(i);
         }
     }
-    out.map(|(mut buf, first_redacted)| {
-        buf.push_str(&input[copied..]);
-        (buf, first_redacted)
-    })
+    None
 }
 
 fn is_token_start(bytes: &[u8], i: usize) -> bool {

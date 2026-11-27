@@ -125,10 +125,14 @@ fn diagnostic(raw: &str) -> Failure {
             Value::Number(timestamp) => Some(timestamp.to_string()),
             value => value.as_str().map(str::to_owned),
         };
-        failure.reset_at = reset.or_else(|| {
-            let (_, when) = message.rsplit_once("try again at ")?;
-            nonempty(when.trim_end_matches('.')).map(str::to_owned)
-        });
+        if let Some(reset) = reset {
+            failure.reset_at = Some(reset);
+        } else {
+            failure.reset_at = message
+                .rsplit_once("try again at ")
+                .and_then(|(_, when)| nonempty(when.trim_end_matches('.')).map(str::to_owned));
+            failure.reset_at_from_text = failure.reset_at.is_some();
+        }
     }
     failure
 }

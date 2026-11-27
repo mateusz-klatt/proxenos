@@ -313,6 +313,12 @@ impl Registry {
             if result.report.thread_id.is_none() {
                 result.report.thread_id = prior_thread;
             }
+            let turn_failed = finished.code != Some(0)
+                || !result.report.completed
+                || result.report.failure.is_some();
+            if turn_failed && (finished.stdout.truncated() || finished.stderr.truncated()) {
+                result.report.from_truncated_capture = true;
+            }
             if (finished.code != Some(0) || !result.report.completed)
                 && !finished.stderr.bytes.is_empty()
                 && result.report.diagnostic.is_none()
@@ -322,17 +328,8 @@ impl Registry {
                     .as_ref()
                     .is_some_and(|failure| failure.kind == FailureKind::Authentication)
             {
-                let raw = String::from_utf8_lossy(&finished.stderr.bytes);
-                let capture_truncated = finished.stderr.truncated();
-                if raw.len() > 2048 || capture_truncated {
-                    let (diagnostic, redacted) =
-                        crate::envelope::redact_excerpt(&raw, 2048, capture_truncated);
-                    result.report.diagnostic = Some(diagnostic);
-                    result.report.diagnostic_redacted = redacted;
-                    result.report.diagnostic_scanned = true;
-                } else {
-                    result.report.diagnostic = Some(raw.into_owned());
-                }
+                result.report.diagnostic =
+                    Some(String::from_utf8_lossy(&finished.stderr.bytes).into_owned());
             }
             match finished.ending {
                 #[cfg(unix)]

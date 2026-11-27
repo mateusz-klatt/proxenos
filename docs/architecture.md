@@ -113,30 +113,36 @@ in `error.data`, while other protocol-level errors carry no D2 summary.
 | 4 | Otherwise (`observed.state` is `"finished"`) | `null` | — |
 
 Before any envelope is serialized (and before `reported.failure.message` is excerpted or archived
-to `observed.failure_file`), a shared redaction pass (`envelope::redact`) runs centrally over the
-result (with captured stderr and version-probe diagnostics filtered before their 2 KiB truncation,
-and `observed.session_save_failure` filtered before recording and writing Proxenos's stderr line):
+to `observed.failure_file`), a shared all-or-nothing redaction pass (`envelope::redact`) runs
+centrally over `Report` (after `diagnostic_excerpt` inspects failed version-probe diagnostics before
+their 2 KiB truncation; `observed.failure.message`, `observed.session_save_failure`, and `doctor`
+zero-exit version-probe output are decided as single fields):
 
 - When `reported.failure.kind` is `authentication`, both `reported.failure.message` and top-level
   `failure.message` (when `source` is `"reported"`) become the fixed sentence `"The provider
-  reported that it is not signed in."`, `reported.content` is omitted (whenever a provider reports
-  `reported.failure` across the six adapters, including Antigravity `ERROR` records and
-  `authentication`, it does not populate `reported.content`), the raw stderr fallback into
-  `reported.diagnostic` is skipped, and `reported.diagnostic` becomes the unified provider-neutral
-  sentence `"The provider CLI is not signed in. Its sign-in output was omitted because it can
-  contain one-time login URLs or codes."` (replacing Antigravity's earlier provider-specific
-  sign-in diagnostic). By contrast, when a provider reports a completed turn without
-  `reported.failure` (for example Antigravity `status == "SUCCESS"` with a non-empty `response`)
-  and supervision later records an observed failure such as `abnormal_exit` or `timeout`, the
-  final envelope has `observed.state == "failed"` with `reported.content` (and any
+  reported that it is not signed in."`, any `reset_at` is removed, `reported.content` is omitted
+  (whenever a provider reports `reported.failure` across the six adapters, including Antigravity
+  `ERROR` records and `authentication`, it does not populate `reported.content`), the raw stderr
+  fallback into `reported.diagnostic` is skipped, and `reported.diagnostic` becomes the unified
+  provider-neutral sentence `"The provider CLI is not signed in. Its sign-in output was omitted
+  because it can contain one-time login URLs or codes."` (replacing Antigravity's earlier
+  provider-specific sign-in diagnostic). By contrast, when a provider reports a completed turn
+  without `reported.failure` (for example Antigravity `status == "SUCCESS"` with a non-empty
+  `response`) and supervision later records an observed failure such as `abnormal_exit` or
+  `timeout`, the final envelope has `observed.state == "failed"` with `reported.content` (and any
   `observed.content_file`) intact.
-- For every other failure kind (and on session-save failures), a linear-time pure-Rust heuristic
-  filter replaces matches with `"[redacted]"` across `reported.failure.message`,
-  `reported.failure.reset_at`, `reported.diagnostic` (including failed version-probe diagnostics),
-  `observed.failure.message`, `observed.session_save_failure`, the top-level `failure.message`
-  (and `failure.reset_at`), the failure archive file (`observed.failure_file`), and Proxenos's
-  stderr session-save lines (`could not save session settings: ...`), as well as `doctor`
-  zero-exit version-probe text:
+- Otherwise, `redact_report` makes one all-or-nothing taint decision per `Report`. A `Report` is
+  tainted if **any** of the following holds:
+  - the linear-time heuristic detector matches anywhere in `reported.failure.message` (cue
+    required), anywhere in `reported.failure.reset_at` (`no-cue mode`), or within the kept 2 KiB
+    prefix of `reported.diagnostic` (cue required; failed version-probe diagnostics are checked on
+    the full captured stream before 2 KiB truncation and marked `diagnostic_scanned` so cut
+    clean identifiers are never rescanned at finalization); or
+  - `from_truncated_capture` is `true` — set by delegation whenever `stdout` or `stderr` was cut at
+    the 4 MiB capture limit (`total > captured`) and the turn failed (`finished.code != Some(0)`,
+    `!report.completed`, or `report.failure.is_some()`) — or a failed version-probe stream was
+    truncated at the capture limit.
+  Detector rules:
   - `http://` and `https://` URLs (including non-whitespace non-ASCII characters in the URL body,
     terminating at any Unicode whitespace) whose path or query contains `auth`, `login`, `oauth`,
     `device`, `token`, `code`, `session`, or `verify` (case-insensitive), or that carry any query
@@ -144,30 +150,54 @@ and `observed.session_save_failure` filtered before recording and writing Proxen
   - device-code shapes (`XXXX-XXXX` 4-4 uppercase alphanumeric groups and 6–9 character uppercase
     alphanumeric codes) when `code` or `enter` appears within one short paragraph (up to 160 bytes
     before or after, across line breaks and sentence punctuation, stopping at blank lines), or
-    without requiring a cue (`no-cue mode`) when the captured stream was cut at the capture limit
-    (`total > captured`);
+    without requiring a cue (`no-cue mode`) in `reported.failure.reset_at`;
   - well-known secret prefixes (`sk-`, `sk-ant-`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
     `github_pat_`, `xai-`, `AIza`) and `Bearer <token>` (including any opaque token of 16 or more
     characters regardless of case).
-- Excerpted diagnostics that have already been scanned before their 2 KiB truncation are tracked
-  separately (`diagnostic_scanned` vs `diagnostic_redacted`) and are never rescanned at
-  finalization, so a longer identifier cut at the 2 KiB boundary is not misclassified later.
-- `observed.redacted` records whether any text was omitted or replaced (`true` or `false`) in the
-  covered fields (`reported.failure.message`, `reported.failure.reset_at`, `reported.diagnostic`,
-  `observed.failure.message`, `observed.session_save_failure`, top-level `failure.message`,
-  `observed.failure_file`, and Proxenos's stderr session-save lines).
+- When a `Report` is tainted:
+  - `reported.failure.message` (and top-level `failure.message` when `source` is `"reported"`)
+    becomes the fixed sentence `"The provider's failure text was withheld because it may contain
+    sign-in material; run the CLI directly to see it."`;
+  - `reported.diagnostic` (when present) becomes `"The provider CLI's diagnostic output was
+    withheld because it may contain sign-in material; run the CLI directly to see it."`;
+  - `reported.failure.reset_at` (and top-level `failure.reset_at`) is removed when it was derived
+    from provider free text (such as `"resets at ..."` or `"try again at ..."` suffixes) or when
+    `reset_at` itself matched the detector; a clean structured `reset_at` from a JSON field
+    (`error.resets_at`) is preserved so clients keep structured quota metadata;
+  - `failure.kind`, `reported.thread_id`, `reported.model`, `reported.usage`,
+    `reported.session_cost_usd`, and all `observed` metadata are kept;
+  - `observed.redacted` becomes `true` (when any failure or diagnostic field was withheld);
+  - because the decision runs before excerpting and archiving, `observed.failure_file` is written
+    from the post-decision failure text (so tainted failures stay within the 16 KiB inline excerpt
+    and never write secret-bearing text to disk).
+- Outside `Report`, single-field decisions apply the same heuristic detector (`cue required`):
+  - if `observed.failure.message` matches, the whole field becomes `"Failure details were withheld
+    because they matched a sign-in or secret pattern; check the configuration and environment
+    directly."` (affecting both `observed.failure.message` and top-level `failure.message` when
+    `source` is `"observed"`) and `observed.redacted` becomes `true`;
+  - if `observed.session_save_failure.message` matches, the whole field (both in the envelope and in
+    Proxenos's stderr line `could not save session settings: ...`) becomes `"Session-save failure
+    details were withheld because they may contain sign-in or secret material; inspect the state
+    directory directly."` and `observed.redacted` becomes `true`;
+  - if a `doctor` zero-exit version-probe stream was truncated at the capture limit or matches the
+    detector anywhere in the stream, the version output becomes `"Provider version output was
+    withheld because it may contain sign-in material; run the CLI directly to see it."`.
+- When a `Report` or single field is **not** tainted, its original failure text, clean text-derived
+  `reset_at`, diagnostics, and `>16 KiB` failure archive (`observed.failure_file`) pass through
+  verbatim with `observed.redacted` equal to `false`.
 
-What this cannot do: diagnostic redaction is a heuristic filter, not a guarantee:
+What this cannot do: detection is still a heuristic filter, not a guarantee:
+- undetected token formats, login URLs without query strings or the listed path words, wrapped or
+  encoded secrets, and sign-in prompts outside these patterns pass through whole and verbatim;
+- a truncated failed capture (`total > captured`) loses its failure and diagnostic text
+  conservatively even when no sign-in material was present, and conservative detector hits (such
+  as `"error code EACCES"`, code-like tokens near `"code"` or `"enter"`, or non-auth URLs with
+  query strings) withhold the entire affected failure/diagnostic field;
 - `reported.content` when populated without `reported.failure` (on finished turns, as well as on
   turns that fail later in observed supervision such as `abnormal_exit` or `timeout`, plus any
-  `observed.content_file` archive) is not filtered;
-- `doctor` runs the same heuristic filter on version-probe output when a provider exits 0, so
-  unknown sign-in prompts outside those patterns still pass through;
-- heuristics miss unknown token formats, login URLs without query strings or the listed path
-  words, wrapped or encoded secrets, and sign-in prompts phrased outside these patterns;
-- over-redaction is possible (for example, `"error code EACCES"`, error codes near `"code"` or
-  `"enter"` within a short paragraph, non-auth URLs carrying query strings, or any device-code-shaped
-  token in a capture-truncated stream can be replaced with `"[redacted]"`);
+  `observed.content_file` archive) is not inspected or withheld;
+- `doctor` runs the same heuristic detector on version-probe output when a provider exits 0, so
+  unknown sign-in prompts outside those patterns still pass through verbatim;
 - provider output files on disk (including logs or session files written by the provider CLI itself,
   as well as `observed.content_file` for successful provider-reported turns) remain untouched.
 
@@ -405,8 +435,10 @@ record whose reported status is not `"SUCCESS"` (including `authentication`) or 
 empty omits `reported.content` (matching the other five providers' handling of provider-reported
 failures; an Antigravity `SUCCESS` record paired with an observed non-zero exit or timeout still
 retains `reported.content`). On a non-zero exit or incomplete turn, captured standard error
-is redacted before truncating up to 2 KiB into `reported.diagnostic` (omitted when the turn
-classifies as `authentication`). An authentication failure uses the unified fixed
+is inspected before truncating up to 2 KiB into `reported.diagnostic` (omitted when the turn
+classifies as `authentication`; if either capture was truncated or a failure field or kept
+diagnostic matches the detector, all-or-nothing D2 withholding replaces them with the fixed
+messages). An authentication failure uses the unified fixed
 `reported.failure.message` and provider-neutral `reported.diagnostic` text from D2 that omits the
 CLI's sign-in output. The observed byte counts still include the captured output.
 
@@ -1344,12 +1376,13 @@ scope of Iris claims.
   reports it.
 - A call with `wait: true` lasts as long as its delegation. A client that limits the time of one
   call may end it first and leave the caller without a handle (D17).
-- Diagnostic redaction (D2) is a heuristic filter over failure messages, diagnostics,
-  `observed.session_save_failure`, failure archives, session-save stderr lines, and `doctor`
-  version-probe text, never a guarantee: unknown token formats and unrecognised sign-in prompts pass
-  through, over-redaction is possible (such as `"error code EACCES"`), `reported.content` (of
-  successful turns, including `observed.content_file`) is not filtered, and files written on disk by
-  provider CLIs remain unchanged.
+- Diagnostic redaction (D2) is a heuristic all-or-nothing detector over failure messages,
+  `reset_at`, diagnostics, `observed.session_save_failure`, failure archives, session-save stderr
+  lines, and `doctor` version-probe text, never a guarantee: unknown token formats and unrecognised
+  sign-in prompts pass through verbatim, conservative triggers (such as `"error code EACCES"` or
+  any truncated failed capture) withhold text that may not contain secrets, `reported.content` (of
+  turns without `reported.failure`, including `observed.content_file`) is not inspected, and files
+  written on disk by provider CLIs remain unchanged.
 
 ## 5. Not yet known
 

@@ -355,11 +355,7 @@ async fn probe(
                 .into_iter()
                 .filter_map(|stream| {
                     let raw = String::from_utf8_lossy(&stream.bytes);
-                    let text = crate::envelope::redact_text(&raw, stream.truncated());
-                    text.lines()
-                        .map(str::trim)
-                        .find(|line| !line.is_empty())
-                        .map(|line| line[..line.floor_char_boundary(2048)].to_owned())
+                    crate::envelope::probe_version_excerpt(&raw, 2048, stream.truncated())
                 })
                 .next()
                 .unwrap_or_default();
@@ -373,7 +369,7 @@ async fn probe(
             };
             let raw = String::from_utf8_lossy(&detail.bytes);
             let (diagnostic, redacted) =
-                crate::envelope::redact_excerpt(raw.trim(), 2048, detail.truncated());
+                crate::envelope::diagnostic_excerpt(raw.trim(), 2048, detail.truncated());
             let status = exit_description(outcome.code, outcome.signal);
             Err(DiscoveryError {
                 failure: Failure::new(
