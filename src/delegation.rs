@@ -260,7 +260,9 @@ impl Registry {
                 return Err(error.failure);
             }
         };
+        let git = git::find_git(cancel, call_deadline, activity.clone()).await;
         if let Some(snapshot) = git::snapshot(
+            git.as_deref(),
             &turn.settings.cwd,
             cancel,
             Some(call_deadline),
@@ -464,8 +466,14 @@ impl Registry {
             }
             break Ok(());
         };
-        if let Some(snapshot) =
-            git::snapshot(&turn.settings.cwd, cancel, None, activity.clone()).await
+        if let Some(snapshot) = git::snapshot(
+            git.as_deref(),
+            &turn.settings.cwd,
+            cancel,
+            None,
+            activity.clone(),
+        )
+        .await
         {
             result.snapshot("after", snapshot);
         }

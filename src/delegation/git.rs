@@ -2,10 +2,11 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::Activity;
@@ -16,34 +17,67 @@ use crate::supervise::{self, Ending, Finished, Launch};
 // If the listing does not fit, omit it instead of presenting an incomplete inventory.
 const LIMIT: usize = 256 * 1024;
 
-async fn find_git() -> Option<PathBuf> {
-    static GIT: OnceCell<Option<PathBuf>> = OnceCell::const_new();
-    GIT.get_or_init(|| async {
-        tokio::task::spawn_blocking(|| {
-            // Never look up git in the provider's working directory or execute a shell launcher.
-            std::env::split_paths(&std::env::var_os("PATH")?)
-                .filter(|dir| dir.is_absolute())
-                .map(|dir| dir.join(format!("git{}", std::env::consts::EXE_SUFFIX)))
-                .find(|candidate| candidate.is_file())
-        })
-        .await
-        .expect("git lookup worker finished")
-    })
-    .await
-    .clone()
+const GIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(super) async fn find_git(
+    cancel: &CancellationToken,
+    call_deadline: Instant,
+    activity: Activity,
+) -> Option<PathBuf> {
+    // The original receiver never consumes the publication. Each caller's clone can wait
+    // independently for the same worker, including after it published a missing executable.
+    static GIT: OnceLock<watch::Receiver<Option<PathBuf>>> = OnceLock::new();
+    let lookup = async {
+        let mut done = GIT
+            .get_or_init(|| {
+                let (publish, done) = watch::channel(None);
+                tokio::task::spawn_blocking(move || {
+                    let _activity = activity;
+                    publish
+                        .send(search_path())
+                        .expect("git lookup cache lives for the process");
+                });
+                done
+            })
+            .clone();
+        done.changed().await.expect("git lookup worker published");
+        done.borrow_and_update().clone()
+    };
+    let deadline = call_deadline.min(Instant::now() + GIT_TIMEOUT);
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        () = tokio::time::sleep_until(deadline.into()) => None,
+        path = lookup => path,
+    }
+}
+
+fn search_path() -> Option<PathBuf> {
+    #[cfg(feature = "test-tools")]
+    if let Some(gate) = std::env::var_os("PROXENOS_TEST_GIT_LOOKUP_LOCK") {
+        let file = fs::File::open(gate).expect("test lookup gate exists");
+        eprintln!("proxenos: git lookup waiting on test gate");
+        file.lock_shared().expect("test lookup gate can be locked");
+    }
+    // Only search absolute PATH entries. Do not use the provider cwd or a shell.
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(format!("git{}", std::env::consts::EXE_SUFFIX)))
+        .find(|candidate| candidate.is_file())
 }
 
 pub(super) async fn snapshot(
+    program: Option<&Path>,
     cwd: &Path,
     cancel: &CancellationToken,
     deadline: Option<Instant>,
     activity: Activity,
 ) -> Option<Value> {
-    let program = find_git().await?;
+    let program = program?;
     let launch = |cwd: &Path, args: &[&str]| {
-        let limit = Instant::now() + Duration::from_secs(2);
+        let limit = Instant::now() + GIT_TIMEOUT;
         Launch {
-            program: program.clone(),
+            program: program.to_path_buf(),
             args: args.iter().map(OsString::from).collect(),
             cwd: Some(cwd.into()),
             env_remove: std::env::vars_os()

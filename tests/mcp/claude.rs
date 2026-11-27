@@ -981,14 +981,21 @@ fn claude_maps_not_found_depth_limit_timeout_cancellation_and_capture_failures()
     assert_observed_failure(&captured, "capture", "beyond the capture limit");
     fleet.assert_steps_remaining("claude", 2);
 
-    server.start_call(10, "claude", json!({"prompt": "slow", "timeout_ms": 1500}));
-    let until = Instant::now() + WAIT;
-    while !timed_ready.exists() {
-        assert!(Instant::now() < until, "timed stub did not start");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    server.start_call(10, "claude", json!({"prompt": "slow", "timeout_ms": 4_000}));
     let timed: Value = serde_json::from_str(text(&server.response(10))).unwrap();
     assert_observed_failure(&timed, "timeout", "exceeded the call's deadline");
+    assert!(
+        timed_ready.exists(),
+        "timed stub did not start before deadline: {timed}"
+    );
+    assert!(
+        timed["observed"]["passed"].is_object(),
+        "timed call did not launch provider: {timed}"
+    );
+    assert_eq!(
+        timed["observed"]["attempts"][0]["stdout_bytes"], 7,
+        "{timed}"
+    );
     fleet.assert_steps_remaining("claude", 1);
 
     server.start_call(11, "claude", json!({"prompt": "cancel"}));

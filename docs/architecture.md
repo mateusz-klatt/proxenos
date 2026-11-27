@@ -128,7 +128,11 @@ Git observations use a private configuration with the worktree, index and object
 This avoids executing repository-configured filters and hooks. The two samples can differ from
 the user's own status, including its configured filters, excludes and submodule changes. Paths
 are relative to the worktree root. If Git is unavailable, the directory is outside a worktree,
-or a bounded, UTF-8 listing cannot be obtained, that sample is absent.
+or a bounded, UTF-8 listing cannot be obtained, that sample is absent. The server searches
+`PATH` for Git once, on a blocking worker. Each delegation waits for the search for up to two
+seconds, within its call deadline, and stops waiting on cancellation. It uses that result for
+both snapshots. A stalled filesystem lookup can outlive the caller. The worker remains tracked
+until it finishes or the server reaches D4's shutdown limit.
 
 The same object as MCP structured content is left out until it has been measured on the seven
 clients: sent twice, a long answer could cost its reader twice.
