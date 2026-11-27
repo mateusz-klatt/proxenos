@@ -137,7 +137,7 @@ then took 3 samples after 60 s idle. Same caveat as above: the verifier's own sc
 | claude-delegator Codex server | 2 | 1 (node) | 162 / 223 ms | 163 / 224 ms | 26.5 MiB | 59.4 MiB | 24.0 / 57.5 MiB |
 | claude-delegator Antigravity server | 2 | 1 (node) | 322 / 378 ms | 323 / 378 ms | 26.6 MiB | 59.4 MiB | 23.5 / 57.2 MiB |
 
-claude-delegator registers one server per provider. Assuming seven provider bridges at the
+claude-delegator registers one server per provider. Assuming seven provider bridges at
 59.4 MiB each, the p50 working set that both measured bridges reported, their working sets
 would sum to about 416 MiB. That figure is arithmetic on those two medians, not a measured total.
 Working set also counts shared pages in every process. Private memory was 26.5–26.6 MiB per
