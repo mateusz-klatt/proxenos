@@ -89,12 +89,13 @@ a WSL session that carried a light load, a code review, during the runs. Inputs,
 **Summary.**
 - In `compare_init`, one Proxenos server returns `initialize` about 9× sooner than one
   claude-delegator Codex bridge (p50 11.1 ms against 101.2 ms).
-- One Proxenos process serves every provider. claude-delegator runs one Node process per
-  provider. In the measured processes, the Proxenos working set is about 7× smaller and
+- For one client, one Proxenos process serves every other provider; it omits the client's own.
+  claude-delegator runs one Node process per provider. In the measured processes, the Proxenos working set is about 7× smaller and
   private memory about 4.5× smaller.
 - Process-tree cleanup left no survivors in every scenario tried.
-- The **first `tools/list` is slower**: 721 ms against 163 ms at p50. The client waits for that
-  list before it can call a tool, so this is a regression to fix, tracked in #57.
+- The **first `tools/list` is slower**: 721 ms against 163 ms for the Codex bridge at p50. A
+  client that discovers tools at startup waits for that list, so this is a measured slowdown
+  to fix, tracked in #57.
 
 ### Initialize
 
@@ -136,17 +137,18 @@ then took 3 samples after 60 s idle. Same caveat as above: the verifier's own sc
 | claude-delegator Codex server | 2 | 1 (node) | 162 / 223 ms | 163 / 224 ms | 26.5 MiB | 59.4 MiB | 24.0 / 57.5 MiB |
 | claude-delegator Antigravity server | 2 | 1 (node) | 322 / 378 ms | 323 / 378 ms | 26.6 MiB | 59.4 MiB | 23.5 / 57.2 MiB |
 
-claude-delegator registers one server per provider, and its 3.5.1 configuration also
-registers a usage server. Seven Node servers at the measured 59.4 MiB working set each come to
-about 7 × 59 MiB. That figure is arithmetic on two measured samples, not a measured total.
+claude-delegator registers one server per provider. Assuming seven provider bridges at the
+measured 59.4 MiB each, their working sets would sum to about 416 MiB. That figure is
+arithmetic on two measured samples, not a measured total.
 Working set also counts shared pages in every process. Private memory was 26.5–26.6 MiB per
 measured server. One Proxenos process lists 13 tools: five providers (the calling client's own
 provider is omitted), plus `await`, `cancel` and `usage`, with six CLIs installed.
 
-`initialize` does not wait for discovery. The first `tools/list` does: it waits for the
-parallel D7 search on `PATH` and the `--version` probe of each provider CLI other than the
-client's own, each with its own time limit. On the same host, an earlier measurement on
-2026-11-25, with four tools, gave about 223 ms. See #57.
+`initialize` does not wait for discovery. The first `tools/list` does, as can the first tool
+call. Discovery searches `PATH` and then known install locations (D7) for each provider CLI
+other than the client's own, in parallel. It runs a time-limited `--version` probe for each
+CLI it resolves. An earlier measurement on 2026-11-25, with four tools, gave about 223 ms. See
+#57.
 
 ### What these results do not measure
 
