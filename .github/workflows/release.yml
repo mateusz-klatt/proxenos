@@ -19,6 +19,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      - 'build.rs'
+      - 'src/winres.rs'
+      - 'assets/**'
   workflow_dispatch:
     inputs:
       version:
@@ -238,15 +241,70 @@ jobs:
           import tarfile
           import zipfile
 
-          def pe_machine(path: Path) -> int:
+          def verify_pe(path: Path, expected_machine: int, ico_bytes: bytes) -> None:
               data = path.read_bytes()
               assert data[:2] == b"MZ", f"{path}: missing MZ header"
               pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
               assert data[pe_offset : pe_offset + 4] == b"PE\x00\x00", f"{path}: missing PE signature"
-              return struct.unpack_from("<H", data, pe_offset + 4)[0]
+              machine, num_sections = struct.unpack_from("<HH", data, pe_offset + 4)
+              assert machine == expected_machine, f"{path}: wrong PE machine {machine:#x}"
+              opt_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+              opt_off = pe_offset + 24
+              magic = struct.unpack_from("<H", data, opt_off)[0]
+              dd_off = opt_off + (96 if magic == 0x010B else 112)
+              rsrc_rva, rsrc_size = struct.unpack_from("<II", data, dd_off + 16)
+              assert rsrc_rva and rsrc_size, f"{path}: missing PE .rsrc directory"
+              sec_off = opt_off + opt_size
+              sections = []
+              for i in range(num_sections):
+                  s = sec_off + i * 40
+                  vsize, va, rsize, rptr = struct.unpack_from("<IIII", data, s + 8)
+                  sections.append((va, max(vsize, rsize), rptr, rsize))
 
-          assert pe_machine(Path("dist/proxenos_x86_64-pc-windows-gnu/proxenos.exe")) == 0x8664
-          assert pe_machine(Path("dist/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe")) == 0xAA64
+              def rva_off(rva: int, length: int) -> int:
+                  for va, span, rptr, rsize in sections:
+                      if va <= rva < va + span:
+                          rel = rva - va
+                          assert rel + length <= rsize, f"{path}: RVA {rva:#x} out of raw section"
+                          return rptr + rel
+                  raise AssertionError(f"{path}: unmapped RVA {rva:#x}")
+
+              rsrc_base = rva_off(rsrc_rva, rsrc_size)
+              rsrc = data[rsrc_base : rsrc_base + rsrc_size]
+
+              def entries(off: int) -> list[tuple[int, int]]:
+                  named, ids = struct.unpack_from("<HH", rsrc, off + 12)
+                  return [struct.unpack_from("<II", rsrc, off + 16 + j * 8) for j in range(named + ids)]
+
+              resources: dict[tuple[int, int, int], bytes] = {}
+              for tid, tnext in entries(0):
+                  if (tid & 0x80000000) or not (tnext & 0x80000000):
+                      continue
+                  for iid, inext in entries(tnext & 0x7FFFFFFF):
+                      if (iid & 0x80000000) or not (inext & 0x80000000):
+                          continue
+                      for lid, doff in entries(inext & 0x7FFFFFFF):
+                          if doff & 0x80000000:
+                              continue
+                          drva, dsize = struct.unpack_from("<II", rsrc, doff)
+                          foff = rva_off(drva, dsize)
+                          resources[(tid, iid, lid)] = data[foff : foff + dsize]
+
+              ico_count = struct.unpack_from("<H", ico_bytes, 4)[0]
+              assert (14, 1, 0x0409) in resources, f"{path}: missing RT_GROUP_ICON"
+              assert (16, 1, 0x0409) in resources, f"{path}: missing RT_VERSION"
+              for idx in range(ico_count):
+                  size, off = struct.unpack_from("<II", ico_bytes, 6 + idx * 16 + 8)
+                  assert resources.get((3, idx + 1, 0x0409)) == ico_bytes[off : off + size], (
+                      f"{path}: RT_ICON {idx + 1} mismatch"
+                  )
+              ver = resources[(16, 1, 0x0409)]
+              assert struct.pack("<I", 0xFEEF04BD) in ver, f"{path}: missing VS_FIXEDFILEINFO"
+              assert "proxenos.exe\0".encode("utf-16le") in ver, f"{path}: missing OriginalFilename"
+
+          ico_bytes = Path("assets/proxenos.ico").read_bytes()
+          verify_pe(Path("dist/proxenos_x86_64-pc-windows-gnu/proxenos.exe"), 0x8664, ico_bytes)
+          verify_pe(Path("dist/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe"), 0xAA64, ico_bytes)
 
           dist = Path("dist")
           macos_dist = Path(os.environ["PROXENOS_MACOS_DIST"])
@@ -581,15 +639,68 @@ jobs:
           from pathlib import Path
           import struct
 
-          def pe_machine(path: Path) -> int:
+          def verify_pe(path: Path, expected_machine: int, ico_bytes: bytes) -> None:
               data = path.read_bytes()
               assert data[:2] == b"MZ"
               off = struct.unpack_from("<I", data, 0x3C)[0]
               assert data[off : off + 4] == b"PE\x00\x00"
-              return struct.unpack_from("<H", data, off + 4)[0]
+              machine, num_sections = struct.unpack_from("<HH", data, off + 4)
+              assert machine == expected_machine
+              opt_size = struct.unpack_from("<H", data, off + 20)[0]
+              opt_off = off + 24
+              magic = struct.unpack_from("<H", data, opt_off)[0]
+              dd_off = opt_off + (96 if magic == 0x010B else 112)
+              rsrc_rva, rsrc_size = struct.unpack_from("<II", data, dd_off + 16)
+              assert rsrc_rva and rsrc_size, f"{path}: missing PE .rsrc directory"
+              sec_off = opt_off + opt_size
+              sections = []
+              for i in range(num_sections):
+                  s = sec_off + i * 40
+                  vsize, va, rsize, rptr = struct.unpack_from("<IIII", data, s + 8)
+                  sections.append((va, max(vsize, rsize), rptr, rsize))
 
-          assert pe_machine(Path("dist/proxenos_x86_64-pc-windows-gnu/proxenos.exe")) == 0x8664
-          assert pe_machine(Path("dist/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe")) == 0xAA64
+              def rva_off(rva: int, length: int) -> int:
+                  for va, span, rptr, rsize in sections:
+                      if va <= rva < va + span:
+                          rel = rva - va
+                          assert rel + length <= rsize
+                          return rptr + rel
+                  raise AssertionError(f"{path}: unmapped RVA {rva:#x}")
+
+              rsrc_base = rva_off(rsrc_rva, rsrc_size)
+              rsrc = data[rsrc_base : rsrc_base + rsrc_size]
+
+              def entries(dir_off: int) -> list[tuple[int, int]]:
+                  named, ids = struct.unpack_from("<HH", rsrc, dir_off + 12)
+                  return [struct.unpack_from("<II", rsrc, dir_off + 16 + j * 8) for j in range(named + ids)]
+
+              resources: dict[tuple[int, int, int], bytes] = {}
+              for tid, tnext in entries(0):
+                  if (tid & 0x80000000) or not (tnext & 0x80000000):
+                      continue
+                  for iid, inext in entries(tnext & 0x7FFFFFFF):
+                      if (iid & 0x80000000) or not (inext & 0x80000000):
+                          continue
+                      for lid, doff in entries(inext & 0x7FFFFFFF):
+                          if doff & 0x80000000:
+                              continue
+                          drva, dsize = struct.unpack_from("<II", rsrc, doff)
+                          foff = rva_off(drva, dsize)
+                          resources[(tid, iid, lid)] = data[foff : foff + dsize]
+
+              ico_count = struct.unpack_from("<H", ico_bytes, 4)[0]
+              assert (14, 1, 0x0409) in resources
+              assert (16, 1, 0x0409) in resources
+              for idx in range(ico_count):
+                  size, ioff = struct.unpack_from("<II", ico_bytes, 6 + idx * 16 + 8)
+                  assert resources.get((3, idx + 1, 0x0409)) == ico_bytes[ioff : ioff + size]
+              ver = resources[(16, 1, 0x0409)]
+              assert struct.pack("<I", 0xFEEF04BD) in ver
+              assert "proxenos.exe\0".encode("utf-16le") in ver
+
+          ico_bytes = Path("assets/proxenos.ico").read_bytes()
+          verify_pe(Path("dist/proxenos_x86_64-pc-windows-gnu/proxenos.exe"), 0x8664, ico_bytes)
+          verify_pe(Path("dist/proxenos_aarch64-pc-windows-gnullvm/proxenos.exe"), 0xAA64, ico_bytes)
           PY
           echo "linux-amd64-sha256=$(sha256sum dist/proxenos_x86_64-unknown-linux-musl/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
           echo "linux-arm64-sha256=$(sha256sum dist/proxenos_aarch64-unknown-linux-musl/proxenos | awk '{print $1}')" >> "$GITHUB_OUTPUT"
@@ -1404,7 +1515,14 @@ jobs:
                 $signature.SignerCertificate.Thumbprint -ne $env:EXPECTED_SIGNER_THUMBPRINT) {
               throw "Authenticode verification failed for ${arch}: expected a valid, timestamped signature from the pinned certificate."
             }
-            "${arch}: valid timestamped signature; signer $($signature.SignerCertificate.Thumbprint); timestamp signer $($signature.TimeStamperCertificate.Subject)" >> $env:GITHUB_STEP_SUMMARY
+            $verInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($file)
+            if ($verInfo.ProductName -cne 'Proxenos' -or
+                $verInfo.OriginalFilename -cne 'proxenos.exe' -or
+                $verInfo.ProductVersion -cne $env:RELEASE_VERSION -or
+                $verInfo.FileVersion -cne $env:RELEASE_VERSION) {
+              throw "Unexpected PE version metadata for ${arch}: ProductName=$($verInfo.ProductName), OriginalFilename=$($verInfo.OriginalFilename), ProductVersion=$($verInfo.ProductVersion), FileVersion=$($verInfo.FileVersion)."
+            }
+            "${arch}: valid timestamped signature; signer $($signature.SignerCertificate.Thumbprint); timestamp signer $($signature.TimeStamperCertificate.Subject); ProductName=$($verInfo.ProductName) $($verInfo.ProductVersion)" >> $env:GITHUB_STEP_SUMMARY
           }
           $actual = (& (Join-Path $env:RUNNER_TEMP "windows-verified/amd64/proxenos.exe") --version | Out-String).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne "proxenos $env:RELEASE_VERSION") {

@@ -14,7 +14,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Icon, Implementation,
     ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
     Tool,
 };
@@ -356,10 +356,26 @@ struct Handler<S> {
     active: Activity,
 }
 
+mod icons {
+    include!(concat!(env!("OUT_DIR"), "/mcp_icons.rs"));
+}
+
+fn server_icons() -> Vec<Icon> {
+    vec![
+        Icon::new(icons::SVG_DATA_URI)
+            .with_mime_type("image/svg+xml")
+            .with_sizes(vec!["any".into()]),
+        Icon::new(icons::PNG_64_DATA_URI)
+            .with_mime_type("image/png")
+            .with_sizes(vec!["64x64".into()]),
+    ]
+}
+
 impl<S: Service> ServerHandler for Handler<S> {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-            Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+                .with_icons(server_icons()),
         )
     }
 

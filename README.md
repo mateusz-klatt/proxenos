@@ -1,4 +1,4 @@
-# Proxenos
+# <img src="assets/proxenos.svg" alt="Proxenos icon" width="32" height="32" align="absmiddle" /> Proxenos
 
 Proxenos lets one coding agent consult another. An agent working in Claude Code, Codex CLI,
 Antigravity CLI, Kimi Code, Grok CLI, Cursor Agent or GitHub Copilot CLI hands a task to one of

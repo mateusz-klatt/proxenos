@@ -15,6 +15,8 @@ mod state;
 mod supervise;
 mod tools;
 mod usage;
+#[cfg(test)]
+mod winres;
 
 use std::ffi::OsString;
 use std::io::Write;
