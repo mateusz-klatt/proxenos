@@ -1433,7 +1433,8 @@ scope of Iris claims.
   agents. Which configuration each of the six CLIs loads has not been measured yet (issue #46).
 - If the user's MCP configuration includes Proxenos or another delegator, a delegated agent can
   delegate further. The depth guard (D5, D13) refuses a nested Proxenos call only when
-  `PROXENOS_DEPTH` reaches that nested server. A CLI does not necessarily pass its environment on
+  one of its eight markers (`PROXENOS_DEPTH` or a `CLAUDE_DELEGATOR_*_DEPTH` variable, set to any
+  non-empty value other than `"0"`) reaches that nested server. A CLI does not necessarily pass its environment on
   to the MCP servers it starts. Codex 0.172.0, for one, leaves these variables out of a stdio MCP
   server's environment by default, and `proxenos integrate codex` registers only the command and
   its arguments. A nested Proxenos started that way sees no marker and accepts the call. Nor can
