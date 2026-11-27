@@ -1,4 +1,4 @@
-//! Account reads go through the compiled MCP server and local providers with scripted stdout.
+//! Account reads go through the compiled MCP server and local providers with inline synthetic account responses.
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -14,9 +14,10 @@ fn usage(server: &mut Server, args: Value) -> Value {
     body["providers"].clone()
 }
 
-fn rpc(result: Value) -> Value {
+/// Wrap an inline synthetic Codex app-server JSON-RPC response in a scripted dialogue.
+fn synthetic_rpc(result: Value) -> Value {
     json!({"rpc":[
-        {"expect":"initialize","send":format!("{}\n",json!({"id":1,"result":{"userAgent":"fixture","codexHome":"private-path"}}))},
+        {"expect":"initialize","send":format!("{}\n",json!({"id":1,"result":{"userAgent":"synthetic-fixture","codexHome":"private-path"}}))},
         {"expect":"initialized"},
         {"expect":"account/rateLimits/read","send":format!("{}\n{result}\n", json!({"id":2,"method":"account/updated","params":{"private":"unrelated"}}))}
     ]})
@@ -25,17 +26,22 @@ fn rpc(result: Value) -> Value {
 #[test]
 fn shared_usage_reports_selected_windows_and_plan_without_private_fields() {
     let fleet = Fleet::new(&["codex", "cursor-agent"]);
+    // Synthetic Codex GetAccountRateLimitsResponse payload.
     let snapshot = json!({
-        "rateLimits":{"limitId":"base","planType":"plus","primary":{"usedPercent":99}},
+        "rateLimits":{"limitId":"codex","planType":"plus","primary":{"usedPercent":99}},
         "rateLimitsByLimitId":{
-            "base":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1700000000}},
-            "extra":{"primary":null,"secondary":{"usedPercent":62,"windowDurationMins":null,"resetsAt":null}}
+            "codex":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1700000000}},
+            "codex_bengalfox":{"primary":null,"secondary":{"usedPercent":62,"windowDurationMins":null,"resetsAt":null}}
         },
         "ordinaryUsageAllowed":false,"accountId":"private-account",
         "rateLimitResetCredits":{"credits":[{"description":"private-credit"}]}
     });
     let result = json!({"id":2,"result":snapshot});
-    fleet.script("codex", json!([rpc(result.clone()), rpc(result)]));
+    fleet.script(
+        "codex",
+        json!([synthetic_rpc(result.clone()), synthetic_rpc(result)]),
+    );
+    // Synthetic Cursor `about --format json` payload.
     let about = json!({"subscriptionTier":"Pro Plus","userEmail":"private@example.invalid","lastRequestId":"private-request"});
     fleet.script(
         "cursor-agent",
@@ -54,14 +60,21 @@ fn shared_usage_reports_selected_windows_and_plan_without_private_fields() {
         json!(["codex", "cursor"])
     );
     let expected_windows = json!([
-        {"bucket":"base","period":"primary","used_percent":25,"duration_minutes":300,"resets_at_unix_seconds":1700000000},
-        {"bucket":"extra","period":"secondary","used_percent":62,"duration_minutes":null,"resets_at_unix_seconds":null}
+        {"bucket":"codex","period":"primary","used_percent":25,"duration_minutes":300,"resets_at_unix_seconds":1700000000},
+        {"bucket":"codex_bengalfox","period":"secondary","used_percent":62,"duration_minutes":null,"resets_at_unix_seconds":null}
     ]);
     let summary = usage(&mut server, json!({"providers":["codex","cursor"]}));
     assert_eq!(
         summary,
         json!({
-            "codex":{"status":"available","plan":"plus","windows":expected_windows},
+            "codex":{
+                "status":"available",
+                "plan":"plus",
+                "windows":expected_windows,
+                "ordinary_usage_allowed":false,
+                "rate_limit_reached_type":null,
+                "spend_control_reached":null
+            },
             "cursor":{"status":"plan_only","plan":"Pro Plus","windows":null}
         })
     );
@@ -70,7 +83,6 @@ fn shared_usage_reports_selected_windows_and_plan_without_private_fields() {
         json!({"providers":["cursor","codex"],"full":true}),
     );
     let mut expected = summary;
-    expected["codex"]["ordinary_usage_allowed"] = json!(false);
     expected["codex"]["model_prices"] = Value::Null;
     expected["cursor"]["model_prices"] = Value::Null;
     assert_eq!(full, expected);
@@ -118,6 +130,7 @@ fn malformed_requests_do_not_launch_a_cli_and_missing_sources_stay_independent()
         assert_eq!(err["failure"]["kind"], "invalid_request");
     }
     assert!(fleet.records().is_empty());
+    // Synthetic Cursor response with null subscriptionTier.
     fleet.script(
         "cursor-agent",
         json!([{"stdout":"{\"subscriptionTier\":null}"}]),
@@ -134,13 +147,22 @@ fn malformed_requests_do_not_launch_a_cli_and_missing_sources_stay_independent()
 #[test]
 fn cursor_refuses_incomplete_nonzero_and_malformed_account_output() {
     let fleet = Fleet::new(&["cursor-agent"]);
+    // Synthetic Cursor responses exercising parse, empty-tier, capture-limit and exit-status errors.
     let prefix = r#"{"subscriptionTier":"Pro"}"#;
-    fleet.script("cursor-agent",json!([
-        {"stdout":"not JSON"},{"stdout":"{}"},{"stdout":r#"{"subscriptionTier":"user@example.invalid"}"#},
-        {"stdout":format!("{prefix}{}\n{{}}"," ".repeat(256<<10))},{"code":1,"stdout":prefix,"stderr":"private-account"}
-    ]));
+    fleet.script(
+        "cursor-agent",
+        json!([
+            {"stdout":"not JSON"},
+            {"stdout":"{}"},
+            {"stdout":r#"{"subscriptionTier":""}"#},
+            {"stdout":r#"{"subscriptionTier":123}"#},
+            {"stdout":format!("{prefix}{}\n{{}}"," ".repeat(256<<10))},
+            {"code":1,"stdout":prefix,"stderr":"private-account"}
+        ]),
+    );
     let mut server = fleet.server("codex");
     for reason in [
+        "invalid_report",
         "invalid_report",
         "invalid_report",
         "invalid_report",
@@ -155,12 +177,288 @@ fn cursor_refuses_incomplete_nonzero_and_malformed_account_output() {
 }
 
 #[test]
+fn uuid_and_token_shaped_labels_never_reach_the_client() {
+    let fleet = Fleet::new(&["codex", "cursor-agent"]);
+    let uuid_label = "550e8400-e29b-41d4-a716-446655440000";
+    let token_label = "tok_live_secret_9f8e7d6c";
+    let email_label = "user@example.invalid";
+    let single_token = "bearer-secret-single-bucket";
+
+    // Synthetic Cursor responses: documented aliases plus UUID, token and email strings.
+    fleet.script(
+        "cursor-agent",
+        json!([
+            {"stdout":json!({"subscriptionTier":"Pro+"}).to_string()},
+            {"stdout":json!({"subscriptionTier":uuid_label}).to_string()},
+            {"stdout":json!({"subscriptionTier":token_label}).to_string()},
+            {"stdout":json!({"subscriptionTier":email_label}).to_string()},
+        ]),
+    );
+    // Synthetic Codex responses: documented names alongside single, empty and multiple unknown buckets/plans.
+    fleet.script(
+        "codex",
+        json!([
+            synthetic_rpc(json!({"id":2,"result":{
+                "rateLimits":{"limitId":"","planType":uuid_label,"rateLimitReachedType":token_label},
+                "rateLimitsByLimitId":{
+                    "codex":{"primary":{"usedPercent":10}},
+                    "": {"secondary":{"usedPercent":20}},
+                    uuid_label: {"primary":{"usedPercent":30}},
+                    token_label: {"secondary":{"usedPercent":40}}
+                }
+            }})),
+            synthetic_rpc(json!({"id":2,"result":{
+                "rateLimits":{"planType":"prolite"},
+                "rateLimitsByLimitId":{
+                    "codex_other":{"primary":{"usedPercent":15}},
+                    uuid_label: {"secondary":{"usedPercent":25}}
+                }
+            }})),
+            synthetic_rpc(json!({"id":2,"result":{
+                "rateLimits":{"limitId":single_token,"planType":"","primary":{"usedPercent":55}}
+            }})),
+        ]),
+    );
+    let mut server = fleet.server("codex");
+    for expected_plan in ["Pro Plus", "other", "other", "other"] {
+        let frame = server.call(7, "usage", json!({"providers":["cursor"]}));
+        let raw = text(&frame);
+        for forbidden in [uuid_label, token_label, email_label] {
+            assert!(!raw.contains(forbidden), "leaked label {forbidden}: {raw}");
+        }
+        let body: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            body["providers"]["cursor"],
+            json!({"status":"plan_only","plan":expected_plan,"windows":null})
+        );
+    }
+
+    let first_frame = server.call(8, "usage", json!({"providers":["codex"]}));
+    let first_raw = text(&first_frame);
+    for forbidden in [uuid_label, token_label] {
+        assert!(
+            !first_raw.contains(forbidden),
+            "leaked label {forbidden}: {first_raw}"
+        );
+    }
+    let first: Value = serde_json::from_str(first_raw).unwrap();
+    // BTreeMap orders keys lexicographically: "", uuid_label, "codex", token_label.
+    assert_eq!(
+        first["providers"]["codex"],
+        json!({
+            "status":"available",
+            "plan":"other",
+            "windows":[
+                {"bucket":null,"period":"secondary","used_percent":20,"duration_minutes":null,"resets_at_unix_seconds":null},
+                {"bucket":"other_1","period":"primary","used_percent":30,"duration_minutes":null,"resets_at_unix_seconds":null},
+                {"bucket":"codex","period":"primary","used_percent":10,"duration_minutes":null,"resets_at_unix_seconds":null},
+                {"bucket":"other_2","period":"secondary","used_percent":40,"duration_minutes":null,"resets_at_unix_seconds":null}
+            ],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":"other",
+            "spend_control_reached":null
+        })
+    );
+
+    let second_frame = server.call(9, "usage", json!({"providers":["codex"]}));
+    let second_raw = text(&second_frame);
+    assert!(
+        !second_raw.contains(uuid_label),
+        "leaked label {uuid_label}: {second_raw}"
+    );
+    let second: Value = serde_json::from_str(second_raw).unwrap();
+    assert_eq!(
+        second["providers"]["codex"],
+        json!({
+            "status":"available",
+            "plan":"prolite",
+            "windows":[
+                {"bucket":"other","period":"secondary","used_percent":25,"duration_minutes":null,"resets_at_unix_seconds":null},
+                {"bucket":"codex_other","period":"primary","used_percent":15,"duration_minutes":null,"resets_at_unix_seconds":null}
+            ],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":null
+        })
+    );
+
+    let third_frame = server.call(10, "usage", json!({"providers":["codex"]}));
+    let third_raw = text(&third_frame);
+    assert!(
+        !third_raw.contains(single_token),
+        "leaked label {single_token}: {third_raw}"
+    );
+    let third: Value = serde_json::from_str(third_raw).unwrap();
+    assert_eq!(
+        third["providers"]["codex"],
+        json!({
+            "status":"available",
+            "plan":null,
+            "windows":[
+                {"bucket":"other","period":"primary","used_percent":55,"duration_minutes":null,"resets_at_unix_seconds":null}
+            ],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":null
+        })
+    );
+}
+
+#[test]
+fn codex_preserves_explicit_limit_and_permission_signals_without_windows() {
+    let fleet = Fleet::new(&["codex"]);
+    // Synthetic Codex responses comparing no-decision empty payloads against explicit exhaustion.
+    fleet.script(
+        "codex",
+        json!([
+            synthetic_rpc(json!({"id":2,"result":{"rateLimits":{}}})),
+            synthetic_rpc(json!({"id":2,"result":{"rateLimits":{"rateLimitReachedType":"rate_limit_reached"}}})),
+            synthetic_rpc(json!({"id":2,"result":{"rateLimits":{},"ordinaryUsageAllowed":false}})),
+            synthetic_rpc(json!({"id":2,"result":{"rateLimits":{"spendControlReached":false},"ordinaryUsageAllowed":true}})),
+            synthetic_rpc(json!({"id":2,"result":{
+                "rateLimits":{},
+                "rateLimitsByLimitId":{
+                    "codex":{"spendControlReached":false}
+                }
+            }})),
+            synthetic_rpc(json!({"id":2,"result":{
+                "rateLimits":{},
+                "rateLimitsByLimitId":{
+                    "codex_bengalfox":{"spendControlReached":true}
+                }
+            }})),
+            synthetic_rpc(json!({"id":2,"result":{
+                "rateLimits":{},
+                "rateLimitsByLimitId":{
+                    "codex_bengalfox":{"rateLimitReachedType":"workspace_member_usage_limit_reached","spendControlReached":true}
+                }
+            }}))
+        ]),
+    );
+    let mut server = fleet.server("cursor");
+
+    let empty = usage(&mut server, json!({"providers":["codex"]}));
+    assert_eq!(
+        empty["codex"],
+        json!({
+            "status":"no_windows",
+            "plan":null,
+            "windows":[],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":null
+        })
+    );
+
+    let reached = usage(&mut server, json!({"providers":["codex"]}));
+    assert_eq!(
+        reached["codex"],
+        json!({
+            "status":"limit_reached",
+            "plan":null,
+            "windows":[],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":"rate_limit_reached",
+            "spend_control_reached":null
+        })
+    );
+    assert_ne!(reached["codex"], empty["codex"]);
+
+    let disallowed = usage(&mut server, json!({"providers":["codex"]}));
+    assert_eq!(
+        disallowed["codex"],
+        json!({
+            "status":"limit_reached",
+            "plan":null,
+            "windows":[],
+            "ordinary_usage_allowed":false,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":null
+        })
+    );
+
+    let allowed = usage(&mut server, json!({"providers":["codex"]}));
+    assert_eq!(
+        allowed["codex"],
+        json!({
+            "status":"no_windows",
+            "plan":null,
+            "windows":[],
+            "ordinary_usage_allowed":true,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":false
+        })
+    );
+
+    let bucket_spend_ok = usage(&mut server, json!({"providers":["codex"]}));
+    assert_eq!(
+        bucket_spend_ok["codex"],
+        json!({
+            "status":"no_windows",
+            "plan":null,
+            "windows":[],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":null,
+            "bucket_limits":[
+                {
+                    "bucket":"codex",
+                    "rate_limit_reached_type":null,
+                    "spend_control_reached":false
+                }
+            ]
+        })
+    );
+
+    let bucket_spend_reached = usage(&mut server, json!({"providers":["codex"]}));
+    assert_eq!(
+        bucket_spend_reached["codex"],
+        json!({
+            "status":"limit_reached",
+            "plan":null,
+            "windows":[],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":null,
+            "bucket_limits":[
+                {
+                    "bucket":"codex_bengalfox",
+                    "rate_limit_reached_type":null,
+                    "spend_control_reached":true
+                }
+            ]
+        })
+    );
+
+    let bucket_exhausted = usage(&mut server, json!({"providers":["codex"]}));
+    assert_eq!(
+        bucket_exhausted["codex"],
+        json!({
+            "status":"limit_reached",
+            "plan":null,
+            "windows":[],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":null,
+            "bucket_limits":[
+                {
+                    "bucket":"codex_bengalfox",
+                    "rate_limit_reached_type":"workspace_member_usage_limit_reached",
+                    "spend_control_reached":true
+                }
+            ]
+        })
+    );
+}
+
+#[test]
 fn codex_falls_back_to_the_single_bucket_and_preserves_unavailable_windows() {
     let fleet = Fleet::new(&["codex"]);
+    // Synthetic Codex responses for single-bucket fallback, empty response and malformed window.
     fleet.script("codex",json!([
-        rpc(json!({"id":2,"result":{"rateLimits":{"limitId":"codex","secondary":{"usedPercent":0}}}})),
-        rpc(json!({"id":2,"result":{"rateLimits":{},"rateLimitsByLimitId":{}}})),
-        rpc(json!({"id":2,"result":{"rateLimits":{"primary":{"usedPercent":"50"}}}}))
+        synthetic_rpc(json!({"id":2,"result":{"rateLimits":{"limitId":"codex","secondary":{"usedPercent":0}}}})),
+        synthetic_rpc(json!({"id":2,"result":{"rateLimits":{},"rateLimitsByLimitId":{}}})),
+        synthetic_rpc(json!({"id":2,"result":{"rateLimits":{"primary":{"usedPercent":"50"}}}}))
     ]));
     let mut server = fleet.server("codex");
     let report = usage(&mut server, json!({"providers":["codex"]}));
@@ -171,7 +469,15 @@ fn codex_falls_back_to_the_single_bucket_and_preserves_unavailable_windows() {
     let none = usage(&mut server, json!({"providers":["codex"],"full":true}));
     assert_eq!(
         none["codex"],
-        json!({"status":"no_windows","plan":null,"windows":[],"ordinary_usage_allowed":null,"model_prices":null})
+        json!({
+            "status":"no_windows",
+            "plan":null,
+            "windows":[],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":null,
+            "model_prices":null
+        })
     );
     let invalid = usage(&mut server, json!({"providers":["codex"]}));
     assert_eq!(
@@ -184,15 +490,17 @@ fn codex_falls_back_to_the_single_bucket_and_preserves_unavailable_windows() {
 fn codex_requires_a_matching_rpc_response_and_keeps_account_errors_private() {
     let fleet = Fleet::new(&["codex"]);
     let err = |id, code, message| json!({"id":id,"error":{"code":code,"message":message}});
-    let mut nonzero = rpc(json!({"id":2,"result":{"rateLimits":{}}}));
+    // Synthetic Codex RPC error and framing responses.
+    let mut nonzero = synthetic_rpc(json!({"id":2,"result":{"rateLimits":{}}}));
     nonzero["code"] = json!(7);
-    let mut tail = rpc(json!({"id":2,"result":{"rateLimits":{}}}));
+    let mut tail = synthetic_rpc(json!({"id":2,"result":{"rateLimits":{}}}));
     tail["stdout"] = json!(" ".repeat((256 << 10) + 1));
     fleet.script(
         "codex",
         json!([
-            rpc(err(2,-32600,"codex account authentication required to read rate limits")),
-            rpc(err(2,-32600,"unrelated private failure")),
+            synthetic_rpc(err(2,-32600,"codex account authentication required to read rate limits")),
+            synthetic_rpc(err(2,-32600,"unrelated private failure")),
+            // Synthetic malformed/oversized JSON-RPC handshake frames.
             {"rpc":[{"expect":"initialize","send":"not JSON\n"}]},
             {"rpc":[{"expect":"initialize","send":"{\"id\":999,\"result\":{}}\n"}]},
             {"rpc":[{"expect":"initialize","send":"{\"id\":1}\n"}]},
@@ -224,7 +532,8 @@ fn a_reported_account_error_allows_the_app_server_to_exit_normally() {
     let fleet = Fleet::new(&["codex"]);
     let lock = fleet.root.join("rpc-error");
     let release = fleet.root.join("allow-exit");
-    let mut step = rpc(
+    // Synthetic Codex RPC authentication error step.
+    let mut step = synthetic_rpc(
         json!({"id":2,"error":{"code":-32600,"message":"codex account authentication required to read rate limits"}}),
     );
     step["hold_file"] = json!(lock);
@@ -330,45 +639,64 @@ fn a_timeout_releases_the_process_for_each_account_source() {
 
 #[test]
 fn an_exited_account_reader_cannot_leave_its_output_pipes_with_a_descendant() {
-    let fleet = Fleet::new(&["codex"]);
-    let lock = fleet.root.join("descendant");
-    let release = fleet.root.join("release-leader");
-    let mut step = rpc(json!({"id":2,"result":{"rateLimits":{}}}));
-    step["pipe_holding_descendant"] = json!(lock);
-    step["wait_for"] = json!(release);
-    fleet.script("codex", json!([step]));
+    let fleet = Fleet::new(&["codex", "cursor-agent"]);
     let mut server = fleet.server("codex");
-    server.start_call(13, "usage", json!({"providers":["codex"]}));
-    let until = Instant::now() + WAIT;
-    while !lock.with_extension("ready").exists() {
-        assert!(
-            Instant::now() < until,
-            "descendant did not acquire its lock"
+    for (id, source, cli, mut step) in [
+        (
+            13,
+            "codex",
+            "codex",
+            // Synthetic Codex payload while a descendant holds the output pipes.
+            synthetic_rpc(json!({"id":2,"result":{"rateLimits":{}}})),
+        ),
+        (
+            14,
+            "cursor",
+            "cursor-agent",
+            // Synthetic Cursor JSON payload printed before exiting 0 while a descendant holds stdout.
+            json!({"stdout":r#"{"subscriptionTier":"Pro"}"#}),
+        ),
+    ] {
+        let lock = fleet.root.join(format!("{source}-descendant"));
+        let release = fleet.root.join(format!("{source}-release-leader"));
+        step["pipe_holding_descendant"] = json!(lock);
+        step["wait_for"] = json!(release);
+        fleet.script(cli, json!([step]));
+        server.start_call(id, "usage", json!({"providers":[source]}));
+        let until = Instant::now() + WAIT;
+        while !lock.with_extension("ready").exists() {
+            assert!(
+                Instant::now() < until,
+                "{source} descendant did not acquire its lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let witness = std::fs::File::options().write(true).open(&lock).unwrap();
+        assert!(matches!(
+            witness.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        std::fs::write(release, []).unwrap();
+        let started = Instant::now();
+        let report: Value = serde_json::from_str(text(&server.response(id))).unwrap();
+        assert_eq!(
+            report["providers"][source],
+            json!({"status":"unavailable","reason":"timeout"})
         );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let witness = std::fs::File::options().write(true).open(&lock).unwrap();
-    assert!(matches!(
-        witness.try_lock(),
-        Err(std::fs::TryLockError::WouldBlock)
-    ));
-    std::fs::write(release, []).unwrap();
-    let started = Instant::now();
-    let report: Value = serde_json::from_str(text(&server.response(13))).unwrap();
-    assert_eq!(
-        report["providers"]["codex"],
-        json!({"status":"unavailable","reason":"timeout"})
-    );
-    assert!(started.elapsed() >= Duration::from_millis(1900));
-    let until = Instant::now() + WAIT;
-    loop {
-        match witness.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                assert!(Instant::now() < until, "the descendant survived its parent");
-                std::thread::sleep(Duration::from_millis(10));
+        assert!(started.elapsed() >= Duration::from_millis(1900));
+        let until = Instant::now() + WAIT;
+        loop {
+            match witness.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < until,
+                        "{source} descendant survived its parent"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("could not verify the {source} descendant lock: {error}"),
             }
-            Err(error) => panic!("could not verify the descendant lock: {error}"),
         }
     }
 }
@@ -381,11 +709,13 @@ fn an_unlaunchable_account_cli_does_not_disclose_os_diagnostics() {
         (
             "codex",
             "codex",
-            rpc(json!({"id":2,"result":{"rateLimits":{}}})),
+            // Synthetic Codex payload (never reached on an unlaunchable image).
+            synthetic_rpc(json!({"id":2,"result":{"rateLimits":{}}})),
         ),
         (
             "cursor",
             "cursor-agent",
+            // Synthetic Cursor payload (never reached on an unlaunchable image).
             json!({"stdout":r#"{"subscriptionTier":"Pro"}"#}),
         ),
     ] {

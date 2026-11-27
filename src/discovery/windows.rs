@@ -30,7 +30,10 @@ fn expand(shim: &Path, search: &[PathBuf]) -> Result<Executable, Failure> {
     let unsupported = || {
         Failure::new(
             FailureKind::UnsupportedLauncher,
-            format!("Cannot follow batch launcher {}.", shim.display()),
+            format!(
+                "Cannot follow batch launcher {}. Proxenos never runs batch or PowerShell launchers with control flow (such as vendor installers with staged-update hooks like cursor-agent.cmd and its .ps1 companion); if a native .exe exists for that CLI, place its directory ahead of the shim on PATH.",
+                shim.display()
+            ),
         )
     };
     let source = fs::read_to_string(shim).map_err(|_| unsupported())?;

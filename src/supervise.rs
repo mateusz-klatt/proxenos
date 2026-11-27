@@ -87,6 +87,7 @@ impl Ending {
 pub struct Captured {
     pub bytes: Vec<u8>,
     pub total: u64,
+    pub eof: bool,
     last_output: Option<Duration>,
 }
 
@@ -101,6 +102,7 @@ impl Captured {
         loop {
             let count = pipe.read(&mut chunk).await?;
             if count == 0 {
+                self.eof = true;
                 return Ok(());
             }
             self.last_output = Some(started.elapsed());
