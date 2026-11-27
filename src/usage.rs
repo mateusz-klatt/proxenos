@@ -89,7 +89,15 @@ pub async fn call(
                     crate::envelope::FailureKind::Cancellation => json!("cancelled"),
                     other => json!(other),
                 };
-                json!({"status":"unavailable","reason":reason})
+                #[cfg_attr(not(windows), allow(unused_mut))]
+                let mut body = json!({"status":"unavailable","reason":reason});
+                #[cfg(windows)]
+                if error.failure.kind == crate::envelope::FailureKind::UnsupportedLauncher {
+                    body["hint"] = json!(
+                        "If a native executable exists, point PATH at its directory ahead of the shim (or set PROXENOS_NODE_BIN for a JavaScript launcher)."
+                    );
+                }
+                body
             }
             Ok(exe) => {
                 let read = match source {
@@ -291,11 +299,7 @@ fn codex_limit_reached_type(raw: &str) -> Option<&'static str> {
 const CODEX_BUCKETS: &[&str] = &["codex", "codex_bengalfox", "codex_other", "codex_secondary"];
 
 fn known_codex_bucket(raw: &str) -> Option<&'static str> {
-    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
-    CODEX_BUCKETS
-        .iter()
-        .copied()
-        .find(|&known| known == normalized)
+    CODEX_BUCKETS.iter().copied().find(|&known| known == raw)
 }
 
 struct BucketLabeler {
@@ -306,7 +310,7 @@ struct BucketLabeler {
 impl BucketLabeler {
     fn new<'a>(keys: impl Iterator<Item = &'a String>) -> Self {
         let unknown_count = keys
-            .filter(|id| !id.trim().is_empty() && known_codex_bucket(id).is_none())
+            .filter(|id| !id.is_empty() && known_codex_bucket(id).is_none())
             .count();
         Self {
             multiple_unknown: unknown_count > 1,
@@ -315,7 +319,7 @@ impl BucketLabeler {
     }
 
     fn label(&mut self, id: &str) -> Option<String> {
-        if id.trim().is_empty() {
+        if id.is_empty() {
             return None;
         }
         if let Some(known) = known_codex_bucket(id) {

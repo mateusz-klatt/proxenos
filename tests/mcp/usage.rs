@@ -305,6 +305,55 @@ fn uuid_and_token_shaped_labels_never_reach_the_client() {
 }
 
 #[test]
+fn colliding_near_duplicate_codex_buckets_get_distinct_labels_and_separate_limits() {
+    let fleet = Fleet::new(&["codex"]);
+    let near_case = "Codex";
+    let near_hyphen = "codex-other";
+    // Synthetic Codex payload mixing exact bucket IDs with case/hyphen near-duplicates.
+    fleet.script(
+        "codex",
+        json!([synthetic_rpc(json!({"id":2,"result":{
+            "rateLimits":{},
+            "rateLimitsByLimitId":{
+                "codex":{"primary":{"usedPercent":10},"spendControlReached":false},
+                near_case:{"secondary":{"usedPercent":35}},
+                near_hyphen:{"primary":{"usedPercent":90},"rateLimitReachedType":"rate_limit_reached","spendControlReached":true},
+                "codex_other":{"primary":{"usedPercent":15},"rateLimitReachedType":null,"spendControlReached":false}
+            }
+        }}))]),
+    );
+    let mut server = fleet.server("cursor");
+    let frame = server.call(7, "usage", json!({"providers":["codex"]}));
+    let raw = text(&frame);
+    for forbidden in [near_case, near_hyphen] {
+        assert!(!raw.contains(forbidden), "leaked label {forbidden}: {raw}");
+    }
+    let body: Value = serde_json::from_str(raw).unwrap();
+    // BTreeMap orders keys lexicographically: "Codex", "codex", "codex-other", "codex_other".
+    assert_eq!(
+        body["providers"]["codex"],
+        json!({
+            "status":"available",
+            "plan":null,
+            "windows":[
+                {"bucket":"other_1","period":"secondary","used_percent":35,"duration_minutes":null,"resets_at_unix_seconds":null},
+                {"bucket":"codex","period":"primary","used_percent":10,"duration_minutes":null,"resets_at_unix_seconds":null},
+                {"bucket":"other_2","period":"primary","used_percent":90,"duration_minutes":null,"resets_at_unix_seconds":null},
+                {"bucket":"codex_other","period":"primary","used_percent":15,"duration_minutes":null,"resets_at_unix_seconds":null}
+            ],
+            "ordinary_usage_allowed":null,
+            "rate_limit_reached_type":null,
+            "spend_control_reached":null,
+            "bucket_limits":[
+                {"bucket":"codex","rate_limit_reached_type":null,"spend_control_reached":false},
+                {"bucket":"other_2","rate_limit_reached_type":"rate_limit_reached","spend_control_reached":true},
+                {"bucket":"codex_other","rate_limit_reached_type":null,"spend_control_reached":false}
+            ]
+        })
+    );
+}
+
+#[test]
 fn codex_preserves_explicit_limit_and_permission_signals_without_windows() {
     let fleet = Fleet::new(&["codex"]);
     // Synthetic Codex responses comparing no-decision empty payloads against explicit exhaustion.
@@ -751,4 +800,30 @@ fn an_unlaunchable_account_cli_does_not_disclose_os_diagnostics() {
         );
         fleet.assert_steps_remaining(cli, 1);
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_unsupported_cursor_launcher_includes_path_free_hint() {
+    let fleet = Fleet::new(&[]);
+    let bin = fleet.root.join("bin");
+    std::fs::write(
+        bin.join("cursor-agent.cmd"),
+        "@echo off\r\nif exist \"%~dp0versions\\promote-staged.cmd\" call \"%~dp0versions\\promote-staged.cmd\"\r\n",
+    )
+    .unwrap();
+    let mut server = fleet.server("codex");
+    let report = usage(&mut server, json!({"providers":["cursor"]}));
+    let cursor = &report["cursor"];
+    assert_eq!(cursor["status"], "unavailable");
+    assert_eq!(cursor["reason"], "unsupported_launcher");
+    let hint = cursor["hint"].as_str().expect("fixed hint");
+    assert!(hint.contains("PATH"), "{cursor}");
+    let root = fleet.root.to_string_lossy();
+    assert!(!hint.contains(root.as_ref()), "leaked root path: {hint}");
+    assert!(
+        !hint.contains('\\') && !hint.contains('/'),
+        "hint contained path separator: {hint}"
+    );
+    assert!(fleet.records().is_empty());
 }

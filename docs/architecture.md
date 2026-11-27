@@ -494,7 +494,9 @@ holds the CLI. Known install locations are tried only after `PATH`. It never ask
 On Windows a `.cmd` or `.bat` shim is read and followed to the program it starts: an executable, a
 JavaScript loader, or a PowerShell script. Wrappers whose full behaviour cannot be established—for
 example those containing control flow or environment changes outside the recognized wrapper
-shapes—are reported as `unsupported_launcher` and never run. The shim itself is never started:
+shapes—are reported as `unsupported_launcher` and never run. When a recognized wrapper forwards to
+a `.ps1` script, Proxenos checks only the batch wrapper's shape and passes that script path to
+`powershell.exe` without inspecting the `.ps1` body. The shim itself is never started:
 Rust would run it through `cmd.exe` and refuses any argument it cannot escape safely for that
 shell, a line break among them, and every real prompt has one. When the loader is JavaScript,
 `node` is looked for in this order: an explicit override, beside the shim, on `PATH`, then stable
@@ -560,9 +562,12 @@ executable can trigger an OS loader dialog during that wait.
   when no windows are present and an explicit limit or `ordinary_usage_allowed: false` is
   reported, `status` is `limit_reached` rather than `no_windows`. Documented `planType`,
   `rateLimitReachedType`, and bucket IDs (`codex`, `codex_bengalfox`, `codex_other`,
-  `codex_secondary`) are mapped to fixed names; unrecognized non-empty bucket IDs, plans, or
-  reached types map to `other` (or indexed `other_1`, `other_2` when multiple unknown buckets
-  appear), so raw provider strings never reach the client. A signed-out profile returned an
+  `codex_secondary`) are matched exactly; every other non-empty bucket ID (including near-matches
+  such as `codex-other` or differently cased variants) goes through the unknown path (`other` when
+  at most one unknown bucket appears, or distinct indexed `other_1`, `other_2`, … when multiple
+  unknown buckets appear), and unrecognized non-empty plans or reached types map to `other`, so
+  no two buckets in one report share a label and raw provider strings never reach the client. A
+  signed-out profile returned an
   authentication error. [Codex app-server protocol](https://developers.openai.com/codex/app-server/)
 - `cursor-agent about --format json` exposes the subscription tier. Its measured response
   included no usage windows. The tool returns `plan_only` for a supplied tier and
@@ -572,11 +577,15 @@ executable can trigger an OS loader dialog during that wait.
   JSON and exits 0 while a descendant still holds standard output past D6's two-second drain,
   `usage` fails with `timeout`. It discards email, machine details and request IDs.
 
-What this cannot do: on Windows, a Cursor installation that exposes only `cursor-agent.cmd` and
-its PowerShell companion (such as the vendor installer, whose `.cmd` and `.ps1` wrappers prepend a
-staged-update hook containing control flow) is rejected as `unsupported_launcher`, because D6 and
-D7 never execute batch or PowerShell launchers. If a native `cursor-agent.exe` exists for that
-installation, the user can place its directory ahead of the shim on `PATH`.
+What this cannot do: on Windows, D7 inspects only `.exe`, `.cmd`, and `.bat` entries on `PATH` and
+in install directories, and for `.cmd` or `.bat` shims checks only the batch wrapper's own lines
+(it does not inspect the body of a `.ps1` script that a recognized wrapper forwards to). An
+installation whose `cursor-agent.cmd` contains control flow or unrecognized syntax (such as the
+vendor installer's staged-update hook) is therefore rejected as `unsupported_launcher` without
+running the batch file, and a standalone `cursor-agent.ps1` is not discovered without a recognized
+`.cmd` or `.bat` forwarding wrapper. When `usage` fails with `unsupported_launcher`, it includes a
+fixed, path-free `hint` advising the caller to point `PATH` at a native executable's directory
+ahead of the shim (if one exists) or set `PROXENOS_NODE_BIN` for a JavaScript launcher.
 Account network access belongs to each CLI.
 
 ### D10. Proxenos registers itself with each client
