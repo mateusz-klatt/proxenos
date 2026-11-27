@@ -90,7 +90,7 @@ fn listed_provider_tools(server: &mut Server) -> Vec<Value> {
         .iter()
         .filter(|tool| {
             let name = tool["name"].as_str().unwrap();
-            !name.starts_with("test_") && !matches!(name, "await" | "cancel")
+            !name.starts_with("test_") && !matches!(name, "await" | "cancel" | "usage")
         })
         .cloned()
         .collect()

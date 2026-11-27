@@ -494,7 +494,9 @@ holds the CLI. Known install locations are tried only after `PATH`. It never ask
 On Windows a `.cmd` or `.bat` shim is read and followed to the program it starts: an executable, a
 JavaScript loader, or a PowerShell script. Wrappers whose full behaviour cannot be established—for
 example those containing control flow or environment changes outside the recognized wrapper
-shapes—are reported as `unsupported_launcher` and never run. The shim itself is never started:
+shapes—are reported as `unsupported_launcher` and never run. When a recognized wrapper forwards to
+a `.ps1` script, Proxenos checks only the batch wrapper's shape and passes that script path to
+`powershell.exe` without inspecting the `.ps1` body. The shim itself is never started:
 Rust would run it through `cmd.exe` and refuses any argument it cannot escape safely for that
 shell, a line break among them, and every real prompt has one. When the loader is JavaScript,
 `node` is looked for in this order: an explicit override, beside the shim, on `PATH`, then stable
@@ -533,11 +535,58 @@ configuration name it.
 `usage` reports each CLI's subscription windows without running a model, where the CLI gives them
 that way. Where one does not, `usage` says so for that provider: claude-delegator found only the
 plan for Cursor. A voter of vote 6 asked for this limit to be stated. `usage` takes a list of
-providers and by default returns a short summary, the windows with their percentages and reset
-times; the full report with prices per model is asked for explicitly. It needs a JSON-RPC
-client over a child's pipes and one HTTP request to a loopback address. It makes no HTTPS request,
-so Proxenos has no TLS stack. The Moonshot API-key balance that claude-delegator read is not
-supported: Kimi is used through its subscription.
+providers and by default returns a short summary of windows (with their percentages and reset
+times) alongside Codex's explicit exhaustion and permission signals. `full: true` asks for the full
+report with per-model pricing; neither source supplies per-model prices yet, so successful full
+reports return `model_prices: null`. Both providers communicate through child pipes (JSON-RPC over
+stdio for Codex, standard output JSON for Cursor), with no loopback HTTP request and no TLS stack
+in Proxenos. The Moonshot API-key balance that claude-delegator read is not supported: Kimi is used
+through its subscription.
+
+The shared MCP tool currently accepts `providers: ["codex", "cursor"]` or either name alone.
+It can read the calling client's own subscription. Each provider has its own status and a
+ten-second deadline including CLI lookup, followed by D6 process cleanup. Failure to read one
+account leaves the other result available. If the OS stalls while creating a process, the
+account read can return while the launch worker still waits for a handle. D6 cleans up a handle
+that arrives while Proxenos is still running, subject to D6's Unix exception: if Proxenos exits
+before a stalled `exec` returns (such as when D4's ten-second shutdown limit expires), it exits
+without that handle and the CLI can run afterwards if `exec` later succeeds. On Windows, an invalid
+executable can trigger an OS loader dialog during that wait.
+
+- Codex CLI 0.172.0 accepts `account/rateLimits/read` over `app-server --listen stdio://`
+  after initialization. Proxenos asks for windows without reset credit details. It prefers the
+  per-bucket map and falls back to the single bucket on older responses. Window percentages
+  are used percentages. Resets are Unix seconds. Explicit permission and limit signals
+  (`ordinary_usage_allowed`, `rate_limit_reached_type`, `spend_control_reached`, and per-bucket
+  `bucket_limits` when present) are preserved in every Codex report independently of `windows`:
+  when no windows are present and an explicit limit or `ordinary_usage_allowed: false` is
+  reported, `status` is `limit_reached` rather than `no_windows`. Documented `planType`,
+  `rateLimitReachedType`, and bucket IDs (`codex`, `codex_bengalfox`, `codex_other`,
+  `codex_secondary`) are matched exactly; every other non-empty bucket ID (including near-matches
+  such as `codex-other` or differently cased variants) goes through the unknown path (`other` when
+  at most one unknown bucket appears, or distinct indexed `other_1`, `other_2`, … when multiple
+  unknown buckets appear), and unrecognized non-empty plans or reached types map to `other`, so
+  no two buckets in one report share a label and raw provider strings never reach the client. A
+  signed-out profile returned an
+  authentication error. [Codex app-server protocol](https://developers.openai.com/codex/app-server/)
+- `cursor-agent about --format json` exposes the subscription tier. Its measured response
+  included no usage windows. The tool returns `plan_only` for a supplied tier and
+  `plan_not_reported` when the tier is null. Documented Cursor tiers map to fixed names, and any
+  unrecognized non-empty tier maps to `other` so raw provider strings never reach the client.
+  Cursor requires standard output to reach EOF before accepting a report: if the launcher prints
+  JSON and exits 0 while a descendant still holds standard output past D6's two-second drain,
+  `usage` fails with `timeout`. It discards email, machine details and request IDs.
+
+What this cannot do: on Windows, D7 inspects only `.exe`, `.cmd`, and `.bat` entries on `PATH` and
+in install directories, and for `.cmd` or `.bat` shims checks only the batch wrapper's own lines
+(it does not inspect the body of a `.ps1` script that a recognized wrapper forwards to). An
+installation whose `cursor-agent.cmd` contains control flow or unrecognized syntax (such as the
+vendor installer's staged-update hook) is therefore rejected as `unsupported_launcher` without
+running the batch file, and a standalone `cursor-agent.ps1` is not discovered without a recognized
+`.cmd` or `.bat` forwarding wrapper. When `usage` fails with `unsupported_launcher`, it includes a
+fixed, path-free `hint` advising the caller to point `PATH` at a native executable's directory
+ahead of the shim (if one exists) or set `PROXENOS_NODE_BIN` for a JavaScript launcher.
+Account network access belongs to each CLI.
 
 ### D10. Proxenos registers itself with each client
 

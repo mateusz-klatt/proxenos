@@ -3,7 +3,8 @@
 pub(crate) mod cleanup;
 
 use std::ffi::OsString;
-use std::io;
+use std::future::Future;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::process::{Command, ExitStatus, Stdio};
@@ -86,6 +87,7 @@ impl Ending {
 pub struct Captured {
     pub bytes: Vec<u8>,
     pub total: u64,
+    pub eof: bool,
     last_output: Option<Duration>,
 }
 
@@ -100,6 +102,7 @@ impl Captured {
         loop {
             let count = pipe.read(&mut chunk).await?;
             if count == 0 {
+                self.eof = true;
                 return Ok(());
             }
             self.last_output = Some(started.elapsed());
@@ -140,16 +143,79 @@ pub(crate) async fn finish_reap(
     Ok(status)
 }
 
+pub(crate) fn check_start(cancel: &CancellationToken, deadline: Instant) -> Result<(), StartError> {
+    if cancel.is_cancelled() {
+        return Err(StartError::Skipped(Ending::Cancelled));
+    }
+    if Instant::now() >= deadline {
+        return Err(StartError::Skipped(Ending::TimedOut));
+    }
+    Ok(())
+}
+
+pub(crate) async fn write_stdin(
+    writer: &mut Option<io::PipeWriter>,
+    payload: String,
+) -> io::Result<()> {
+    let mut pipe = writer.take().expect("stdin is open");
+    let (pipe, result) = tokio::task::spawn_blocking(move || {
+        let result = pipe
+            .write_all(payload.as_bytes())
+            .and_then(|()| pipe.flush());
+        (pipe, result)
+    })
+    .await
+    .expect("child stdin writer finished");
+    *writer = Some(pipe);
+    result
+}
+
+pub(crate) async fn until_interrupted<T, E>(
+    operation: impl Future<Output = T>,
+    interrupt: impl Future<Output = E>,
+) -> Result<T, E> {
+    tokio::select! {
+        biased;
+        reason = interrupt => Err(reason),
+        value = operation => Ok(value),
+    }
+}
+
+/// An interrupted wait cannot say whether native process creation already started.
+pub(crate) async fn run_with_interruptible_spawn<E>(
+    launch: Launch,
+    cancel: &CancellationToken,
+    activity: Activity,
+    interrupt: impl Future<Output = E>,
+) -> Result<io::Result<Finished>, E> {
+    let (accepted, received) = oneshot::channel();
+    let mut running = pin!(run_inner(launch, cancel, activity, Some(accepted)));
+    tokio::select! {
+        biased;
+        // Once the supervisor owns the child, wait for its complete D6 result.
+        _ = received => Ok(running.await),
+        result = until_interrupted(&mut running, interrupt) => result,
+    }
+}
+
 pub async fn run(
+    launch: Launch,
+    cancel: &CancellationToken,
+    activity: Activity,
+) -> io::Result<Finished> {
+    run_inner(launch, cancel, activity, None).await
+}
+
+async fn run_inner(
     mut launch: Launch,
     cancel: &CancellationToken,
     activity: Activity,
+    accepted: Option<oneshot::Sender<()>>,
 ) -> io::Result<Finished> {
     let started = Instant::now();
     let mut command = Command::new(&launch.program);
     command
         .args(&launch.args)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(cwd) = &launch.cwd {
@@ -169,18 +235,11 @@ pub async fn run(
     tokio::task::spawn_blocking(move || {
         let child = platform::spawn(
             command,
+            platform::Input::Closed,
             &mut launch.temporary_files,
             memory_limit_bytes,
             activity.clone(),
-            || {
-                if queued.is_cancelled() {
-                    return Err(StartError::Skipped(Ending::Cancelled));
-                }
-                if Instant::now() >= launch.deadline {
-                    return Err(StartError::Skipped(Ending::TimedOut));
-                }
-                Ok(())
-            },
+            || check_start(&queued, launch.deadline),
         );
         let _ = publish.send(child);
         // Only failed or skipped launches have files left here. This worker holds its
@@ -207,6 +266,9 @@ pub async fn run(
             };
         }
     };
+    if let Some(accepted) = accepted {
+        let _ = accepted.send(());
+    }
     let out = child.stdout.take().expect("stdout was piped");
     let err = child.stderr.take().expect("stderr was piped");
     let mut stdout = Captured::default();

@@ -1,0 +1,181 @@
+//! Codex app-server serves account/rateLimits/read after its own stdio initialization.
+use std::future::Future;
+use std::io;
+use std::pin::pin;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader, Take};
+use tokio::process::ChildStdout;
+use tokio_util::sync::CancellationToken;
+
+use crate::discovery::Executable;
+use crate::mcp::Activity;
+use crate::platform;
+use crate::supervise::{StartError, check_start, until_interrupted, write_stdin};
+
+type Output = Take<BufReader<ChildStdout>>;
+type ReadResult<T> = Result<T, &'static str>;
+
+// Transport diagnostics may contain private account or installation details.
+fn unavailable(_: impl Into<StartError>) -> &'static str {
+    "unavailable"
+}
+
+async fn response(reader: &mut Output, id: i64) -> ReadResult<Value> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let size = reader
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(unavailable)?;
+        if reader.limit() == 0 {
+            return Err("capture");
+        }
+        if size == 0 {
+            return Err("invalid_report");
+        }
+        let mut frame: Value = serde_json::from_slice(&line).map_err(|_| "invalid_report")?;
+        if frame["id"].as_i64() != Some(id) || frame.get("method").is_some() {
+            continue;
+        }
+        match (frame.get("result"), frame.get("error")) {
+            (Some(result), None) if result.is_object() => return Ok(frame["result"].take()),
+            (None, Some(error)) if error.is_object() => {
+                let login = id == 2
+                    && error["code"].as_i64() == Some(-32600)
+                    && error["message"]
+                        == "codex account authentication required to read rate limits";
+                return Err(if login {
+                    "authentication"
+                } else {
+                    "unavailable"
+                });
+            }
+            _ => return Err("invalid_report"),
+        }
+    }
+}
+
+async fn drain<R: AsyncRead + Unpin>(reader: &mut Take<R>) -> ReadResult<()> {
+    tokio::io::copy(reader, &mut tokio::io::sink())
+        .await
+        .map_err(unavailable)?;
+    (reader.limit() != 0).then_some(()).ok_or("capture")
+}
+
+async fn request_limits(reader: &mut Output, writer: io::PipeWriter) -> ReadResult<Value> {
+    let mut writer = Some(writer);
+    let init = json!({"id":1, "method":"initialize", "params":{"clientInfo":{
+        "name":"proxenos", "version":env!("CARGO_PKG_VERSION")
+    }}});
+    write_stdin(&mut writer, format!("{init}\n"))
+        .await
+        .map_err(unavailable)?;
+    response(reader, 1).await?;
+    let ready = json!({"method":"initialized"});
+    let limits = json!({"id":2, "method":"account/rateLimits/read", "params":{"excludeResetCreditDetails":true}});
+    write_stdin(&mut writer, format!("{ready}\n{limits}\n"))
+        .await
+        .map_err(unavailable)?;
+    response(reader, 2).await
+}
+
+async fn bounded<T>(
+    deadline: Instant,
+    cancel: &CancellationToken,
+    operation: impl Future<Output = ReadResult<T>>,
+) -> ReadResult<T> {
+    let result = until_interrupted(operation, super::read_interruption(deadline, cancel)).await;
+    // A worker can skip the launch before Tokio delivers the timer tick. The token and
+    // monotonic clock still identify why it skipped when its result wins the select.
+    if cancel.is_cancelled() {
+        return Err("cancelled");
+    }
+    if Instant::now() >= deadline {
+        return Err("timeout");
+    }
+    result?
+}
+
+pub(super) async fn read(
+    exe: Executable,
+    deadline: Instant,
+    cancel: &CancellationToken,
+    activity: Activity,
+) -> ReadResult<Value> {
+    let mut command = Command::new(exe.program);
+    command
+        .args(exe.prefix)
+        .args(["app-server", "--listen", "stdio://"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // The worker rechecks a dropped request under the native spawn lock. A handle that
+    // arrives after its receiver is gone still owns the group and will stop it on drop.
+    let queued = cancel.child_token();
+    let _abandoned = queued.clone().drop_guard();
+    let launched = tokio::task::spawn_blocking(move || {
+        platform::spawn(
+            command,
+            platform::Input::Piped,
+            &mut Vec::new(),
+            None,
+            activity,
+            || check_start(&queued, deadline),
+        )
+    });
+    let mut child = bounded(deadline, cancel, async {
+        launched
+            .await
+            .expect("usage spawn worker finished")
+            .map_err(unavailable)
+    })
+    .await?;
+    let writer = child.stdin.take().expect("stdin was piped");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout was piped"))
+        .take(super::REPORT_LIMIT as u64 + 1);
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("stderr was piped")
+        .take(super::REPORT_LIMIT as u64 + 1);
+    let result = bounded(deadline, cancel, async {
+        let mut pipes = pin!(async {
+            // A protocol error also ends the dialogue. Closing stdin lets a well-behaved
+            // app-server exit and flush its remaining output before D6 reaps it.
+            let stdout_exchange = async {
+                let reported = request_limits(&mut stdout, writer).await;
+                drain(&mut stdout).await?;
+                Ok(reported)
+            };
+            let (value, ()) = tokio::try_join!(stdout_exchange, drain(&mut stderr))?;
+            Ok(value)
+        });
+        let mut wait = pin!(child.wait_for_exit());
+        tokio::select! {
+            answer = &mut pipes => {
+                let answer = answer?;
+                wait.await.map_err(unavailable)?;
+                Ok(answer)
+            }
+            status = &mut wait => {
+                status.map_err(unavailable)?;
+                // A descendant may hold the pipes open even after the app-server exits.
+                tokio::time::timeout(Duration::from_secs(2), pipes).await.map_err(|_| "timeout")?
+            }
+        }
+    })
+    .await;
+    let stopped = if result.is_err() {
+        child.stop().await
+    } else {
+        Ok(())
+    };
+    let (status, _) = child.finish().await;
+    let status = stopped.and(status).map_err(|_| "cleanup_failed")?;
+    let report = result??;
+    status.success().then_some(report).ok_or("unavailable")
+}

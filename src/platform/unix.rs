@@ -183,12 +183,14 @@ pub struct Child {
     accounting: Arc<Mutex<UnixAccounting>>,
     #[cfg(feature = "test-tools")]
     eperm_injection: Option<EpermInjection>,
+    pub stdin: Option<io::PipeWriter>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
 }
 
 pub fn spawn(
     mut command: Command,
+    input: super::Input,
     files: &mut Vec<TemporaryFile>,
     memory_limit_bytes: Option<u64>,
     activity: Activity,
@@ -231,8 +233,9 @@ pub fn spawn(
         .spawn(reap_when_released)?;
 
     // Pipe creation and FD_CLOEXEC can be separate operations on macOS. Serialize both our
-    // output pipes and std's exec-status pipe against every other fork in the supervisor.
+    // data pipes and std's exec-status pipe against every other fork in the supervisor.
     let spawning = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+    let stdin = input.attach(&mut command)?;
     let (out, stdout_writer) = io::pipe()?;
     let (err, stderr_writer) = io::pipe()?;
     let stdout = ChildStdout::from_std(OwnedFd::from(out).into())?;
@@ -258,6 +261,7 @@ pub fn spawn(
         accounting: Arc::new(Mutex::new(UnixAccounting::new(memory_limit_bytes))),
         #[cfg(feature = "test-tools")]
         eperm_injection: EpermInjection::load(),
+        stdin,
         stdout: Some(stdout),
         stderr: Some(stderr),
     })

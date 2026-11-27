@@ -200,6 +200,7 @@ pub struct Child {
     exited: oneshot::Receiver<()>,
     status: oneshot::Receiver<io::Result<ExitStatus>>,
     cleaned: oneshot::Receiver<()>,
+    pub stdin: Option<io::PipeWriter>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
 }
@@ -224,12 +225,14 @@ impl Child {
 
 pub fn spawn(
     mut command: Command,
+    input: super::Input,
     files: &mut Vec<TemporaryFile>,
     memory_limit_bytes: Option<u64>,
     activity: Activity,
     check_start: impl Fn() -> Result<(), StartError>,
 ) -> Result<Child, StartError> {
     let job = Group::new(memory_limit_bytes)?;
+    let stdin = input.attach(&mut command)?;
     // Rust exposes the primary thread handle on std's Child. Keep it through job assignment.
     command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
     check_start()?;
@@ -284,6 +287,7 @@ pub fn spawn(
         exited,
         status,
         cleaned,
+        stdin,
         stdout,
         stderr,
     })

@@ -17,7 +17,7 @@ fn a_release_build_lists_only_shared_tools_and_refuses_the_test_ones() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("a name"))
         .collect();
-    assert_eq!(names, ["await", "cancel"]);
+    assert_eq!(names, ["await", "cancel", "usage"]);
     for (id, name) in [
         (2, "test_echo"),
         (3, "test_panic"),

@@ -176,6 +176,7 @@ impl Service for Registry {
             tools.extend([provider.tool(false), provider.tool(true)]);
         }
         tools.extend(background::tool_specs());
+        tools.push(crate::usage::tool());
         tools
     }
 
@@ -191,6 +192,9 @@ impl Service for Registry {
         }
         if name == "cancel" {
             return Ok(self.background.call_cancel(&arguments));
+        }
+        if name == "usage" {
+            return Ok(crate::usage::call(arguments, &cancel, activity).await);
         }
         if let Some((provider, reply)) = self.provider_for(&name) {
             return Ok(self

@@ -103,13 +103,15 @@ fn search_path() -> Vec<PathBuf> {
 }
 
 fn locate(provider: &Provider) -> Result<Executable, Failure> {
-    let cli = provider.cli;
+    locate_cli(provider.cli, provider.install_dirs)
+}
+
+fn locate_cli(cli: &str, install_dirs: &[(&str, &str)]) -> Result<Executable, Failure> {
     let mut directories = search_path();
     #[cfg(windows)]
     let path_end = directories.len();
     directories.extend(
-        provider
-            .install_dirs
+        install_dirs
             .iter()
             .filter_map(|(key, subdir)| absolute_env(key).map(|root| root.join(subdir))),
     );
@@ -135,6 +137,20 @@ fn locate(provider: &Provider) -> Result<Executable, Failure> {
             format!("Could not find {cli} on PATH or in its install directories."),
         ))
     })
+}
+
+/// A shared account read also works for the calling client's own CLI.
+pub async fn locate_for_usage(
+    cli: &'static str,
+    install_dirs: &'static [(&'static str, &'static str)],
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<Executable, DiscoveryError> {
+    let lookup = tokio::task::spawn_blocking(move || locate_cli(cli, install_dirs));
+    wait_for(lookup, cancel, Some(deadline))
+        .await?
+        .expect("CLI lookup worker finished")
+        .map_err(DiscoveryError::from)
 }
 
 struct Located {

@@ -30,7 +30,10 @@ fn expand(shim: &Path, search: &[PathBuf]) -> Result<Executable, Failure> {
     let unsupported = || {
         Failure::new(
             FailureKind::UnsupportedLauncher,
-            format!("Cannot follow batch launcher {}.", shim.display()),
+            format!(
+                "Cannot follow batch launcher {}. Proxenos checks only the batch wrapper's shape and rejects .cmd or .bat wrappers whose own lines use control flow or unrecognized syntax (such as vendor installers with staged-update hooks like cursor-agent.cmd); it does not inspect the body of a .ps1 script that a recognized wrapper forwards to. If a native .exe exists for that CLI, point PATH at its directory ahead of the shim.",
+                shim.display()
+            ),
         )
     };
     let source = fs::read_to_string(shim).map_err(|_| unsupported())?;
@@ -165,6 +168,7 @@ fn expand(shim: &Path, search: &[PathBuf]) -> Result<Executable, Failure> {
                 .map(|root| root.join("System32/WindowsPowerShell/v1.0/powershell.exe"))
                 .filter(|path| path.is_file())
                 .ok_or_else(unsupported)?;
+            // Only the batch wrapper's shape is checked; the .ps1 body is passed uninspected.
             // Preserve the shim's PowerShell policy flags exactly as supplied.
             let mut prefix: Vec<_> = words[1..words.len() - 1]
                 .iter()

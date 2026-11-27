@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ use crate::mcp::Activity;
 use crate::platform;
 use crate::providers::{self, Provider};
 use crate::state;
-use crate::supervise::{Ending, StartError};
+use crate::supervise::{Ending, StartError, write_stdin};
 
 const REPORT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -484,20 +484,6 @@ async fn read_response(
     }
 }
 
-async fn write_stdin(writer: &mut Option<io::PipeWriter>, payload: String) -> io::Result<()> {
-    let mut pipe = writer.take().expect("stdin is open");
-    let (pipe, result) = tokio::task::spawn_blocking(move || {
-        let result = pipe
-            .write_all(payload.as_bytes())
-            .and_then(|()| pipe.flush());
-        (pipe, result)
-    })
-    .await
-    .expect("handshake stdin writer finished");
-    *writer = Some(pipe);
-    result
-}
-
 async fn run_handshake(
     command: &Path,
     args: &[String],
@@ -507,22 +493,25 @@ async fn run_handshake(
     let deadline = Instant::now() + limit;
     let tokio_deadline = tokio::time::Instant::from_std(deadline);
 
-    let (stdin_reader, stdin_writer) = io::pipe().map_err(HandshakeError::Io)?;
     let mut cmd = Command::new(command);
-    cmd.args(args)
-        .stdin(stdin_reader)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // Spawn via D6's platform layer under the same deadline so the child runs in its own Unix
     // session/process group or Windows kill-on-close job and descendants are stopped too.
     let launched = tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
-        platform::spawn(cmd, &mut files, None, activity, || {
-            (Instant::now() < deadline)
-                .then_some(())
-                .ok_or(StartError::Skipped(Ending::TimedOut))
-        })
+        platform::spawn(
+            cmd,
+            platform::Input::Piped,
+            &mut files,
+            None,
+            activity,
+            || {
+                (Instant::now() < deadline)
+                    .then_some(())
+                    .ok_or(StartError::Skipped(Ending::TimedOut))
+            },
+        )
     });
     let spawned = tokio::time::timeout_at(tokio_deadline, launched)
         .await
@@ -539,7 +528,7 @@ async fn run_handshake(
         let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
     });
     let mut reader = BufReader::new(stdout);
-    let mut stdin = Some(stdin_writer);
+    let mut stdin = child.stdin.take();
 
     let exchange = async {
         let init_req = json!({
