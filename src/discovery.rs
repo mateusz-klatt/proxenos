@@ -31,6 +31,8 @@ pub struct Executable {
 pub struct DiscoveryError {
     pub failure: Failure,
     pub diagnostic: Option<String>,
+    pub redacted: bool,
+    pub scanned: bool,
 }
 
 pub enum CliStatus {
@@ -82,6 +84,8 @@ impl From<Failure> for DiscoveryError {
         Self {
             failure,
             diagnostic: None,
+            redacted: false,
+            scanned: false,
         }
     }
 }
@@ -320,7 +324,7 @@ async fn probe(
         env_remove: crate::delegation::env_remove(),
         deadline: deadline.map_or(limit, |call| call.min(limit)),
         memory_limit_bytes: None,
-        capture_limit: 2048,
+        capture_limit: crate::envelope::CAPTURE_LIMIT,
         temporary_files: Vec::new(),
     };
     let outcome = supervise::run(launch, cancel, activity)
@@ -347,14 +351,11 @@ async fn probe(
         Ending::Exited
             if outcome.code == Some(0) && outcome.stdout.total + outcome.stderr.total > 0 =>
         {
-            let version = [&outcome.stdout.bytes, &outcome.stderr.bytes]
+            let version = [&outcome.stdout, &outcome.stderr]
                 .into_iter()
-                .filter_map(|bytes| {
-                    let text = String::from_utf8_lossy(bytes);
-                    text.lines()
-                        .map(str::trim)
-                        .find(|line| !line.is_empty())
-                        .map(str::to_owned)
+                .filter_map(|stream| {
+                    let raw = String::from_utf8_lossy(&stream.bytes);
+                    crate::envelope::probe_version_excerpt(&raw, 2048, stream.truncated())
                 })
                 .next()
                 .unwrap_or_default();
@@ -362,11 +363,13 @@ async fn probe(
         }
         _ => {
             let detail = if outcome.stderr.bytes.is_empty() {
-                &outcome.stdout.bytes
+                &outcome.stdout
             } else {
-                &outcome.stderr.bytes
+                &outcome.stderr
             };
-            let diagnostic = String::from_utf8_lossy(detail).trim().to_owned();
+            let raw = String::from_utf8_lossy(&detail.bytes);
+            let (diagnostic, redacted) =
+                crate::envelope::diagnostic_excerpt(raw.trim(), 2048, detail.truncated());
             let status = exit_description(outcome.code, outcome.signal);
             Err(DiscoveryError {
                 failure: Failure::new(
@@ -377,6 +380,8 @@ async fn probe(
                     ),
                 ),
                 diagnostic: (!diagnostic.is_empty()).then_some(diagnostic),
+                redacted,
+                scanned: true,
             })
         }
     }

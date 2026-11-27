@@ -105,6 +105,7 @@ impl Envelope {
     }
 
     pub async fn excerpt(&mut self, archive: &AnswerArchive) {
+        self.redact_report();
         if let Some(mut content) = self.report.content.take() {
             let no_turn_failure = self.report.failure.is_none();
             self.retain(archive, "content", &mut content, no_turn_failure)

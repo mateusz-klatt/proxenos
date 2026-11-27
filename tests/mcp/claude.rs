@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::common::{Server, WAIT, text};
-use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_failure, call};
+use crate::provider_support::{
+    AUTHENTICATION_DIAGNOSTIC, AUTHENTICATION_FAILURE_MESSAGE, Fleet, assert_observed_failure,
+    assert_reported_failure, call,
+};
 
 const START_OK: &str = include_str!("../fixtures/claude/captured-start-ok.stdout.json");
 const RESUME_OK: &str = include_str!("../fixtures/claude/captured-resume-ok.stdout.json");
@@ -758,7 +761,15 @@ fn claude_classifies_captured_and_synthetic_errors_and_ignores_error_text_in_ans
         &not_logged_in,
         Some(("abnormal_exit", "exit code 1")),
         "authentication",
-        "Not logged in",
+        AUTHENTICATION_FAILURE_MESSAGE,
+    );
+    assert_eq!(
+        not_logged_in["reported"]["diagnostic"], AUTHENTICATION_DIAGNOSTIC,
+        "{not_logged_in}"
+    );
+    assert!(
+        !not_logged_in.to_string().contains("Not logged in"),
+        "{not_logged_in}"
     );
 
     // 3. Captured bogus resume stderr (exit 1, empty stdout).
@@ -786,8 +797,8 @@ fn claude_classifies_captured_and_synthetic_errors_and_ignores_error_text_in_ans
     // 7-10. Quota without reset, 401 status, authentication_error type, content refusal.
     for (label, kind, detail) in [
         ("7", "quota", "Credit balance"),
-        ("8", "authentication", "Session token rejected"),
-        ("9", "authentication", "Rejected credentials"),
+        ("8", "authentication", AUTHENTICATION_FAILURE_MESSAGE),
+        ("9", "authentication", AUTHENTICATION_FAILURE_MESSAGE),
         ("10", "refusal", "content filtering policy"),
     ] {
         let result = call(&mut server, "claude", json!({"prompt": label}));
@@ -823,7 +834,16 @@ fn claude_classifies_captured_and_synthetic_errors_and_ignores_error_text_in_ans
 
     // 11c. Non-success subtype without errors classifies from stderr instead of agent draft text.
     let draft_stderr = call(&mut server, "claude", json!({"prompt": "11c"}));
-    assert_reported_failure(&draft_stderr, None, "authentication", "401 Unauthorized");
+    assert_reported_failure(
+        &draft_stderr,
+        None,
+        "authentication",
+        AUTHENTICATION_FAILURE_MESSAGE,
+    );
+    assert!(
+        !draft_stderr.to_string().contains("401 Unauthorized"),
+        "{draft_stderr}"
+    );
     assert!(draft_stderr["reported"]["failure"]["reset_at"].is_null());
 
     // 12-14. Error reason fallback chain (stderr -> subtype -> generic).
@@ -847,7 +867,16 @@ fn claude_classifies_captured_and_synthetic_errors_and_ignores_error_text_in_ans
 
     // 16-17. Empty result with classified stderr vs empty stderr.
     let empty_auth = call(&mut server, "claude", json!({"prompt": "16"}));
-    assert_reported_failure(&empty_auth, None, "authentication", "401 Unauthorized");
+    assert_reported_failure(
+        &empty_auth,
+        None,
+        "authentication",
+        AUTHENTICATION_FAILURE_MESSAGE,
+    );
+    assert!(
+        !empty_auth.to_string().contains("401 Unauthorized"),
+        "{empty_auth}"
+    );
     let empty_plain = call(&mut server, "claude", json!({"prompt": "17"}));
     assert_reported_failure(&empty_plain, None, "unknown", "empty result");
 
@@ -857,7 +886,11 @@ fn claude_classifies_captured_and_synthetic_errors_and_ignores_error_text_in_ans
         &stderr_auth,
         Some(("abnormal_exit", "exit code 1")),
         "authentication",
-        "401 Unauthorized",
+        AUTHENTICATION_FAILURE_MESSAGE,
+    );
+    assert!(
+        !stderr_auth.to_string().contains("401 Unauthorized"),
+        "{stderr_auth}"
     );
 
     // 19. Non-JSON stdout with exit 0.

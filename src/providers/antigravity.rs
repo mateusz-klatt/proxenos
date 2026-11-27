@@ -135,7 +135,6 @@ fn response(bytes: &[u8]) -> Option<Value> {
 }
 
 const SIGN_IN_PROMPT: &str = "Authentication required. Please visit the URL to log in";
-const SIGN_IN_DIAGNOSTIC: &str = "agy is not signed in. Run `agy` to sign in. The CLI's sign-in output was omitted because it contains a one-time login URL.";
 
 fn authentication_failure() -> Failure {
     Failure::new(FailureKind::Authentication, "Antigravity requires sign-in")
@@ -174,6 +173,7 @@ fn classify(message: &str, from_json: bool) -> Option<Failure> {
             let start = lower.find(marker)? + marker.len();
             Some(message[start..].trim().trim_end_matches('.').to_owned())
         });
+        failure.reset_at_from_text = failure.reset_at.is_some();
     }
     Some(failure)
 }
@@ -193,15 +193,7 @@ fn turn_failure(error: Option<&str>, stderr: &str) -> Option<Failure> {
 
 fn parse(finished: &Finished, _log: &str, expected: Option<&str>) -> Report {
     let stderr = String::from_utf8_lossy(&finished.stderr.bytes);
-    let mut report = parse_report(response(&finished.stdout.bytes), &stderr, expected);
-    if report
-        .failure
-        .as_ref()
-        .is_some_and(|failure| failure.kind == FailureKind::Authentication)
-    {
-        report.diagnostic = Some(SIGN_IN_DIAGNOSTIC.to_owned());
-    }
-    report
+    parse_report(response(&finished.stdout.bytes), &stderr, expected)
 }
 
 fn parse_report(value: Option<Value>, stderr: &str, expected: Option<&str>) -> Report {
@@ -228,7 +220,6 @@ fn parse_report(value: Option<Value>, stderr: &str, expected: Option<&str>) -> R
         return report;
     }
     if id_matches {
-        report.content = text("response").map(String::from);
         report.model = text("model")
             .filter(|s| is_valid_model(s))
             .map(|s| s.trim().to_owned());
@@ -244,15 +235,20 @@ fn parse_report(value: Option<Value>, stderr: &str, expected: Option<&str>) -> R
             };
             Failure::new(FailureKind::Unknown, reason)
         }));
-    } else if report.content.is_none() {
-        report.failure = Some(turn_failure(None, stderr).unwrap_or_else(|| {
-            Failure::new(
-                FailureKind::Unknown,
-                "Antigravity returned an empty response",
-            )
-        }));
     } else {
-        report.completed = true;
+        // Failed Antigravity turns omit `reported.content` (matching the other providers) so
+        // `ERROR` records carrying sign-in prompts in `response` never surface or archive.
+        report.content = text("response").map(String::from);
+        if report.content.is_none() {
+            report.failure = Some(turn_failure(None, stderr).unwrap_or_else(|| {
+                Failure::new(
+                    FailureKind::Unknown,
+                    "Antigravity returned an empty response",
+                )
+            }));
+        } else {
+            report.completed = true;
+        }
     }
     report
 }

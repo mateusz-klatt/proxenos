@@ -100,6 +100,72 @@ fn nonempty(value: &str) -> Option<&str> {
     (!value.trim().is_empty()).then_some(value)
 }
 
+const MAX_RESET_TIMESTAMP_LEN: usize = 40;
+const MIN_EPOCH_DIGITS: usize = 10;
+
+fn two_digits(bytes: &[u8]) -> Option<u8> {
+    match bytes {
+        [a @ b'0'..=b'9', b @ b'0'..=b'9'] => Some((a - b'0') * 10 + (b - b'0')),
+        _ => None,
+    }
+}
+
+fn is_valid_reset_timestamp(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_RESET_TIMESTAMP_LEN {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    // An all-digit reset is an epoch in seconds or milliseconds, so it has at least ten digits.
+    // A shorter number has the shape of a numeric device code and is not trusted as a timestamp.
+    if bytes.iter().all(u8::is_ascii_digit) {
+        return bytes.len() >= MIN_EPOCH_DIGITS;
+    }
+    // Strict RFC 3339 datetime: YYYY-MM-DDTHH:MM:SS[.digits](Z|+HH:MM|-HH:MM).
+    if bytes.len() < 20
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+    let (Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        two_digits(&bytes[5..7]),
+        two_digits(&bytes[8..10]),
+        two_digits(&bytes[11..13]),
+        two_digits(&bytes[14..16]),
+        two_digits(&bytes[17..19]),
+    ) else {
+        return false;
+    };
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return false;
+    }
+    let mut rest = &bytes[19..];
+    if let Some(after_dot) = rest.strip_prefix(b".") {
+        let frac_len = after_dot.iter().take_while(|b| b.is_ascii_digit()).count();
+        if frac_len == 0 {
+            return false;
+        }
+        rest = &after_dot[frac_len..];
+    }
+    match rest {
+        [b'Z'] => true,
+        [b'+' | b'-', h1, h2, b':', m1, m2] => {
+            two_digits(&[*h1, *h2]).is_some_and(|h| h <= 23)
+                && two_digits(&[*m1, *m2]).is_some_and(|m| m <= 59)
+        }
+        _ => false,
+    }
+}
+
 // The backend sometimes serializes its error object into the event's message.
 // Only CLI diagnostic channels reach this classifier, never agent text or tool results.
 fn diagnostic(raw: &str) -> Failure {
@@ -121,14 +187,23 @@ fn diagnostic(raw: &str) -> Failure {
     };
     let mut failure = Failure::new(kind, message);
     if kind == FailureKind::Quota {
+        // Drop invalid `error.resets_at` strings unconditionally rather than keeping them as
+        // text-derived resets, so a bare token there cannot survive even in an untainted report.
         let reset = match &error["resets_at"] {
-            Value::Number(timestamp) => Some(timestamp.to_string()),
-            value => value.as_str().map(str::to_owned),
+            Value::Number(timestamp) if is_valid_reset_timestamp(&timestamp.to_string()) => {
+                Some(timestamp.to_string())
+            }
+            Value::String(value) if is_valid_reset_timestamp(value) => Some(value.clone()),
+            _ => None,
         };
-        failure.reset_at = reset.or_else(|| {
-            let (_, when) = message.rsplit_once("try again at ")?;
-            nonempty(when.trim_end_matches('.')).map(str::to_owned)
-        });
+        if let Some(reset) = reset {
+            failure.reset_at = Some(reset);
+        } else {
+            failure.reset_at = message
+                .rsplit_once("try again at ")
+                .and_then(|(_, when)| nonempty(when.trim_end_matches('.')).map(str::to_owned));
+            failure.reset_at_from_text = failure.reset_at.is_some();
+        }
     }
     failure
 }

@@ -1,7 +1,9 @@
 use serde_json::{Value, json};
 use std::path::Path;
 
-use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_failure, call};
+use crate::provider_support::{
+    AUTHENTICATION_FAILURE_MESSAGE, Fleet, assert_observed_failure, assert_reported_failure, call,
+};
 
 const FINISHED: &str = include_str!("../fixtures/codex/finished.jsonl");
 const EMPTY: &str = include_str!("../fixtures/codex/empty.jsonl");
@@ -339,7 +341,7 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
             backend(401, json!({"message":"Session expired"})),
             "authentication",
             None,
-            "Session expired",
+            AUTHENTICATION_FAILURE_MESSAGE,
         ),
         (
             backend(
@@ -348,7 +350,7 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
             ),
             "authentication",
             None,
-            "Invalid credentials",
+            AUTHENTICATION_FAILURE_MESSAGE,
         ),
         (
             backend(
@@ -391,7 +393,7 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
             ),
             "authentication",
             None,
-            "401 Unauthorized",
+            AUTHENTICATION_FAILURE_MESSAGE,
         ),
     ];
     let mut script: Vec<_> = cases
@@ -418,8 +420,9 @@ fn codex_classifies_diagnostics_without_treating_a_status_or_a_model_answer_as_q
         &stderr,
         Some(("abnormal_exit", "exit code 1")),
         "authentication",
-        "401 Unauthorized",
+        AUTHENTICATION_FAILURE_MESSAGE,
     );
+    assert!(!stderr.to_string().contains("401 Unauthorized"), "{stderr}");
     fleet.assert_steps_remaining("codex", 1);
     let answer = call(&mut server, "codex", json!({"prompt":"check"}));
     assert_eq!(answer["observed"]["state"], "finished", "{answer}");

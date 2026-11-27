@@ -108,6 +108,12 @@ impl Drop for Fleet {
 }
 
 pub const AUTHENTICATION_FAILURE_MESSAGE: &str = "The provider reported that it is not signed in.";
+pub const AUTHENTICATION_DIAGNOSTIC: &str = "The provider CLI is not signed in. Its sign-in output was omitted because it can contain one-time login URLs or codes.";
+pub const WITHHELD_FAILURE_MESSAGE: &str = "The provider's failure text was withheld because it may contain sign-in material; run the CLI directly to see it.";
+pub const WITHHELD_DIAGNOSTIC: &str = "The provider CLI's diagnostic output was withheld because it may contain sign-in material; run the CLI directly to see it.";
+pub const WITHHELD_OBSERVED_FAILURE_MESSAGE: &str = "Failure details were withheld because they matched a sign-in or secret pattern; check the configuration and environment directly.";
+pub const WITHHELD_SESSION_SAVE_MESSAGE: &str = "Session-save failure details were withheld because they may contain sign-in or secret material; inspect the state directory directly.";
+pub const WITHHELD_PROBE_VERSION: &str = "Provider version output was withheld because it may contain sign-in material; run the CLI directly to see it.";
 
 #[track_caller]
 pub fn assert_observed_failure(envelope: &Value, kind: &str, detail: &str) {
@@ -179,20 +185,26 @@ pub fn assert_reported_failure(
     let message = envelope["reported"]["failure"]["message"]
         .as_str()
         .unwrap_or_else(|| panic!("missing reported failure message in envelope: {envelope}"));
-    assert!(
-        !message.is_empty() && message.contains(reported_detail),
-        "expected reported failure message to contain {reported_detail:?}: {envelope}"
-    );
-    assert_eq!(envelope["failure"]["kind"], reported_kind, "{envelope}");
-    assert_eq!(envelope["failure"]["source"], "reported", "{envelope}");
     let top_message = envelope["failure"]["message"]
         .as_str()
         .unwrap_or_else(|| panic!("missing top-level failure message in envelope: {envelope}"));
     if reported_kind == "authentication" {
+        assert_eq!(message, AUTHENTICATION_FAILURE_MESSAGE, "{envelope}");
         assert_eq!(top_message, AUTHENTICATION_FAILURE_MESSAGE, "{envelope}");
+        assert_eq!(
+            envelope["reported"]["diagnostic"], AUTHENTICATION_DIAGNOSTIC,
+            "{envelope}"
+        );
+        assert_eq!(envelope["observed"]["redacted"], true, "{envelope}");
     } else {
+        assert!(
+            !message.is_empty() && message.contains(reported_detail),
+            "expected reported failure message to contain {reported_detail:?}: {envelope}"
+        );
         assert_eq!(top_message, message, "{envelope}");
     }
+    assert_eq!(envelope["failure"]["kind"], reported_kind, "{envelope}");
+    assert_eq!(envelope["failure"]["source"], "reported", "{envelope}");
     assert_eq!(
         envelope["failure"].get("reset_at"),
         envelope["reported"]["failure"].get("reset_at"),

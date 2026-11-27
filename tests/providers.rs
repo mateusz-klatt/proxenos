@@ -26,6 +26,8 @@ mod grok;
 #[path = "mcp/kimi.rs"]
 mod kimi;
 mod provider_support;
+#[path = "mcp/redact.rs"]
+mod redact;
 #[path = "mcp/sessions.rs"]
 mod sessions;
 #[path = "mcp/usage.rs"]

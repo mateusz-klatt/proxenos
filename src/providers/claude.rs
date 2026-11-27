@@ -334,6 +334,7 @@ fn classify(message: &str, api_status: Option<u64>, api_type: Option<&str>) -> O
                 let when = message[start..].trim().trim_end_matches('.');
                 nonempty(when).map(str::to_owned)
             });
+        failure.reset_at_from_text = failure.reset_at.is_some();
     }
     Some(failure)
 }

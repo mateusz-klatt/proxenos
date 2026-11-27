@@ -261,6 +261,8 @@ impl Registry {
             Ok(exe) => exe,
             Err(error) => {
                 result.report.diagnostic = error.diagnostic;
+                result.report.diagnostic_redacted = error.redacted;
+                result.report.diagnostic_scanned = error.scanned;
                 return Err(error.failure);
             }
         };
@@ -311,12 +313,22 @@ impl Registry {
             if result.report.thread_id.is_none() {
                 result.report.thread_id = prior_thread;
             }
+            let turn_failed = finished.code != Some(0)
+                || !result.report.completed
+                || result.report.failure.is_some();
+            if turn_failed && (finished.stdout.truncated() || finished.stderr.truncated()) {
+                result.report.from_truncated_capture = true;
+            }
             if (finished.code != Some(0) || !result.report.completed)
                 && !finished.stderr.bytes.is_empty()
-                && result.report.diagnostic.is_none()
+                && !result
+                    .report
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == FailureKind::Authentication)
             {
-                let diagnostic = &finished.stderr.bytes[..finished.stderr.bytes.len().min(2048)];
-                result.report.diagnostic = Some(String::from_utf8_lossy(diagnostic).into_owned());
+                result.report.diagnostic =
+                    Some(String::from_utf8_lossy(&finished.stderr.bytes).into_owned());
             }
             match finished.ending {
                 #[cfg(unix)]
@@ -457,12 +469,8 @@ impl Registry {
                 )
                 .await;
                 if let Err(failure) = saved {
-                    result.session_save_failure(&failure);
-                    write_diagnostic(format!(
-                        "could not save session settings: {}",
-                        failure.message
-                    ))
-                    .await;
+                    let message = result.session_save_failure(failure);
+                    write_diagnostic(format!("could not save session settings: {message}")).await;
                 }
             }
             break Ok(());

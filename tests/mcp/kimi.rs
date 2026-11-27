@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::common::{Server, WAIT, text};
-use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_failure, call};
+use crate::provider_support::{
+    AUTHENTICATION_DIAGNOSTIC, AUTHENTICATION_FAILURE_MESSAGE, Fleet, assert_observed_failure,
+    assert_reported_failure, call,
+};
 
 const CAPTURED_START: &str = include_str!("../fixtures/kimi/captured-start.stdout.jsonl");
 const CAPTURED_REPLY: &str = include_str!("../fixtures/kimi/captured-reply.stdout.jsonl");
@@ -654,7 +657,20 @@ fn kimi_joins_messages_requires_completion_and_confirms_session_id() {
     fleet.assert_steps_remaining("kimi", 6);
 
     let no_answer_auth = call(&mut server, "kimi", json!({"prompt": "silent auth"}));
-    assert_reported_failure(&no_answer_auth, None, "authentication", "401 Unauthorized");
+    assert_reported_failure(
+        &no_answer_auth,
+        None,
+        "authentication",
+        AUTHENTICATION_FAILURE_MESSAGE,
+    );
+    assert_eq!(
+        no_answer_auth["reported"]["diagnostic"], AUTHENTICATION_DIAGNOSTIC,
+        "{no_answer_auth}"
+    );
+    assert!(
+        !no_answer_auth.to_string().contains("401 Unauthorized"),
+        "{no_answer_auth}"
+    );
     fleet.assert_steps_remaining("kimi", 5);
 
     // Reply receiving a foreign session ID or missing session ID fails and never leaks or archives content.
@@ -805,7 +821,7 @@ fn kimi_classifies_captured_and_synthetic_errors_without_misclassifying_answers(
             "kimi",
             json!({"prompt": "missing login"}),
             "authentication",
-            "/login to sign in",
+            AUTHENTICATION_FAILURE_MESSAGE,
             None,
         ),
         (
@@ -832,7 +848,7 @@ fn kimi_classifies_captured_and_synthetic_errors_without_misclassifying_answers(
             "kimi",
             json!({"prompt": "raw auth"}),
             "authentication",
-            "401 Unauthorized",
+            AUTHENTICATION_FAILURE_MESSAGE,
             None,
         ),
         (

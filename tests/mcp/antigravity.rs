@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::common::Server;
-use crate::provider_support::{Fleet, assert_observed_failure, assert_reported_failure, call};
+use crate::provider_support::{
+    AUTHENTICATION_DIAGNOSTIC, AUTHENTICATION_FAILURE_MESSAGE, Fleet, assert_observed_failure,
+    assert_reported_failure, call,
+};
 
 const FINISHED: &str = include_str!("../fixtures/antigravity/finished.json");
 const PRINT_TIMEOUT: &str = include_str!("../fixtures/antigravity/timeout.json");
@@ -12,7 +15,6 @@ const CAPTURED_AUTH_FAILED: &str =
     include_str!("../fixtures/antigravity/captured-auth-failed.stdout.json");
 const ID: &str = "paper-crane";
 const SIGN_IN_PROMPT: &str = "Authentication required. Please visit the URL to log in:";
-const SIGN_IN_DIAGNOSTIC: &str = "agy is not signed in. Run `agy` to sign in. The CLI's sign-in output was omitted because it contains a one-time login URL.";
 
 fn failed_json(error: &str) -> String {
     json!({"status": "ERROR", "response": "", "error": error}).to_string()
@@ -24,12 +26,13 @@ fn assert_sign_in_failure(result: &Value) {
         result,
         Some(("abnormal_exit", "exit code 1")),
         "authentication",
-        "Antigravity requires sign-in",
+        AUTHENTICATION_FAILURE_MESSAGE,
     );
     assert_eq!(
-        result["reported"]["diagnostic"], SIGN_IN_DIAGNOSTIC,
+        result["reported"]["diagnostic"], AUTHENTICATION_DIAGNOSTIC,
         "{result}"
     );
+    assert_eq!(result["observed"]["redacted"], true, "{result}");
 }
 
 fn store(fleet: &Fleet) -> PathBuf {
@@ -352,7 +355,7 @@ fn print_status_and_permission_diagnostics_classify_only_the_failed_turn() {
         (
             Some(("abnormal_exit", "exit code 1")),
             "authentication",
-            "Antigravity requires sign-in",
+            AUTHENTICATION_FAILURE_MESSAGE,
         ),
         (
             Some(("abnormal_exit", "exit code 1")),
@@ -758,6 +761,10 @@ fn only_authentication_replaces_stderr_with_fixed_sign_in_diagnostic() {
     );
     assert_eq!(
         other_failure["reported"]["diagnostic"], stderr,
+        "{other_failure}"
+    );
+    assert_eq!(
+        other_failure["observed"]["redacted"], false,
         "{other_failure}"
     );
     fleet.assert_steps_remaining("agy", 0);

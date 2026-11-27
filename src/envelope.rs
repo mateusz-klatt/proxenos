@@ -1,8 +1,10 @@
 //! D2 wire result. A CLI can supply the fields in `reported` only.
 
 mod content;
+mod redact;
 
 pub use content::{AnswerArchive, CAPTURE_LIMIT};
+pub(crate) use redact::{diagnostic_excerpt, probe_version_excerpt};
 
 use std::time::Instant;
 
@@ -108,6 +110,8 @@ pub struct Failure {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<String>,
+    #[serde(skip)]
+    pub reset_at_from_text: bool,
 }
 
 impl Failure {
@@ -116,6 +120,7 @@ impl Failure {
             kind,
             message: message.into(),
             reset_at: None,
+            reset_at_from_text: false,
         }
     }
 }
@@ -126,6 +131,8 @@ pub struct Envelope {
     observed_failure: Option<Failure>,
     observed: Value,
     pub report: Report,
+    report_redacted: bool,
+    redacted: bool,
     attempts: Vec<Value>,
     accounting: Option<Accounting>,
     not_claimed: &'static [&'static str],
@@ -144,6 +151,8 @@ impl Envelope {
             state: "finished",
             observed_failure: None,
             report: Report::default(),
+            report_redacted: false,
+            redacted: false,
             attempts: Vec::new(),
             accounting: None,
             not_claimed: provider.not_claimed,
@@ -155,7 +164,8 @@ impl Envelope {
                 "failure": null,
                 "passed": null,
                 "access_mechanism": null,
-                "accounting": null
+                "accounting": null,
+                "redacted": false
             }),
         }
     }
@@ -218,8 +228,12 @@ impl Envelope {
         self.observed["git"][when] = value;
     }
 
-    pub fn session_save_failure(&mut self, failure: &Failure) {
-        self.observed["session_save_failure"] = json!(failure);
+    pub fn session_save_failure(&mut self, mut failure: Failure) -> String {
+        if redact::redact_session_save_failure(&mut failure) {
+            self.redacted = true;
+        }
+        self.observed["session_save_failure"] = json!(&failure);
+        failure.message
     }
 
     pub fn fail(&mut self, failure: Failure) {
@@ -247,7 +261,21 @@ impl Envelope {
             .map(|observed| TopLevelFailure::new(observed, FailureSource::Observed))
     }
 
+    pub(super) fn redact_report(&mut self) {
+        if !self.report_redacted {
+            self.redacted |= redact::redact_report(&mut self.report);
+            self.report_redacted = true;
+        }
+    }
+
     pub fn finalize(mut self) -> (&'static str, Value) {
+        self.redact_report();
+        if let Some(failure) = &mut self.observed_failure
+            && redact::redact_observed_failure(failure)
+        {
+            self.redacted = true;
+            self.observed["failure"] = json!(&*failure);
+        }
         if self.report.failure.is_some() && self.state == "finished" {
             self.state = "failed";
             self.observed["state"] = json!(self.state);
@@ -255,6 +283,7 @@ impl Envelope {
         self.observed["duration_ms"] = json!(self.elapsed().as_millis());
         self.observed["attempts"] = json!(self.attempts);
         self.observed["accounting"] = json!(self.accounting);
+        self.observed["redacted"] = json!(self.redacted);
         let mut not_claimed = BASE_NOT_CLAIMED.to_vec();
         not_claimed.extend_from_slice(self.not_claimed);
         not_claimed.extend_from_slice(self.access_not_claimed);
@@ -303,6 +332,7 @@ pub fn panic_envelope(provider: &str, message: String) -> Value {
             "passed": null,
             "access_mechanism": null,
             "accounting": null,
+            "redacted": false,
             "attempts": [],
         },
         "reported": Report::default(),
