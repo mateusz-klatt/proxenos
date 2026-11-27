@@ -100,6 +100,9 @@ pub trait Service: Send + Sync + 'static {
         cancel: CancellationToken,
         activity: Activity,
     ) -> impl Future<Output = Result<ToolOutcome, UnknownTool>> + Send + 'static;
+
+    /// Optional JSON-RPC `error.data` for a panicking tool call.
+    fn panic_data(&self, name: &str, message: &str) -> Option<Value>;
 }
 
 /// How serving ended.
@@ -440,10 +443,10 @@ impl<S: Service> ServerHandler for Handler<S> {
         };
         cancel_on_drop.disarm();
         let outcome = joined.map_err(|_| {
-            ErrorData::internal_error(
-                format!("The {name} tool failed unexpectedly; the server is still running."),
-                None,
-            )
+            let message =
+                format!("The {name} tool failed unexpectedly; the server is still running.");
+            let data = self.service.panic_data(&name, &message);
+            ErrorData::internal_error(message, data)
         })??;
         let content = vec![ContentBlock::text(outcome.text)];
         let result = if outcome.is_error {

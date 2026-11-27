@@ -155,6 +155,14 @@ impl Registry {
             background: Background::new(),
         }
     }
+
+    fn provider_for(&self, name: &str) -> Option<(&'static providers::Provider, bool)> {
+        let bare = name.strip_suffix("-reply").unwrap_or(name);
+        providers::ALL
+            .iter()
+            .find(|p| p.name == bare && bare != self.client.name())
+            .map(|provider| (provider, bare != name))
+    }
 }
 
 impl Service for Registry {
@@ -184,18 +192,19 @@ impl Service for Registry {
         if name == "cancel" {
             return Ok(self.background.call_cancel(&arguments));
         }
-        let bare = name.strip_suffix("-reply").unwrap_or(&name);
-        if let Some(provider) = providers::ALL
-            .iter()
-            .find(|p| p.name == bare && bare != self.client.name())
-        {
+        if let Some((provider, reply)) = self.provider_for(&name) {
             return Ok(self
-                .delegate(provider, bare != name, arguments, cancel, activity)
+                .delegate(provider, reply, arguments, cancel, activity)
                 .await);
         }
         extra_call(&name, &arguments, &cancel, activity, &self.background)
             .await
             .ok_or(UnknownTool)
+    }
+
+    fn panic_data(&self, name: &str, message: &str) -> Option<Value> {
+        self.provider_for(name)
+            .map(|_| crate::envelope::panic_summary(message))
     }
 }
 

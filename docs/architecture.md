@@ -100,7 +100,10 @@ having run a turn is a failure.
 A client should read the top-level `failure` to determine whether and why a delegation failed;
 `observed` and `reported` are for diagnosis. The same rule applies to results delivered by `await`
 for `wait: false` calls, and a panicked background task yields a top-level `failure` with kind
-`unknown` and source `observed`.
+`unknown` and source `observed`. Only a tool result carries the full D2 envelope. At the MCP error
+boundary, a panicked foreground delegation returns JSON-RPC `-32603` with the
+`{"schema_version": 1, "failure": {"kind": "unknown", "message", "source": "observed"}}` summary
+in `error.data`, while other protocol-level errors carry no D2 summary.
 
 | Priority | Condition | Top-level `failure` | `source` |
 |---|---|---|---|

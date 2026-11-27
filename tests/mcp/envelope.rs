@@ -1,6 +1,7 @@
 //! D2 top-level `failure` precedence, `authentication` fixed message, and `await` delivery.
 
 use std::fs;
+use std::path::Path;
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -186,6 +187,18 @@ fn top_level_failure_covers_authentication_across_all_six_providers_and_exit_zer
     }
 }
 
+fn wait_for_ready(path: &Path) {
+    let until = Instant::now() + WAIT;
+    while !path.exists() {
+        assert!(
+            Instant::now() < until,
+            "stub never created {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn timeout_while_report_is_non_empty_selects_observed_timeout_over_reported_failure() {
     let fleet = Fleet::new(&["agy"]);
@@ -225,11 +238,7 @@ fn timeout_while_report_is_non_empty_selects_observed_timeout_over_reported_fail
         "antigravity",
         json!({"prompt": "hang with error report", "timeout_ms": 1_500}),
     );
-    let until = Instant::now() + WAIT;
-    while !ready_err.exists() {
-        assert!(Instant::now() < until, "timed stub 1 never reached ready");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    wait_for_ready(&ready_err);
     let timed_err: Value = serde_json::from_str(text(&server.response(10))).unwrap();
     assert_eq!(timed_err["observed"]["state"], "failed", "{timed_err}");
     assert_eq!(
@@ -260,11 +269,7 @@ fn timeout_while_report_is_non_empty_selects_observed_timeout_over_reported_fail
         "antigravity",
         json!({"prompt": "hang with content report", "timeout_ms": 1_500}),
     );
-    let until = Instant::now() + WAIT;
-    while !ready_ok.exists() {
-        assert!(Instant::now() < until, "timed stub 2 never reached ready");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    wait_for_ready(&ready_ok);
     let timed_ok: Value = serde_json::from_str(text(&server.response(11))).unwrap();
     assert_observed_failure(&timed_ok, "timeout", "exceeded the call's deadline");
     assert_eq!(
@@ -282,6 +287,8 @@ fn timeout_while_report_is_non_empty_selects_observed_timeout_over_reported_fail
 #[test]
 fn wait_false_calls_collected_through_await_carry_top_level_failure() {
     let fleet = Fleet::new(&["agy", "claude"]);
+    let go_ok = fleet.root.join("bg-ok.go");
+    let ready_auth = fleet.root.join("bg-auth.ready");
     let ready_timeout = fleet.root.join("bg-timeout.ready");
     let quota_json = json!({
         "conversation_id": "paper-crane",
@@ -294,14 +301,14 @@ fn wait_false_calls_collected_through_await_carry_top_level_failure() {
     fleet.script(
         "agy",
         json!([
-            {"stdout": AGY_FINISHED},
+            {"stdout": AGY_FINISHED, "wait_for": go_ok},
             {"stdout": quota_json, "ready": ready_timeout, "sleep_ms": 60_000}
         ]),
     );
     fleet.script(
         "claude",
         json!([
-            {"stdout": CLAUDE_NOT_LOGGED_IN, "code": 1},
+            {"stdout": CLAUDE_NOT_LOGGED_IN, "ready": ready_auth, "code": 1},
             {"stdout": CLAUDE_QUOTA, "code": 0}
         ]),
     );
@@ -329,12 +336,15 @@ fn wait_false_calls_collected_through_await_carry_top_level_failure() {
         "claude",
         json!({"prompt": "auth", "wait": false}),
     );
+    // Gate the second Claude background call on the first having consumed step 0 from claude.steps.
+    wait_for_ready(&ready_auth);
     let h_quota = start_bg(
         &mut server,
         12,
         "claude",
         json!({"prompt": "quota", "wait": false}),
     );
+    fs::write(&go_ok, []).unwrap();
 
     let awaited_first = server.call(
         13,
@@ -369,11 +379,7 @@ fn wait_false_calls_collected_through_await_carry_top_level_failure() {
         "antigravity",
         json!({"prompt": "timeout", "wait": false, "timeout_ms": 1_500}),
     );
-    let until = Instant::now() + WAIT;
-    while !ready_timeout.exists() {
-        assert!(Instant::now() < until, "bg timeout stub never started");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    wait_for_ready(&ready_timeout);
     let awaited_timeout = server.call(
         15,
         "await",
