@@ -608,6 +608,8 @@ fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
     assert!(panic_result["reported"].is_object(), "{awaited}");
     assert!(panic_result["not_claimed"].is_array(), "{awaited}");
     assert!(panic_result["observed"]["attempts"].is_array(), "{awaited}");
+    // The panic text is Proxenos's own fixed sentence, so the detector finds nothing to withhold.
+    assert_eq!(panic_result["observed"]["redacted"], false, "{awaited}");
     assert_eq!(
         panic_result["observed"]["failure"]["kind"], "unknown",
         "{awaited}"

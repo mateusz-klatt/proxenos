@@ -651,8 +651,10 @@ roster therefore needs no release. A user adds a role by adding a file.
 - What `refresh` generated and what the user wrote are kept apart, and `refresh` replaces only
   the first. An overlay carries a schema version and the time it was generated, so that an old
   one does not hide a newer catalogue in the binary without `doctor` saying so.
-- Proxenos chooses no model. On a start it passes the model that the call names, or else the one
-  that the user's own overlay sets for that provider, and otherwise none. A CLI that is given no
+- Proxenos chooses no model. On a start it passes the model that the call names, and otherwise
+  none. The catalogue overlay is not implemented yet (`catalog` is listed as unimplemented in the
+  status banner). Once it exists, a model that the user's own overlay sets for a provider will be
+  passed when the call names none. A CLI that is given no
   model runs its own default or refuses to start, and Proxenos chooses for it in neither case. A
   reply follows D19. The result shows what was passed and, where the provider reports it, which
   model ran (D2).
@@ -1440,8 +1442,8 @@ scope of Iris claims.
   its arguments. A nested Proxenos started that way sees no marker and accepts the call. Nor can
   the guard stop a nested call made through a different delegator that does not check these
   variables.
-- On a start, when neither the call nor the user's overlay names a model, Proxenos passes none
-  (D8); replies follow D19. The provider's CLI then runs its own default or refuses to start. Proxenos does not choose that
+- On a start, when the call names no model, Proxenos passes none (D8; the catalogue overlay
+  is not implemented yet); replies follow D19. The provider's CLI then runs its own default or refuses to start. Proxenos does not choose that
   default, and it can change with a release of the CLI or with the user's configuration of it. A
   model that is named is a request: the result names the one that ran only where the provider
   reports it.
@@ -1457,8 +1459,9 @@ scope of Iris claims.
 
 ## 5. Not yet known
 
-- Whether Codex passes Proxenos's environment variables to the MCP servers it starts. If it
-  filters them, the depth guard needs them named in its registration.
+- Whether naming the depth markers in the Codex registration (`proxenos integrate codex`) makes
+  Codex pass them to the Proxenos it starts. Codex 0.172.0 leaves them out of a stdio MCP server's
+  environment by default (section 4), so today a Proxenos nested under Codex does not see them.
 - How Grok and Cursor treat a Claude Code plugin they load by themselves, and whether that offers
   them their own provider.
 - How the seven clients run several tool calls from one message, and how long each lets one call

@@ -323,7 +323,7 @@ pub fn panic_summary(message: &str) -> Value {
 /// Builds a D2 failure envelope when a background delegation task unwinds on panic.
 pub fn panic_envelope(provider: &str, message: String) -> Value {
     let mut failure = Failure::new(FailureKind::Unknown, message);
-    redact::redact_observed_failure(&mut failure);
+    let redacted = redact::redact_observed_failure(&mut failure);
     let top_failure = TopLevelFailure::new(&failure, FailureSource::Observed);
     json!({
         "schema_version": 1,
@@ -335,7 +335,7 @@ pub fn panic_envelope(provider: &str, message: String) -> Value {
             "passed": null,
             "access_mechanism": null,
             "accounting": null,
-            "redacted": false,
+            "redacted": redacted,
             "attempts": [],
         },
         "reported": Report::default(),
