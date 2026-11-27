@@ -337,7 +337,7 @@ impl Child {
             } else {
                 #[cfg(feature = "test-tools")]
                 if let Some(marker) = std::env::var_os("PROXENOS_TEST_EPERM_WAIT_MARKER") {
-                    let _ = std::fs::write(marker, []);
+                    let _ = tokio::fs::write(marker, []).await;
                 }
                 // The outcome of the bounded wait is not needed: the exited() check below decides,
                 // and if waitid failed during the wait, that check reports the error.
