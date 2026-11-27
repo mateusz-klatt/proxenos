@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::sync::Mutex;
@@ -16,6 +16,12 @@ mod session;
 const BURN_WALL_LIMIT_MS: u64 = 30_000;
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
+    // In comparison tests the stub stands in for Node. Its sole argument is the bridge file.
+    if let Some(script) = std::env::args_os().nth(1).map(std::path::PathBuf::from)
+        && script.ends_with("server/codex/index.js")
+    {
+        return initialize_peer(&script);
+    }
     if let Some(directory) = std::env::var_os("PROXENOS_STUB_DIR") {
         return replay(Path::new(&directory));
     }
@@ -92,6 +98,42 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Reply with the fixture's wire bytes and record the complete client conversation at EOF.
+fn initialize_peer(script: &Path) -> Result<ExitCode, Box<dyn Error>> {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        reply: String,
+        #[serde(default)]
+        after_eof_bytes: u64,
+        #[serde(default)]
+        exit_code: u8,
+    }
+    let fixture: Fixture = serde_json::from_slice(&fs::read(script)?)?;
+    let mut input = io::stdin().lock();
+    let mut transcript = String::new();
+    input.read_line(&mut transcript)?;
+    let mut output = io::stdout().lock();
+    output.write_all(fixture.reply.as_bytes())?;
+    output.flush()?;
+    input.read_to_string(&mut transcript)?;
+    let cwd = std::env::current_dir()?;
+    let record = serde_json::json!({
+        "input": transcript, "script": script.display().to_string(),
+        "cwd": cwd, "home": std::env::var("HOME").ok(),
+        "codex": cwd.join("bin").join(format!("codex{}", std::env::consts::EXE_SUFFIX)).is_file()
+    });
+    let mut log = File::options()
+        .create(true)
+        .append(true)
+        .open(script.with_extension("log"))?;
+    writeln!(log, "{record}")?;
+    io::copy(
+        &mut io::repeat(b' ').take(fixture.after_eof_bytes),
+        &mut output,
+    )?;
+    Ok(ExitCode::from(fixture.exit_code))
 }
 
 /// Record only test inputs. Provider credentials from the surrounding environment never enter

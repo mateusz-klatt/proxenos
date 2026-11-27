@@ -42,8 +42,14 @@ name = "proxenos-stub"
 path = "src/proxenos-stub.rs"
 required-features = ["test-tools"]
 
+# A developer tool for replaying the migration comparison in D12.
+[[bin]]
+name = "compare_init"
+path = "src/compare_init.rs"
+required-features = ["test-tools"]
+
 [features]
-# Extra tools that exist only to test the MCP layer through the compiled binary.
+# Tools for exercising the MCP layer and its migration comparison through compiled binaries.
 test-tools = []
 
 [lints.rust]
