@@ -339,10 +339,9 @@ impl Child {
                 if let Some(marker) = std::env::var_os("PROXENOS_TEST_EPERM_WAIT_MARKER") {
                     let _ = std::fs::write(marker, []);
                 }
-                let _ = tokio::time::timeout(MACOS_EPERM_GRACE, self.wait_for_leader_exit())
-                    .await
-                    .ok()
-                    .transpose()?;
+                // The outcome of the bounded wait is not needed: the exited() check below decides,
+                // and if waitid failed during the wait, that check reports the error.
+                let _ = tokio::time::timeout(MACOS_EPERM_GRACE, self.wait_for_leader_exit()).await;
                 self.exited()?
             }
         } else {
