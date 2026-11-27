@@ -319,22 +319,16 @@ fn a_call_that_outlasts_the_stop_limit_makes_serving_fail() {
     let (mut server, _) = Server::initialized("2025-11-25");
     server.start_call(1, "test_wait", json!({ "ms": 60_000, "linger_ms": 60_000 }));
     server.wait_for_stderr("test_wait: started");
-    let closed = Instant::now();
+    let deadline = Instant::now() + common::EXIT_WAIT;
     server.close_input();
-    let (status, _) = server.wait_for_exit(common::EXIT_WAIT);
-    let took = closed.elapsed();
-    assert_eq!(status.code(), Some(1));
-    assert!(took < Duration::from_secs(12), "exit took {took:?}");
+    let watchdog_ms =
+        server.wait_for_stderr_u64("proxenos test watchdog elapsed_ms=", 1, common::EXIT_WAIT);
+    let (status, _) = server.wait_for_exit(deadline.saturating_duration_since(Instant::now()));
     let stderr = server.stderr();
-    let watchdog_ms: u64 = stderr
-        .lines()
-        .find_map(|line| line.strip_prefix("proxenos test watchdog elapsed_ms="))
-        .unwrap_or_else(|| panic!("watchdog did not report elapsed time: {stderr}"))
-        .parse()
-        .unwrap();
+    assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(
-        watchdog_ms >= 9_900,
-        "watchdog expired too early: {watchdog_ms} ms"
+        (9_900..12_000).contains(&watchdog_ms),
+        "watchdog slept {watchdog_ms} ms, expected 9900–11999 ms"
     );
     assert!(stderr.contains("did not finish within 10 s"), "{stderr}");
     assert!(!stderr.contains("test_wait: done"), "{stderr}");

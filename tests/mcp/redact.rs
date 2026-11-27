@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -1291,78 +1291,106 @@ fn answer_content_containing_urls_codes_and_secrets_is_unchanged() {
 #[test]
 fn adversarial_four_mib_diagnostics_complete_in_linear_time() {
     let fleet = Fleet::new(&["agy"]);
-    let rejected_parens_url = format!(
-        "https://example.invalid/{}{}",
-        "a".repeat((2 << 20) - 32),
-        ")]".repeat(1 << 20)
-    );
-    let auth_parens_url = format!(
-        "https://example.invalid/login?{}{}",
-        "a".repeat((2 << 20) - 128),
-        ")]".repeat((1 << 20) - 64)
-    );
-    let http_fragments = format!(
-        "{}{} https://auth.example.invalid/login",
-        "http://".repeat(550_000),
-        "http://a#".repeat(10_000),
-    );
-    assert!(rejected_parens_url.len() > 3_900_000);
-    assert!(auth_parens_url.len() > 3_900_000);
-    assert!(http_fragments.len() > 3_900_000);
+    let mut command = fleet.command("claude");
+    command.env("PROXENOS_TEST_REDACTION_TIMING", "1");
+    let mut server = Server::start_command(command);
+    server.initialize("2025-11-25");
+    server.request(1, "tools/list", json!({}));
+    let mut measurement = 0;
 
-    let auth_json_err = json!({
-        "status": "ERROR",
-        "response": "",
-        "error": auth_parens_url
-    })
-    .to_string();
-
-    fleet.script(
-        "agy",
-        json!([
-            {"stderr": rejected_parens_url, "code": 2},
-            {"stdout": auth_json_err, "code": 1},
-            {"stderr": http_fragments, "code": 2},
-        ]),
-    );
-    let mut server = fleet.server("claude");
-
-    for (label, expect_redacted) in [
-        ("rejected URL with 2M parens/brackets", false),
-        ("auth URL with 2M parens/brackets", true),
-        ("4 MiB http:// and fragment runs", true),
+    let scales = [1, 4];
+    let parens_url = |path, scale| {
+        format!(
+            "https://example.invalid/{path}{}{}",
+            "a".repeat(((1 << 19) - 32) * scale),
+            ")]".repeat(((1 << 18) - 16) * scale)
+        )
+    };
+    for (label, payloads, stream, code, expect_redacted) in [
+        (
+            "rejected URL with parens/brackets",
+            scales.map(|scale| parens_url("", scale)),
+            "stderr",
+            2,
+            false,
+        ),
+        (
+            "auth URL with parens/brackets",
+            scales.map(|scale| {
+                json!({"status": "ERROR", "response": "", "error": parens_url("login?", scale)})
+                    .to_string()
+            }),
+            "stdout",
+            1,
+            true,
+        ),
+        (
+            "http:// and fragment runs",
+            scales.map(|scale| {
+                format!(
+                    "{}{} https://auth.example.invalid/login",
+                    "http://".repeat(137_500 * scale),
+                    "http://a#".repeat(2_500 * scale),
+                )
+            }),
+            "stderr",
+            2,
+            true,
+        ),
     ] {
-        let started = Instant::now();
-        let result = call(&mut server, "antigravity", json!({"prompt": label}));
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "{label} took {:?} (expected < 2s)",
-            elapsed
-        );
-        assert_eq!(result["observed"]["redacted"], expect_redacted, "{label}");
-        if expect_redacted {
-            if result["reported"]["failure"].is_object() {
+        assert!((3_900_000..=(4 << 20)).contains(&payloads[1].len()));
+        let mut timings = [[0; 3]; 2];
+        // Alternate sizes and take medians to limit the effect of transient scheduler delays.
+        for sample in 0..3 {
+            for (payload, times) in payloads.iter().zip(&mut timings) {
+                fleet.script("agy", json!([{(stream): payload, "code": code}]));
+                let result = call(&mut server, "antigravity", json!({"prompt": label}));
+                let observed = &result["observed"];
+                let attempt = &observed["attempts"][0];
+                assert_eq!(attempt["exit_code"], code, "{result}");
                 assert_eq!(
-                    result["reported"]["failure"]["message"], WITHHELD_FAILURE_MESSAGE,
+                    attempt[format!("{stream}_captured")],
+                    payload.len(),
                     "{result}"
                 );
-                assert!(result["observed"]["failure_file"].is_null(), "{result}");
-                assert!(!result.to_string().contains("login?"), "{result}");
-            } else {
-                assert_eq!(
-                    result["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC,
-                    "{result}"
+                assert_eq!(observed["redacted"], expect_redacted, "{label}: {result}");
+                if stream == "stdout" {
+                    assert_eq!(
+                        result["reported"]["failure"]["message"], WITHHELD_FAILURE_MESSAGE,
+                        "{result}"
+                    );
+                    assert!(observed["failure_file"].is_null(), "{result}");
+                    assert!(!result.to_string().contains("login?"), "{result}");
+                } else if expect_redacted {
+                    assert_eq!(
+                        result["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC,
+                        "{result}"
+                    );
+                    assert!(
+                        !result.to_string().contains("auth.example.invalid"),
+                        "{result}"
+                    );
+                }
+                measurement += 1;
+                times[sample] = server.wait_for_stderr_u64(
+                    "proxenos test redaction elapsed_us=",
+                    measurement,
+                    WAIT,
                 );
-                assert!(
-                    !result.to_string().contains("auth.example.invalid"),
-                    "{result}"
-                );
+                fleet.assert_steps_remaining("agy", 0);
             }
         }
+        for times in &mut timings {
+            times.sort_unstable();
+        }
+        let [[_, small, _], [_, large, _]] = timings;
+        // Four times the input costs about four times as much for a linear scan, or sixteen
+        // times as much for a quadratic scan. Allow for one tick of microsecond rounding.
+        assert!(
+            large > 0 && large < 8 * small.max(1),
+            "{label} expected a positive measurement and less than 8× growth: {timings:?} µs"
+        );
     }
-
-    fleet.assert_steps_remaining("agy", 0);
 }
 
 #[test]

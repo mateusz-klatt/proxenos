@@ -264,7 +264,18 @@ impl Envelope {
 
     pub(super) fn redact_report(&mut self) {
         if !self.report_redacted {
+            // The timing test measures the scan independently of CLI replay and response I/O.
+            #[cfg(feature = "test-tools")]
+            let started =
+                std::env::var_os("PROXENOS_TEST_REDACTION_TIMING").map(|_| Instant::now());
             self.redacted |= redact::redact_report(&mut self.report);
+            #[cfg(feature = "test-tools")]
+            if let Some(started) = started {
+                eprintln!(
+                    "proxenos test redaction elapsed_us={}",
+                    started.elapsed().as_micros()
+                );
+            }
             self.report_redacted = true;
         }
     }
