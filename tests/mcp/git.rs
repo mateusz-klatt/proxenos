@@ -230,6 +230,8 @@ fn git_omits_an_unsupported_object_format_without_affecting_the_call() {
 
 const GATE_WAIT: &str = "git lookup waiting on test gate";
 const EARLY_LOOKUP_BOUND: Duration = Duration::from_millis(1500);
+const ORDINARY_LOOKUP_MIN: Duration = Duration::from_millis(1900);
+const ORDINARY_LOOKUP_MAX: Duration = Duration::from_millis(3500);
 
 struct GateLock(Option<fs::File>);
 
@@ -305,13 +307,15 @@ fn stalled_git_lookup_can_be_cancelled_or_timed_out_and_is_reused_after_release(
         assert_ne!(reply["result"]["isError"], true, "{reply}");
         serde_json::from_str(text(&reply)).unwrap()
     };
+    // Start timing before sending the background call so a missing cancellation arm cannot
+    // hide behind the delay before `GATE_WAIT` is observed on stderr.
+    let cancel_started = Instant::now();
     let started = control(
         &mut gated.server,
         "antigravity",
         json!({"prompt": "cancel", "wait": false}),
     );
     gated.server.wait_for_stderr(GATE_WAIT);
-    let cancel_started = Instant::now();
     let handle = started["handle"].as_str().unwrap();
     let cancelled = control(&mut gated.server, "cancel", json!({"handle": handle}));
     assert_eq!(cancelled["cancel_requested"], true, "{cancelled}");
@@ -343,11 +347,18 @@ fn stalled_git_lookup_can_be_cancelled_or_timed_out_and_is_reused_after_release(
     gated.fleet.assert_steps_remaining("agy", 2);
     gated.fleet.assert_steps_remaining("git", 4);
 
-    // An ordinary delegation can still run when the best-effort Git observation times out.
+    // An ordinary delegation can still run when the best-effort Git observation times out
+    // at the 2 s lookup cap.
+    let skipped_started = Instant::now();
     let skipped = call(
         &mut gated.server,
         "antigravity",
         json!({"prompt": "continue"}),
+    );
+    let skipped_elapsed = skipped_started.elapsed();
+    assert!(
+        skipped_elapsed >= ORDINARY_LOOKUP_MIN && skipped_elapsed < ORDINARY_LOOKUP_MAX,
+        "ordinary lookup while gated ended outside expected 2 s cap window: {skipped_elapsed:?}"
     );
     assert_eq!(skipped["reported"]["content"], "without Git", "{skipped}");
     assert!(skipped["observed"]["git"].is_null());
