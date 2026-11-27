@@ -249,6 +249,11 @@ fn replay(root: &Path) -> Result<ExitCode, Box<dyn Error>> {
     if let Some(wait) = step["wait_for"].as_str() {
         wait_for_file(wait)?;
     }
+    #[cfg(unix)]
+    if let Some(ready) = step["exit_on_term"].as_str() {
+        platform::ignore_term();
+        platform::await_term(ready)?;
+    }
     thread::sleep(Duration::from_millis(
         step["sleep_ms"].as_u64().unwrap_or(0),
     ));
