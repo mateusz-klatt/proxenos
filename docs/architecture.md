@@ -119,12 +119,17 @@ and `observed.session_save_failure` filtered before recording and writing Proxen
 
 - When `reported.failure.kind` is `authentication`, both `reported.failure.message` and top-level
   `failure.message` (when `source` is `"reported"`) become the fixed sentence `"The provider
-  reported that it is not signed in."`, `reported.content` is omitted (failed turns across all six
-  providers, including Antigravity `ERROR` records, omit `reported.content`), the raw stderr
-  fallback into `reported.diagnostic` is skipped, and `reported.diagnostic` becomes the unified
-  provider-neutral sentence `"The provider CLI is not signed in. Its sign-in output was omitted
-  because it can contain one-time login URLs or codes."` (replacing Antigravity's earlier
-  provider-specific sign-in diagnostic).
+  reported that it is not signed in."`, `reported.content` is omitted (whenever a provider reports
+  `reported.failure` across the six adapters, including Antigravity `ERROR` records and
+  `authentication`, it does not populate `reported.content`), the raw stderr fallback into
+  `reported.diagnostic` is skipped, and `reported.diagnostic` becomes the unified provider-neutral
+  sentence `"The provider CLI is not signed in. Its sign-in output was omitted because it can
+  contain one-time login URLs or codes."` (replacing Antigravity's earlier provider-specific
+  sign-in diagnostic). By contrast, when a provider reports a completed turn without
+  `reported.failure` (for example Antigravity `status == "SUCCESS"` with a non-empty `response`)
+  and supervision later records an observed failure such as `abnormal_exit` or `timeout`, the
+  final envelope has `observed.state == "failed"` with `reported.content` (and any
+  `observed.content_file`) intact.
 - For every other failure kind (and on session-save failures), a linear-time pure-Rust heuristic
   filter replaces matches with `"[redacted]"` across `reported.failure.message`,
   `reported.failure.reset_at`, `reported.diagnostic` (including failed version-probe diagnostics),
@@ -132,32 +137,39 @@ and `observed.session_save_failure` filtered before recording and writing Proxen
   (and `failure.reset_at`), the failure archive file (`observed.failure_file`), and Proxenos's
   stderr session-save lines (`could not save session settings: ...`), as well as `doctor`
   zero-exit version-probe text:
-  - `http://` and `https://` URLs (including non-ASCII bytes in the URL body) whose path or query
-    contains `auth`, `login`, `oauth`, `device`, `token`, `code`, `session`, or `verify`
-    (case-insensitive), or that carry any query string;
+  - `http://` and `https://` URLs (including non-whitespace non-ASCII characters in the URL body,
+    terminating at any Unicode whitespace) whose path or query contains `auth`, `login`, `oauth`,
+    `device`, `token`, `code`, `session`, or `verify` (case-insensitive), or that carry any query
+    string;
   - device-code shapes (`XXXX-XXXX` 4-4 uppercase alphanumeric groups and 6–9 character uppercase
     alphanumeric codes) when `code` or `enter` appears within one short paragraph (up to 160 bytes
-    before or after, across line breaks and sentence punctuation, stopping at blank lines);
+    before or after, across line breaks and sentence punctuation, stopping at blank lines), or
+    without requiring a cue (`no-cue mode`) when the captured stream was cut at the capture limit
+    (`total > captured`);
   - well-known secret prefixes (`sk-`, `sk-ant-`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
     `github_pat_`, `xai-`, `AIza`) and `Bearer <token>` (including any opaque token of 16 or more
     characters regardless of case).
+- Excerpted diagnostics that have already been scanned before their 2 KiB truncation are tracked
+  separately (`diagnostic_scanned` vs `diagnostic_redacted`) and are never rescanned at
+  finalization, so a longer identifier cut at the 2 KiB boundary is not misclassified later.
 - `observed.redacted` records whether any text was omitted or replaced (`true` or `false`) in the
   covered fields (`reported.failure.message`, `reported.failure.reset_at`, `reported.diagnostic`,
   `observed.failure.message`, `observed.session_save_failure`, top-level `failure.message`,
   `observed.failure_file`, and Proxenos's stderr session-save lines).
 
 What this cannot do: diagnostic redaction is a heuristic filter, not a guarantee:
-- `reported.content` of successful turns (and any `observed.content_file` archive of a long
-  successful answer) is not filtered;
+- `reported.content` when populated without `reported.failure` (on finished turns, as well as on
+  turns that fail later in observed supervision such as `abnormal_exit` or `timeout`, plus any
+  `observed.content_file` archive) is not filtered;
 - `doctor` runs the same heuristic filter on version-probe output when a provider exits 0, so
   unknown sign-in prompts outside those patterns still pass through;
 - heuristics miss unknown token formats, login URLs without query strings or the listed path
   words, wrapped or encoded secrets, and sign-in prompts phrased outside these patterns;
 - over-redaction is possible (for example, `"error code EACCES"`, error codes near `"code"` or
-  `"enter"` within a short paragraph, or non-auth URLs carrying query strings can be replaced with
-  `"[redacted]"`);
+  `"enter"` within a short paragraph, non-auth URLs carrying query strings, or any device-code-shaped
+  token in a capture-truncated stream can be replaced with `"[redacted]"`);
 - provider output files on disk (including logs or session files written by the provider CLI itself,
-  as well as `observed.content_file` for successful turns) remain untouched.
+  as well as `observed.content_file` for successful provider-reported turns) remain untouched.
 
 A long answer is returned as an excerpt with the path of a file that holds what was captured, up
 to the capture limit. That file is kept apart from the child's temporary files, which D6 removes
@@ -388,9 +400,11 @@ URL) to standard error, and writes a single JSON object to standard output with 
 For a failed Antigravity turn, a classified top-level JSON `error` takes precedence. Standard
 error can establish an authentication failure when that field is absent, blank or unclassified
 and a line starts with the exact `agy` sign-in prompt above. When both the JSON error and the sign-in prompt are absent, Proxenos reads other failure kinds
-from standard error. It never classifies agent-authored `response` text, and every failed
-Antigravity turn (`status != "SUCCESS"`, including `authentication`) omits `reported.content`
-(matching the other five providers). On a non-zero exit or incomplete turn, captured standard error
+from standard error. It never classifies agent-authored `response` text, and every Antigravity
+record whose reported status is not `"SUCCESS"` (including `authentication`) or whose `response` is
+empty omits `reported.content` (matching the other five providers' handling of provider-reported
+failures; an Antigravity `SUCCESS` record paired with an observed non-zero exit or timeout still
+retains `reported.content`). On a non-zero exit or incomplete turn, captured standard error
 is redacted before truncating up to 2 KiB into `reported.diagnostic` (omitted when the turn
 classifies as `authentication`). An authentication failure uses the unified fixed
 `reported.failure.message` and provider-neutral `reported.diagnostic` text from D2 that omits the

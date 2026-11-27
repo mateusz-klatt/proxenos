@@ -44,9 +44,10 @@ pub(super) fn redact_report(report: &mut Report) -> bool {
             redacted |= filter_in_place(reset_at);
         }
     }
-    if !report.diagnostic_redacted
+    if !report.diagnostic_scanned
         && let Some(diagnostic) = &mut report.diagnostic
     {
+        report.diagnostic_scanned = true;
         redacted |= filter_in_place(diagnostic);
     }
     redacted
@@ -57,9 +58,15 @@ pub(super) fn redact_failure(failure: &mut Failure) -> bool {
 }
 
 /// Redacts `input` before truncating to at most `max_bytes` on a UTF-8 char boundary.
+/// When `capture_truncated` is `true`, device-code-shaped tokens are redacted even without an
+/// adjacent `"code"` or `"enter"` cue because the cue may have been cut at the capture limit.
 /// Returns the bounded string and whether any replacement occurred within the kept prefix.
-pub(crate) fn redact_excerpt(input: &str, max_bytes: usize) -> (String, bool) {
-    match filter_text(input) {
+pub(crate) fn redact_excerpt(
+    input: &str,
+    max_bytes: usize,
+    capture_truncated: bool,
+) -> (String, bool) {
+    match filter_text(input, !capture_truncated) {
         Some((mut filtered, first_redacted)) => {
             let kept = filtered.floor_char_boundary(max_bytes);
             filtered.truncate(kept);
@@ -73,22 +80,22 @@ pub(crate) fn redact_excerpt(input: &str, max_bytes: usize) -> (String, bool) {
 }
 
 /// Runs the heuristic redaction filter over `input` without truncation.
-pub(crate) fn redact_text(input: &str) -> Cow<'_, str> {
-    match filter_text(input) {
+pub(crate) fn redact_text(input: &str, capture_truncated: bool) -> Cow<'_, str> {
+    match filter_text(input, !capture_truncated) {
         Some((filtered, _)) => Cow::Owned(filtered),
         None => Cow::Borrowed(input),
     }
 }
 
 fn filter_in_place(text: &mut String) -> bool {
-    let Some((filtered, _)) = filter_text(text) else {
+    let Some((filtered, _)) = filter_text(text, true) else {
         return false;
     };
     *text = filtered;
     true
 }
 
-fn filter_text(input: &str) -> Option<(String, usize)> {
+fn filter_text(input: &str, require_code_cue: bool) -> Option<(String, usize)> {
     let bytes = input.as_bytes();
     let mut out: Option<(String, usize)> = None;
     let mut copied = 0;
@@ -97,13 +104,15 @@ fn filter_text(input: &str) -> Option<(String, usize)> {
     while i < bytes.len() {
         let matched = match bytes[i] {
             b's' | b'g' | b'x' => match_prefixed_secret_at(bytes, i),
-            b'A' => match_prefixed_secret_at(bytes, i).or_else(|| match_device_code_at(bytes, i)),
+            b'A' => match_prefixed_secret_at(bytes, i)
+                .or_else(|| match_device_code_at(bytes, i, require_code_cue)),
             b'b' => match_bearer_at(bytes, i),
-            b'B' => match_bearer_at(bytes, i).or_else(|| match_device_code_at(bytes, i)),
-            b'h' => match_auth_url_at(bytes, i, &mut url_reject_until),
-            b'H' => match_auth_url_at(bytes, i, &mut url_reject_until)
-                .or_else(|| match_device_code_at(bytes, i)),
-            b'C'..=b'Z' | b'0'..=b'9' => match_device_code_at(bytes, i),
+            b'B' => match_bearer_at(bytes, i)
+                .or_else(|| match_device_code_at(bytes, i, require_code_cue)),
+            b'h' => match_auth_url_at(input, i, &mut url_reject_until),
+            b'H' => match_auth_url_at(input, i, &mut url_reject_until)
+                .or_else(|| match_device_code_at(bytes, i, require_code_cue)),
+            b'C'..=b'Z' | b'0'..=b'9' => match_device_code_at(bytes, i, require_code_cue),
             _ => None,
         };
         if let Some(end) = matched {
@@ -197,7 +206,7 @@ fn match_bearer_at(bytes: &[u8], i: usize) -> Option<usize> {
         .then_some(end)
 }
 
-fn is_url_byte(b: u8) -> bool {
+fn is_ascii_url_byte(b: u8) -> bool {
     b > 0x20
         && b != 0x7f
         && !matches!(
@@ -230,7 +239,8 @@ fn has_auth_marker(path_and_query: &[u8]) -> bool {
     false
 }
 
-fn match_auth_url_at(bytes: &[u8], i: usize, reject_until: &mut usize) -> Option<usize> {
+fn match_auth_url_at(input: &str, i: usize, reject_until: &mut usize) -> Option<usize> {
+    let bytes = input.as_bytes();
     if i < *reject_until || !is_token_start(bytes, i) {
         return None;
     }
@@ -243,10 +253,7 @@ fn match_auth_url_at(bytes: &[u8], i: usize, reject_until: &mut usize) -> Option
         return None;
     };
     let scheme_end = i + scheme_len;
-    if scheme_end >= bytes.len()
-        || !is_url_byte(bytes[scheme_end])
-        || matches!(bytes[scheme_end], b'/' | b'?' | b'#')
-    {
+    if scheme_end >= bytes.len() || matches!(bytes[scheme_end], b'/' | b'?' | b'#') {
         return None;
     }
     let mut end = scheme_end;
@@ -254,26 +261,37 @@ fn match_auth_url_at(bytes: &[u8], i: usize, reject_until: &mut usize) -> Option
     let mut hash_pos = None;
     let mut parens = (0usize, 0usize);
     let mut brackets = (0usize, 0usize);
-    while end < bytes.len() && is_url_byte(bytes[end]) {
+    while end < bytes.len() {
         let b = bytes[end];
-        if b == b'#' && hash_pos.is_none() {
-            hash_pos = Some(end);
-            if !auth_start.is_some_and(|start| has_auth_marker(&bytes[start..end])) {
-                *reject_until = end;
-                return None;
+        if b < 0x80 {
+            if !is_ascii_url_byte(b) {
+                break;
             }
+            if b == b'#' && hash_pos.is_none() {
+                hash_pos = Some(end);
+                if !auth_start.is_some_and(|start| has_auth_marker(&bytes[start..end])) {
+                    *reject_until = end;
+                    return None;
+                }
+            }
+            if auth_start.is_none() && matches!(b, b'/' | b'?') {
+                auth_start = Some(end);
+            }
+            match b {
+                b'(' => parens.0 += 1,
+                b')' => parens.1 += 1,
+                b'[' => brackets.0 += 1,
+                b']' => brackets.1 += 1,
+                _ => {}
+            }
+            end += 1;
+        } else {
+            let ch = input[end..].chars().next().expect("valid UTF-8 boundary");
+            if ch.is_whitespace() {
+                break;
+            }
+            end += ch.len_utf8();
         }
-        if auth_start.is_none() && matches!(b, b'/' | b'?') {
-            auth_start = Some(end);
-        }
-        match b {
-            b'(' => parens.0 += 1,
-            b')' => parens.1 += 1,
-            b'[' => brackets.0 += 1,
-            b']' => brackets.1 += 1,
-            _ => {}
-        }
-        end += 1;
     }
     let raw_end = end;
     while end > scheme_end {
@@ -359,7 +377,7 @@ fn has_adjacent_keyword(bytes: &[u8], start: usize, end: usize) -> bool {
         || has_keyword_before_blank(bytes[end..after_max].split(|&b| b == b'\n'))
 }
 
-fn match_device_code_at(bytes: &[u8], i: usize) -> Option<usize> {
+fn match_device_code_at(bytes: &[u8], i: usize, require_cue: bool) -> Option<usize> {
     if i > 0 && is_code_word_char(bytes[i - 1]) {
         return None;
     }
@@ -368,7 +386,7 @@ fn match_device_code_at(bytes: &[u8], i: usize) -> Option<usize> {
         end += 1;
     }
     let tok = &bytes[i..end];
-    if !is_device_code_shape(tok) || !has_adjacent_keyword(bytes, i, end) {
+    if !is_device_code_shape(tok) || (require_cue && !has_adjacent_keyword(bytes, i, end)) {
         return None;
     }
     Some(end)

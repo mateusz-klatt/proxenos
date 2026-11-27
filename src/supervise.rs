@@ -92,6 +92,12 @@ pub struct Captured {
 }
 
 impl Captured {
+    pub fn truncated(&self) -> bool {
+        self.total > self.bytes.len() as u64
+    }
+}
+
+impl Captured {
     async fn read(
         &mut self,
         mut pipe: impl AsyncRead + Unpin,

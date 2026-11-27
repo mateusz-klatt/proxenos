@@ -262,6 +262,7 @@ impl Registry {
             Err(error) => {
                 result.report.diagnostic = error.diagnostic;
                 result.report.diagnostic_redacted = error.redacted;
+                result.report.diagnostic_scanned = error.scanned;
                 return Err(error.failure);
             }
         };
@@ -322,9 +323,16 @@ impl Registry {
                     .is_some_and(|failure| failure.kind == FailureKind::Authentication)
             {
                 let raw = String::from_utf8_lossy(&finished.stderr.bytes);
-                let (diagnostic, redacted) = crate::envelope::redact_excerpt(&raw, 2048);
-                result.report.diagnostic = Some(diagnostic);
-                result.report.diagnostic_redacted = redacted;
+                let capture_truncated = finished.stderr.truncated();
+                if raw.len() > 2048 || capture_truncated {
+                    let (diagnostic, redacted) =
+                        crate::envelope::redact_excerpt(&raw, 2048, capture_truncated);
+                    result.report.diagnostic = Some(diagnostic);
+                    result.report.diagnostic_redacted = redacted;
+                    result.report.diagnostic_scanned = true;
+                } else {
+                    result.report.diagnostic = Some(raw.into_owned());
+                }
             }
             match finished.ending {
                 #[cfg(unix)]

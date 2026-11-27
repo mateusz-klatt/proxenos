@@ -1055,3 +1055,172 @@ fn doctor_filters_sign_in_prompts_from_zero_exit_probes() {
         assert!(stdout.contains("[redacted]"), "{stdout}");
     }
 }
+
+#[test]
+fn capture_truncation_redacts_device_code_pulled_into_excerpt_without_cue() {
+    let fleet = Fleet::new(&["agy", "codex"]);
+
+    // A >4 MiB URL shrinks to `[redacted]`, pulling `ABCD-1234` from near the 4 MiB capture
+    // limit into the 2 KiB excerpt while its `Enter this code` cue is dropped beyond 4 MiB.
+    let capture_cut_stderr = format!(
+        "https://auth.example.invalid/login?{} ABCD-1234\n{}Enter this code",
+        "a".repeat((4 << 20) - 64),
+        "p".repeat(128),
+    );
+    assert!(capture_cut_stderr.len() > (4 << 20));
+
+    let probe_capture_cut = format!(
+        "https://probe.example.invalid/login?{} WXYZ-9876\n{}Enter this code",
+        "a".repeat((4 << 20) - 65),
+        "p".repeat(128),
+    );
+    assert!(probe_capture_cut.len() > (4 << 20));
+
+    fleet.script("agy", json!([{"stderr": capture_cut_stderr, "code": 2}]));
+    fs::write(
+        fleet.root.join("codex.version"),
+        json!({"stderr": probe_capture_cut, "code": 3}).to_string(),
+    )
+    .unwrap();
+
+    let mut server = fleet.server("claude");
+
+    let stderr_res = call(&mut server, "antigravity", json!({"prompt": "capture cut"}));
+    assert_observed_failure(&stderr_res, "abnormal_exit", "exit code 2");
+    assert_eq!(stderr_res["observed"]["redacted"], true, "{stderr_res}");
+    assert_eq!(
+        stderr_res["reported"]["diagnostic"],
+        format!("[redacted] [redacted]\n{}", "p".repeat(18)),
+        "{stderr_res}"
+    );
+    let stderr_raw = stderr_res.to_string();
+    assert!(!stderr_raw.contains("ABCD-1234"), "{stderr_raw}");
+    assert!(!stderr_raw.contains("login?"), "{stderr_raw}");
+
+    let probe_res = call(&mut server, "codex", json!({"prompt": "probe capture cut"}));
+    assert_observed_failure(&probe_res, "launch", "exit code 3");
+    assert_eq!(probe_res["observed"]["redacted"], true, "{probe_res}");
+    assert_eq!(
+        probe_res["reported"]["diagnostic"],
+        format!("[redacted] [redacted]\n{}", "p".repeat(18)),
+        "{probe_res}"
+    );
+    let probe_raw = probe_res.to_string();
+    assert!(!probe_raw.contains("WXYZ-9876"), "{probe_raw}");
+    assert!(!probe_raw.contains("login?"), "{probe_raw}");
+
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn already_scanned_truncated_diagnostic_does_not_rescan_cut_identifier() {
+    let fleet = Fleet::new(&["agy", "codex"]);
+
+    // Build ID `LONGBUILDID12345` (16 chars) sits across byte 2048 with `code:` nearby.
+    // The 2048-byte excerpt cuts it to 8 uppercase chars (`LONGBUIL`), which must not be
+    // rescanned and falsely redacted during envelope finalization.
+    let stderr_cut_id = format!(
+        "{} code: {} LONGBUILDID12345 tail",
+        "x".repeat(1994),
+        "y".repeat(38),
+    );
+    let probe_cut_id = format!(
+        "{} code: {} LONGPROBEID12345 tail",
+        "a".repeat(1994),
+        "b".repeat(38),
+    );
+    assert_eq!(stderr_cut_id.find("LONGBUILDID12345"), Some(2040));
+    assert_eq!(probe_cut_id.find("LONGPROBEID12345"), Some(2040));
+
+    fleet.script("agy", json!([{"stderr": stderr_cut_id, "code": 2}]));
+    fs::write(
+        fleet.root.join("codex.version"),
+        json!({"stderr": probe_cut_id, "code": 3}).to_string(),
+    )
+    .unwrap();
+
+    let mut server = fleet.server("claude");
+
+    let stderr_res = call(&mut server, "antigravity", json!({"prompt": "cut id"}));
+    assert_observed_failure(&stderr_res, "abnormal_exit", "exit code 2");
+    assert_eq!(stderr_res["observed"]["redacted"], false, "{stderr_res}");
+    let diag = stderr_res["reported"]["diagnostic"].as_str().unwrap();
+    assert_eq!(diag.len(), 2048);
+    assert!(diag.ends_with(" LONGBUIL"), "{diag}");
+    assert!(
+        !stderr_res.to_string().contains("[redacted]"),
+        "{stderr_res}"
+    );
+
+    let probe_res = call(&mut server, "codex", json!({"prompt": "probe cut id"}));
+    assert_observed_failure(&probe_res, "launch", "exit code 3");
+    assert_eq!(probe_res["observed"]["redacted"], false, "{probe_res}");
+    let probe_diag = probe_res["reported"]["diagnostic"].as_str().unwrap();
+    assert_eq!(probe_diag.len(), 2048);
+    assert!(probe_diag.ends_with(" LONGPROB"), "{probe_diag}");
+    assert!(!probe_res.to_string().contains("[redacted]"), "{probe_res}");
+
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn unicode_whitespace_terminates_urls_and_preserves_localized_instructions() {
+    let fleet = Fleet::new(&["agy"]);
+    let localized_stderr = concat!(
+        "認証が必要です: https://auth.example.invalid/café/login?next=1\u{3000}",
+        "再試行する前にブラウザでログインしてください。\n",
+        "通常案内: https://example.invalid/ヘルプ\u{00a0}https://login.example.invalid/oauth\u{2003}続行します。\n"
+    );
+    fleet.script("agy", json!([{"stderr": localized_stderr, "code": 2}]));
+
+    let mut server = fleet.server("claude");
+    let res = call(&mut server, "antigravity", json!({"prompt": "localized"}));
+    assert_observed_failure(&res, "abnormal_exit", "exit code 2");
+    assert_eq!(res["observed"]["redacted"], true, "{res}");
+    assert_eq!(
+        res["reported"]["diagnostic"],
+        concat!(
+            "認証が必要です: [redacted]\u{3000}",
+            "再試行する前にブラウザでログインしてください。\n",
+            "通常案内: https://example.invalid/ヘルプ\u{00a0}[redacted]\u{2003}続行します。\n"
+        )
+    );
+    let raw = res.to_string();
+    assert!(!raw.contains("auth.example.invalid"), "{raw}");
+    assert!(!raw.contains("login.example.invalid"), "{raw}");
+    assert!(!raw.contains("café"), "{raw}");
+    assert!(
+        raw.contains("再試行する前にブラウザでログインしてください。"),
+        "{raw}"
+    );
+    assert!(raw.contains("続行します。"), "{raw}");
+
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn provider_reported_success_with_observed_nonzero_exit_preserves_content() {
+    let fleet = Fleet::new(&["agy"]);
+    let success_payload = json!({
+        "conversation_id": AGY_ID,
+        "status": "SUCCESS",
+        "response": "Completed answer https://example.invalid/oauth?code=KEEP-SUCCESS"
+    })
+    .to_string();
+    fleet.script("agy", json!([{"stdout": success_payload, "code": 1}]));
+
+    let mut server = fleet.server("claude");
+    let res = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "exit 1 after success"}),
+    );
+    assert_observed_failure(&res, "abnormal_exit", "exit code 1");
+    assert_eq!(res["observed"]["redacted"], false, "{res}");
+    assert_eq!(
+        res["reported"]["content"],
+        "Completed answer https://example.invalid/oauth?code=KEEP-SUCCESS"
+    );
+
+    fleet.assert_steps_remaining("agy", 0);
+}

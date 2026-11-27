@@ -196,6 +196,8 @@ pub struct Report {
     #[serde(skip)]
     pub diagnostic_redacted: bool,
     #[serde(skip)]
+    pub diagnostic_scanned: bool,
+    #[serde(skip)]
     pub completed: bool,
     #[serde(skip)]
     pub retry_missing_final: bool,
