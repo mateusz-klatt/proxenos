@@ -101,6 +101,7 @@ fn nonempty(value: &str) -> Option<&str> {
 }
 
 const MAX_RESET_TIMESTAMP_LEN: usize = 40;
+const MIN_EPOCH_DIGITS: usize = 10;
 
 fn two_digits(bytes: &[u8]) -> Option<u8> {
     match bytes {
@@ -114,8 +115,10 @@ fn is_valid_reset_timestamp(value: &str) -> bool {
         return false;
     }
     let bytes = value.as_bytes();
+    // An all-digit reset is an epoch in seconds or milliseconds, so it has at least ten digits.
+    // A shorter number has the shape of a numeric device code and is not trusted as a timestamp.
     if bytes.iter().all(u8::is_ascii_digit) {
-        return true;
+        return bytes.len() >= MIN_EPOCH_DIGITS;
     }
     // Strict RFC 3339 datetime: YYYY-MM-DDTHH:MM:SS[.digits](Z|+HH:MM|-HH:MM).
     if bytes.len() < 20
@@ -187,7 +190,9 @@ fn diagnostic(raw: &str) -> Failure {
         // Drop invalid `error.resets_at` strings unconditionally rather than keeping them as
         // text-derived resets, so a bare token there cannot survive even in an untainted report.
         let reset = match &error["resets_at"] {
-            Value::Number(timestamp) => Some(timestamp.to_string()),
+            Value::Number(timestamp) if is_valid_reset_timestamp(&timestamp.to_string()) => {
+                Some(timestamp.to_string())
+            }
             Value::String(value) if is_valid_reset_timestamp(value) => Some(value.clone()),
             _ => None,
         };

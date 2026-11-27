@@ -657,7 +657,7 @@ fn all_six_providers_withhold_on_hit_and_preserve_verbatim_on_no_hit() {
         "Quota exceeded; Authorization: Bearer tok-frac-secret-1",
     );
     let codex_structured_digits_hit = codex_error_with_reset(
-        json!("123456"),
+        json!("1735689600123"),
         "Quota exceeded; Authorization: Bearer tok-digits-secret-2",
     );
     let codex_structured_number_hit = codex_error_with_reset(
@@ -674,6 +674,8 @@ fn all_six_providers_withhold_on_hit_and_preserve_verbatim_on_no_hit() {
     );
     let codex_invalid_resets = [
         ("ABCD-1234", "ABCD-1234"),
+        ("six-digit device code", "804216"),
+        ("nine-digit device code", "804216937"),
         ("bare-token-reset", "bare-clean-token-888"),
         (
             "too-long-timestamp",
@@ -909,7 +911,7 @@ fn all_six_providers_withhold_on_hit_and_preserve_verbatim_on_no_hit() {
             "2030-01-01T00:00:00.123456+02:00",
             "tok-frac-secret-1",
         ),
-        ("codex digit string", "123456", "tok-digits-secret-2"),
+        ("codex digit string", "1735689600123", "tok-digits-secret-2"),
         ("codex epoch number", "1735689600", "tok-num-secret-3"),
     ] {
         let res = call(&mut server, "codex", json!({"prompt": label}));
