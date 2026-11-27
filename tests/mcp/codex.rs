@@ -93,7 +93,7 @@ fn codex_starts_and_resumes_with_the_same_settings_and_exact_prompt() {
         "codex-reply",
         json!({"thread_id":THREAD,"prompt":"explain","instructions":"Different instructions"}),
     );
-    assert_observed_failure(&amended, "invalid_request", "instructions");
+    assert_observed_failure(&amended, "invalid_request", "Omit instructions on a reply");
     fleet.assert_steps_remaining("codex", 1);
     let changed = call(
         &mut server,

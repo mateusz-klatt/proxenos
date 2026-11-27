@@ -40,7 +40,7 @@ pub(super) const SPEC: Provider = Provider {
     fixed_instructions: true,
     reply_model: false,
     not_claimed: &[
-        "Project settings in the working directory (hooks, env, MCP servers) were not applied; with --print Claude Code skips workspace trust.",
+        "That project settings in the working directory (hooks, env, MCP servers) were withheld; with --print Claude Code skips workspace trust.",
     ],
     read_only_not_claimed: &[
         "Claude Code's plan mode enforced an OS sandbox, applied project or local sandbox settings, or prevented user and managed settings or permission allow-lists from interacting with it.",

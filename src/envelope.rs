@@ -310,7 +310,8 @@ impl Envelope {
 /// Builds the compact D2 `failure` summary placed in `error.data` when a foreground
 /// delegation panics before returning a tool result.
 pub fn panic_summary(message: &str) -> Value {
-    let failure = Failure::new(FailureKind::Unknown, message);
+    let mut failure = Failure::new(FailureKind::Unknown, message);
+    redact::redact_observed_failure(&mut failure);
     let top_failure = TopLevelFailure::new(&failure, FailureSource::Observed);
     json!({
         "schema_version": 1,
@@ -320,7 +321,8 @@ pub fn panic_summary(message: &str) -> Value {
 
 /// Builds a D2 failure envelope when a background delegation task unwinds on panic.
 pub fn panic_envelope(provider: &str, message: String) -> Value {
-    let failure = Failure::new(FailureKind::Unknown, message);
+    let mut failure = Failure::new(FailureKind::Unknown, message);
+    redact::redact_observed_failure(&mut failure);
     let top_failure = TopLevelFailure::new(&failure, FailureSource::Observed);
     json!({
         "schema_version": 1,

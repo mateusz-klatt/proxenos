@@ -83,24 +83,83 @@ fn both_pairs_and_shared_tools_are_listed_with_their_own_capabilities() {
 
 #[test]
 fn a_chain_that_has_used_either_bridge_stops_before_discovery() {
-    for depth in [
+    const ALL_DEPTH: [&str; 8] = [
         "PROXENOS_DEPTH",
+        "CLAUDE_DELEGATOR_CODEX_DEPTH",
         "CLAUDE_DELEGATOR_AGY_DEPTH",
+        "CLAUDE_DELEGATOR_CLAUDE_DEPTH",
+        "CLAUDE_DELEGATOR_KIMI_DEPTH",
         "CLAUDE_DELEGATOR_GROK_DEPTH",
-    ] {
-        let fleet = Fleet::new(&["codex"]);
-        let mut cmd = fleet.command("claude");
-        cmd.env(depth, "1");
+        "CLAUDE_DELEGATOR_CURSOR_DEPTH",
+        "CLAUDE_DELEGATOR_COPILOT_DEPTH",
+    ];
+    let refuse_fleet = Fleet::new(&["codex"]);
+    let assert_refused = |key: &str, value: &std::ffi::OsStr| {
+        let mut cmd = refuse_fleet.command("claude");
+        cmd.env(key, value);
         let mut server = common::Server::start_command(cmd);
         server.initialize("2025-11-25");
-        let failure = call(&mut server, "codex", json!({"prompt":"nested"}));
+        let failure = call(&mut server, "codex", json!({"prompt": "nested"}));
         assert_observed_failure(
             &failure,
             "depth_limit",
             "delegated CLI cannot start another",
         );
-        assert!(fleet.records().is_empty());
+        assert!(server.finish().0.success());
+    };
+    for depth in ALL_DEPTH {
+        for value in ["1", "yes"] {
+            assert_refused(depth, value.as_ref());
+        }
     }
+    for (depth, value) in [
+        ("PROXENOS_DEPTH", "00"),
+        ("PROXENOS_DEPTH", " 0 "),
+        ("PROXENOS_DEPTH", " "),
+        ("CLAUDE_DELEGATOR_CODEX_DEPTH", "00"),
+        ("CLAUDE_DELEGATOR_CLAUDE_DEPTH", " 0 "),
+    ] {
+        assert_refused(depth, value.as_ref());
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        assert_refused("PROXENOS_DEPTH", OsStr::from_bytes(b"\xff"));
+    }
+    assert!(refuse_fleet.records().is_empty());
+
+    let pass_fleet = Fleet::new(&["codex"]);
+    let finished = include_str!("fixtures/codex/finished.jsonl");
+    pass_fleet.script(
+        "codex",
+        json!([
+            {"stdout": finished},
+            {"stdout": finished},
+            {"stdout": finished},
+            {"stdout": finished},
+            {"stdout": finished}
+        ]),
+    );
+    let env_cases: [Vec<(&str, &str)>; 5] = [
+        Vec::new(),
+        vec![("PROXENOS_DEPTH", "0")],
+        ALL_DEPTH[1..].iter().map(|&k| (k, "0")).collect(),
+        vec![("PROXENOS_DEPTH", "")],
+        ALL_DEPTH[1..].iter().map(|&k| (k, "")).collect(),
+    ];
+    for vars in env_cases {
+        let mut cmd = pass_fleet.command("claude");
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        let mut server = common::Server::start_command(cmd);
+        server.initialize("2025-11-25");
+        let ok = call(&mut server, "codex", json!({"prompt": "allowed"}));
+        assert_eq!(ok["observed"]["state"], "finished", "{ok}");
+        assert!(server.finish().0.success());
+    }
+    pass_fleet.assert_steps_remaining("codex", 0);
 }
 
 #[test]

@@ -200,9 +200,10 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
     assert!(start["reported"]["cost_usd"].is_null());
     let not_claimed = start["not_claimed"].to_string();
     assert!(
-        not_claimed.contains("Project settings in the working directory"),
+        not_claimed.contains("That project settings in the working directory"),
         "{not_claimed}"
     );
+    assert!(not_claimed.contains("were withheld"), "{not_claimed}");
     assert!(
         not_claimed.contains("skips workspace trust"),
         "{not_claimed}"
@@ -262,7 +263,11 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
         "claude-reply",
         json!({"thread_id": SESSION_ID, "prompt": "act", "instructions": "Different"}),
     );
-    assert_observed_failure(&bad_instructions, "invalid_request", "instructions");
+    assert_observed_failure(
+        &bad_instructions,
+        "invalid_request",
+        "Omit instructions on a reply",
+    );
     fleet.assert_steps_remaining("claude", 1);
 
     let override_reply = call(
@@ -288,7 +293,11 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
     );
     let full_not_claimed = override_reply["not_claimed"].to_string();
     assert!(
-        full_not_claimed.contains("Project settings in the working directory"),
+        full_not_claimed.contains("That project settings in the working directory"),
+        "{full_not_claimed}"
+    );
+    assert!(
+        full_not_claimed.contains("were withheld"),
         "{full_not_claimed}"
     );
     assert!(
@@ -424,6 +433,21 @@ fn claude_reply_survives_server_restart_and_follows_d19_model_less_rule() {
         json!({"thread_id": CANARY_SESSION_ID, "prompt": "change", "mode": "implementation"}),
     );
     assert_observed_failure(&bad_mode, "invalid_request", "mode");
+
+    let repeated_instructions = call(
+        &mut server2,
+        "claude-reply",
+        json!({
+            "thread_id": CANARY_SESSION_ID,
+            "prompt": "repeat instructions",
+            "instructions": "If asked for the codeword, answer ZEBRA-41."
+        }),
+    );
+    assert_observed_failure(
+        &repeated_instructions,
+        "invalid_request",
+        "Omit instructions on a reply",
+    );
 
     let reply2 = call(
         &mut server2,

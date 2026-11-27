@@ -192,6 +192,8 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_cost_usd: Option<f64>,
     pub failure: Option<Failure>,
+    /// Unredacted, and possibly the full capture, until `Envelope::finalize` applies the D2
+    /// withholding rule and cuts it to 2 KiB. Never serialize a `Report` before that.
     pub diagnostic: Option<String>,
     #[serde(skip)]
     pub diagnostic_redacted: bool,
@@ -375,7 +377,7 @@ impl Provider {
                 || text("instructions")
                     .is_some_and(|s| Some(s) != settings.instructions.as_deref()))
         {
-            return Err("The CLI keeps its developer instructions for the life of the session. Start a new session to change the mode or instructions.".into());
+            return Err("The CLI keeps its developer instructions for the life of the session. Omit instructions on a reply; to change mode or instructions, start a new session.".into());
         }
         if let Some(mode) = text("mode") {
             settings.mode = mode.into();
