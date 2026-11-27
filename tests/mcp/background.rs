@@ -150,6 +150,14 @@ fn wait_false_await_before_and_after_completion_and_cancel() {
     assert_eq!(done_a["timed_out"], false);
     assert_eq!(done_a["results"][0]["state"], "finished");
     assert_eq!(
+        done_a["results"][0]["result"]
+            .as_object()
+            .unwrap()
+            .get("failure"),
+        Some(&Value::Null),
+        "{done_a}"
+    );
+    assert_eq!(
         done_a["results"][0]["result"]["reported"]["content"],
         "finished from background"
     );
@@ -212,6 +220,14 @@ fn wait_false_await_before_and_after_completion_and_cancel() {
         awaited_b["results"][0]["result"]["observed"]["failure"]["kind"],
         "cancellation"
     );
+    assert_eq!(
+        awaited_b["results"][0]["result"]["failure"]["kind"],
+        "cancellation"
+    );
+    assert_eq!(
+        awaited_b["results"][0]["result"]["failure"]["source"],
+        "observed"
+    );
     wait_until("cancelled child lock was not released", || is_free(&held_b));
 
     // A background delegation that fails stores its failed envelope.
@@ -227,6 +243,14 @@ fn wait_false_await_before_and_after_completion_and_cancel() {
     assert_eq!(
         awaited_c["results"][0]["result"]["observed"]["failure"]["kind"],
         "abnormal_exit"
+    );
+    assert_eq!(
+        awaited_c["results"][0]["result"]["failure"]["kind"],
+        "abnormal_exit"
+    );
+    assert_eq!(
+        awaited_c["results"][0]["result"]["failure"]["source"],
+        "observed"
     );
 
     // A handle belongs only to its creating server process.
@@ -364,6 +388,8 @@ fn fourth_concurrent_delegation_is_refused_as_busy_until_a_slot_frees() {
     );
     assert_eq!(busy_bg["observed"]["state"], "failed");
     assert_eq!(busy_bg["observed"]["failure"]["kind"], "busy");
+    assert_eq!(busy_bg["failure"]["kind"], "busy");
+    assert_eq!(busy_bg["failure"]["source"], "observed");
 
     let busy_fg = call(
         &mut server,
@@ -372,6 +398,8 @@ fn fourth_concurrent_delegation_is_refused_as_busy_until_a_slot_frees() {
     );
     assert_eq!(busy_fg["observed"]["state"], "failed");
     assert_eq!(busy_fg["observed"]["failure"]["kind"], "busy");
+    assert_eq!(busy_fg["failure"]["kind"], "busy");
+    assert_eq!(busy_fg["failure"]["source"], "observed");
 
     // Release one slot and await(any) until that slot completes.
     fs::write(&releases[0], []).unwrap();
@@ -562,12 +590,30 @@ fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
     assert!(!is_error, "{awaited}");
     assert_eq!(awaited["satisfied"], true);
     assert_eq!(awaited["results"][0]["state"], "failed", "{awaited}");
-    assert_eq!(
-        awaited["results"][0]["result"]["observed"]["failure"]["kind"], "unknown",
+    let panic_result = &awaited["results"][0]["result"];
+    assert_eq!(panic_result["schema_version"], 1, "{awaited}");
+    assert_eq!(panic_result["failure"]["kind"], "unknown", "{awaited}");
+    assert_eq!(panic_result["failure"]["source"], "observed", "{awaited}");
+    assert!(
+        panic_result["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed unexpectedly"),
         "{awaited}"
     );
     assert!(
-        awaited["results"][0]["result"]["observed"]["failure"]["message"]
+        panic_result["failure"].get("reset_at").is_none(),
+        "{awaited}"
+    );
+    assert!(panic_result["reported"].is_object(), "{awaited}");
+    assert!(panic_result["not_claimed"].is_array(), "{awaited}");
+    assert!(panic_result["observed"]["attempts"].is_array(), "{awaited}");
+    assert_eq!(
+        panic_result["observed"]["failure"]["kind"], "unknown",
+        "{awaited}"
+    );
+    assert!(
+        panic_result["observed"]["failure"]["message"]
             .as_str()
             .unwrap()
             .contains("failed unexpectedly"),
@@ -656,6 +702,8 @@ fn cancelled_or_expired_wait_false_request_does_not_spawn_background_delegation(
         }),
     );
     assert_eq!(timed["observed"]["failure"]["kind"], "timeout", "{timed}");
+    assert_eq!(timed["failure"]["kind"], "timeout", "{timed}");
+    assert_eq!(timed["failure"]["source"], "observed", "{timed}");
 
     server.start_call(
         50,
@@ -674,6 +722,8 @@ fn cancelled_or_expired_wait_false_request_does_not_spawn_background_delegation(
         cancelled["observed"]["failure"]["kind"], "cancellation",
         "{cancelled}"
     );
+    assert_eq!(cancelled["failure"]["kind"], "cancellation", "{cancelled}");
+    assert_eq!(cancelled["failure"]["source"], "observed", "{cancelled}");
     assert_eq!(
         fleet.records().len(),
         before,

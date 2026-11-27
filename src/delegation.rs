@@ -172,6 +172,10 @@ impl Registry {
                     let id_owned = id.to_owned();
                     let load_activity = activity.clone();
                     let found = tokio::task::spawn_blocking(move || {
+                        #[cfg(feature = "test-tools")]
+                        if std::env::var_os("PROXENOS_TEST_PANIC_SESSION_LOAD").is_some() {
+                            panic!("injected session loader panic");
+                        }
                         let found = sessions::load(p, &id_owned);
                         drop(load_activity);
                         found

@@ -131,6 +131,8 @@ fn memory_limit_is_honoured_when_under_and_triggers_memory_limit_failure_when_ex
         over["observed"]["failure"]["kind"], "memory_limit",
         "{over}"
     );
+    assert_eq!(over["failure"]["kind"], "memory_limit", "{over}");
+    assert_eq!(over["failure"]["source"], "observed", "{over}");
     assert_eq!(over["observed"]["accounting"]["memory_limit_bytes"], tight);
     assert_eq!(
         over["observed"]["accounting"]["memory_limit_exceeded"],
@@ -214,6 +216,8 @@ fn memory_limit_stop_runs_once_skips_output_read_and_beats_timeout() {
         over["observed"]["failure"]["kind"], "memory_limit",
         "memory_limit must precede timeout and capture checks: {over}"
     );
+    assert_eq!(over["failure"]["kind"], "memory_limit", "{over}");
+    assert_eq!(over["failure"]["source"], "observed", "{over}");
     assert_eq!(
         over["observed"]["accounting"]["memory_limit_exceeded"],
         true

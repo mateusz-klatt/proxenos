@@ -149,8 +149,53 @@ fn a_panicking_tool_is_answered_and_the_server_carries_on() {
             .expect("a message")
             .contains("test_panic")
     );
+    assert!(panicked["error"]["data"].is_null(), "{panicked}");
     let after = server.call(2, "test_echo", json!({ "still": "here" }));
     assert_eq!(text(&after), r#"{"still":"here"}"#);
+
+    let mut cmd = Server::command(&["mcp", "--client", "claude"]);
+    cmd.env("PROXENOS_TEST_PANIC_SESSION_LOAD", "1");
+    let mut delegation_server = Server::start_command(cmd);
+    delegation_server.initialize("2025-11-25");
+    let delegation_panic = delegation_server.call(
+        1,
+        "codex-reply",
+        json!({
+            "thread_id": "00000000-0000-4000-8000-000000000001",
+            "prompt": "trigger session loader panic",
+            "cwd": ".",
+            "access": "read-only",
+            "mode": "advisory"
+        }),
+    );
+    assert_eq!(
+        delegation_panic["error"]["code"], -32603,
+        "{delegation_panic}"
+    );
+    let message = delegation_panic["error"]["message"]
+        .as_str()
+        .expect("panic error message");
+    assert!(message.contains("codex-reply"), "{delegation_panic}");
+    assert!(
+        !message.contains("injected session loader panic"),
+        "{delegation_panic}"
+    );
+    assert_eq!(
+        delegation_panic["error"]["data"],
+        json!({
+            "schema_version": 1,
+            "failure": {
+                "kind": "unknown",
+                "message": message,
+                "source": "observed"
+            }
+        }),
+        "{delegation_panic}"
+    );
+    let still_alive = delegation_server.call(2, "test_echo", json!({ "still": "here" }));
+    assert_eq!(text(&still_alive), r#"{"still":"here"}"#);
+    let (status, _) = delegation_server.finish();
+    assert!(status.success(), "{status}");
 }
 
 #[test]
