@@ -107,6 +107,8 @@ impl Drop for Fleet {
     }
 }
 
+pub const AUTHENTICATION_FAILURE_MESSAGE: &str = "The provider reported that it is not signed in.";
+
 #[track_caller]
 pub fn assert_observed_failure(envelope: &Value, kind: &str, detail: &str) {
     let expected_state = if kind == "cancellation" {
@@ -126,6 +128,19 @@ pub fn assert_observed_failure(envelope: &Value, kind: &str, detail: &str) {
     assert!(
         envelope["reported"]["failure"].is_null(),
         "unexpected reported failure in envelope: {envelope}"
+    );
+    assert_eq!(envelope["failure"]["kind"], kind, "{envelope}");
+    assert_eq!(envelope["failure"]["source"], "observed", "{envelope}");
+    let top_message = envelope["failure"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing top-level failure message in envelope: {envelope}"));
+    assert!(
+        !top_message.is_empty() && top_message.contains(detail),
+        "expected top-level failure message to contain {detail:?}: {envelope}"
+    );
+    assert!(
+        envelope["failure"].get("reset_at").is_none(),
+        "unexpected reset_at in observed failure: {envelope}"
     );
 }
 
@@ -168,6 +183,21 @@ pub fn assert_reported_failure(
         !message.is_empty() && message.contains(reported_detail),
         "expected reported failure message to contain {reported_detail:?}: {envelope}"
     );
+    assert_eq!(envelope["failure"]["kind"], reported_kind, "{envelope}");
+    assert_eq!(envelope["failure"]["source"], "reported", "{envelope}");
+    let top_message = envelope["failure"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing top-level failure message in envelope: {envelope}"));
+    if reported_kind == "authentication" {
+        assert_eq!(top_message, AUTHENTICATION_FAILURE_MESSAGE, "{envelope}");
+    } else {
+        assert_eq!(top_message, message, "{envelope}");
+    }
+    assert_eq!(
+        envelope["failure"].get("reset_at"),
+        envelope["reported"]["failure"].get("reset_at"),
+        "{envelope}"
+    );
 }
 
 pub fn call(server: &mut Server, name: &str, args: Value) -> Value {
@@ -176,11 +206,13 @@ pub fn call(server: &mut Server, name: &str, args: Value) -> Value {
     let envelope: Value = serde_json::from_str(raw)
         .unwrap_or_else(|error| panic!("invalid JSON envelope ({error}): {answer}"));
     assert_eq!(envelope["schema_version"], 1, "{envelope}");
-    assert_eq!(
-        answer["result"]["isError"] == true,
-        envelope["observed"]["state"] != "finished",
-        "{envelope}"
+    assert!(
+        envelope.as_object().unwrap().contains_key("failure"),
+        "missing top-level failure key: {envelope}"
     );
+    let finished = envelope["observed"]["state"] == "finished";
+    assert_eq!(answer["result"]["isError"] == true, !finished, "{envelope}");
+    assert_eq!(envelope["failure"].is_null(), finished, "{envelope}");
     envelope
 }
 

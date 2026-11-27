@@ -19,6 +19,8 @@ mod content;
 mod copilot;
 #[path = "mcp/discovery.rs"]
 mod discovery;
+#[path = "mcp/envelope.rs"]
+mod envelope;
 #[path = "mcp/grok.rs"]
 mod grok;
 #[path = "mcp/kimi.rs"]

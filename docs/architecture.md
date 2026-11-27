@@ -71,12 +71,15 @@ snake_case:
 
 The answer is a JSON object sent as the text of the result, because MCP clients show a model the
 text; whether any of them also shows structured content has not been measured (section 5). It
-carries a schema version from the first release, and it keeps three kinds of statement apart:
+carries a schema version from the first release, a top-level `failure` field (`null` on success,
+otherwise `{"kind", "message", "reset_at"?, "source": "observed" | "reported"}`), and it keeps
+three kinds of statement apart:
 
 - **What Proxenos observed**: the state (finished, failed, cancelled, still running), a failure of
-  a kind it can see for itself (not found, launch, busy, timeout, cancellation, a memory limit,
-  abnormal exit), the provider, the settings requested and the settings actually passed, the
-  access mechanism Proxenos selected, the duration, the exit status, how much output there was
+  a kind it can see for itself (`not_found`, `unsupported_launcher` on Windows, `launch`, `busy`,
+  `timeout`, `cancellation`, `memory_limit`, `abnormal_exit`, `invalid_request`, `depth_limit`,
+  `capture`, or `unknown`), the provider, the settings requested and the settings actually passed,
+  the access mechanism Proxenos selected, the duration, the exit status, how much output there was
   and when the last of it arrived, memory and CPU with the way they were measured (D18), and,
   where it could look, the commit before and after and the changed and untracked paths it saw,
   also after a timeout.
@@ -86,12 +89,31 @@ carries a schema version from the first release, and it keeps three kinds of sta
   what a review concluded. Snapshots of git cannot establish who changed a path, and do not show
   every edit made during the run.
 
-A failure has a kind: not found, launch, busy, authentication, a trust prompt, a refusal, quota,
-timeout, cancellation, a memory limit, abnormal exit, or unknown. Busy is Proxenos's own answer to
-a delegation above its limit (D17); a refusal is the provider's. Authentication, a trust prompt, a
-refusal and quota are read from what the provider printed, so they are a classification and not an
-observation. Quota carries the reset time when the provider gives one. A CLI that exits with
-success without having run a turn is a failure.
+A failure has a kind: `not_found`, `unsupported_launcher` (on Windows), `launch`, `busy`,
+`timeout`, `cancellation`, `memory_limit`, `abnormal_exit`, `invalid_request`, `depth_limit`,
+`capture`, `authentication`, `refusal`, `quota`, or `unknown`. Busy is Proxenos's own answer to
+a delegation above its limit (D17); a refusal is the provider's. Authentication, refusal and quota
+are read from what the provider printed, so they are a classification and not an observation.
+Quota carries the reset time when the provider gives one. A CLI that exits with success without
+having run a turn is a failure.
+
+A client should read the top-level `failure` to determine whether and why a delegation failed;
+`observed` and `reported` are for diagnosis. The same rule applies to results delivered by `await`
+for `wait: false` calls, and a panicked background task yields a top-level `failure` with kind
+`unknown` and source `observed`.
+
+| Priority | Condition | Top-level `failure` | `source` |
+|---|---|---|---|
+| 1 | `observed.failure` prevents or interrupts the turn (`not_found`, `unsupported_launcher` on Windows, `launch`, `busy`, `invalid_request`, `depth_limit`, `timeout`, `cancellation`, `memory_limit`, or `capture`) | `observed.failure` | `"observed"` |
+| 2 | Otherwise, `reported.failure` is present (including when `observed.failure` is `abnormal_exit`) | `reported.failure` (with fixed `message` when `kind` is `authentication`) | `"reported"` |
+| 3 | Otherwise, `observed.failure` is present (`abnormal_exit` or any remaining kind) | `observed.failure` | `"observed"` |
+| 4 | Otherwise (`observed.state` is `"finished"`) | `null` | — |
+
+When the top-level `failure` comes from `reported` with kind `authentication`, its `message` is
+replaced by the fixed sentence `"The provider reported that it is not signed in."` instead of
+provider text. What this cannot do: `reported.failure` itself (and `reported.diagnostic` for
+providers other than Antigravity's sign-in handling) still carries provider text until redaction
+lands, and nothing stops a client that inspects `reported` directly from reading it there.
 
 A long answer is returned as an excerpt with the path of a file that holds what was captured, up
 to the capture limit. That file is kept apart from the child's temporary files, which D6 removes

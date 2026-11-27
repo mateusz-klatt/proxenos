@@ -89,21 +89,13 @@ impl BackgroundTask {
 impl Drop for BackgroundTask {
     fn drop(&mut self) {
         if !self.finished {
-            let failure = Failure::new(
-                FailureKind::Unknown,
+            let value = crate::envelope::panic_envelope(
+                self.provider,
                 format!(
                     "The background {} delegation failed unexpectedly; the server is still running.",
                     self.provider
                 ),
             );
-            let value = json!({
-                "schema_version": 1,
-                "observed": {
-                    "provider": self.provider,
-                    "state": "failed",
-                    "failure": failure,
-                },
-            });
             self.background
                 .complete(&self.handle, self.provider, "failed", value);
         }
