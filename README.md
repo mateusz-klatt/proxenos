@@ -7,6 +7,27 @@ the available providers over MCP and gets the answer back in the same conversati
 In a Greek city, a proxenos was a citizen who looked after the envoys of another city. This one
 looks after other agents.
 
+## Status: v0.1
+
+**What works:**
+- six providers: Claude Code, Codex CLI, Antigravity, Kimi Code, GitHub Copilot CLI and Grok Build;
+- start and reply tools for each, with remembered sessions;
+- background delegations with `await` and `cancel`;
+- process-tree supervision with resource accounting;
+- a result envelope with one top-level `failure`;
+- withholding of sign-in material from failure text;
+- `integrate` and `doctor` for Claude Code and Codex CLI;
+- `usage` for Codex subscription windows and the Cursor plan tier (Cursor reports no windows).
+
+**Not in v0.1 yet:**
+- Cursor Agent as a provider;
+- role texts and the `expert` parameter, and the model catalogue and its overlay, both described in the [architecture](docs/architecture.md);
+- `usage` for the other providers ([#48](https://github.com/mateusz-klatt/proxenos/issues/48));
+- a read-only mode for Grok ([#44](https://github.com/mateusz-klatt/proxenos/issues/44));
+- re-supplying instructions on a reply after a server restart ([#36](https://github.com/mateusz-klatt/proxenos/issues/36)).
+
+Read section 4 of the [architecture](docs/architecture.md) before relying on any guarantee. It lists what Proxenos cannot enforce. One example: a delegated CLI keeps the user's MCP servers, and no access mode limits their tools ([#46](https://github.com/mateusz-klatt/proxenos/issues/46)).
+
 ## Install from source
 
 From the repository root, build and install Proxenos with Cargo. With rustup, Cargo uses
