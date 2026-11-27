@@ -197,6 +197,39 @@ fn a_panicking_tool_is_answered_and_the_server_carries_on() {
     assert_eq!(text(&still_alive), r#"{"still":"here"}"#);
     let (status, _) = delegation_server.finish();
     assert!(status.success(), "{status}");
+
+    // A panic whose text carries sign-in material is withheld in error.data. Synthetic text,
+    // substituted through the test-tools hook because every real panic message is a fixed sentence.
+    let mut cmd = Server::command(&["mcp", "--client", "claude"]);
+    cmd.env("PROXENOS_TEST_PANIC_SESSION_LOAD", "1").env(
+        "PROXENOS_TEST_PANIC_MESSAGE",
+        "Sign in at https://login.example.invalid/device?code=ABCD-1234 to continue.",
+    );
+    let mut withheld_server = Server::start_command(cmd);
+    withheld_server.initialize("2025-11-25");
+    let withheld = withheld_server.call(
+        1,
+        "codex-reply",
+        json!({
+            "thread_id": "00000000-0000-4000-8000-000000000001",
+            "prompt": "trigger session loader panic",
+            "cwd": ".",
+            "access": "read-only",
+            "mode": "advisory"
+        }),
+    );
+    assert_eq!(withheld["error"]["code"], -32603, "{withheld}");
+    assert_eq!(
+        withheld["error"]["data"]["failure"]["message"],
+        "Failure details were withheld because they matched a sign-in or secret pattern; check the configuration and environment directly.",
+        "{withheld}"
+    );
+    assert!(
+        !withheld.to_string().contains("login.example.invalid"),
+        "{withheld}"
+    );
+    let (status, _) = withheld_server.finish();
+    assert!(status.success(), "{status}");
 }
 
 #[test]
