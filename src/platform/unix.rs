@@ -332,11 +332,19 @@ impl Child {
         // the same.
         #[cfg(target_os = "macos")]
         let eperm_exited = if result != 0 && error.raw_os_error() == Some(libc::EPERM) {
-            let _ = tokio::time::timeout(MACOS_EPERM_GRACE, self.wait_for_leader_exit())
-                .await
-                .ok()
-                .transpose()?;
-            self.exited()?
+            if self.exited()? {
+                true
+            } else {
+                #[cfg(feature = "test-tools")]
+                if let Some(marker) = std::env::var_os("PROXENOS_TEST_EPERM_WAIT_MARKER") {
+                    let _ = std::fs::write(marker, []);
+                }
+                let _ = tokio::time::timeout(MACOS_EPERM_GRACE, self.wait_for_leader_exit())
+                    .await
+                    .ok()
+                    .transpose()?;
+                self.exited()?
+            }
         } else {
             false
         };

@@ -1090,20 +1090,28 @@ mod unix_eperm_tests {
     fn injected_eperm_during_stop_recovers_when_leader_exits_within_macos_grace() {
         let fleet = Fleet::new(&["agy"]);
         let spec = fleet.root.join("eperm.spec");
+        let marker = fleet.root.join("waitid.marker");
         let timeout_ready = fleet.root.join("timeout.ready");
         let cancel_ready = fleet.root.join("cancel.ready");
         fleet.script(
             "agy",
             json!([
-                {"exit_on_term": timeout_ready, "sleep_ms": 20},
-                {"exit_on_term": cancel_ready, "sleep_ms": 20}
+                {"ready": timeout_ready, "wait_for": marker},
+                {"ready": cancel_ready, "wait_for": marker}
             ]),
         );
-        let mut server = server_with_eperm_spec(&fleet, &spec);
+        let mut command = fleet.command("claude");
+        command
+            .env("PROXENOS_TEST_KILL_GROUP_EPERM", &spec)
+            .env("PROXENOS_TEST_EPERM_WAIT_MARKER", &marker);
+        let mut server = common::Server::start_command(command);
+        server.initialize("2025-11-25");
+        server.request(1, "tools/list", json!({}));
 
-        // Timeout: EPERM is injected on SIGTERM while the leader sleeps 20 ms after receiving it
-        // (cannot be waited on immediately), then exits within MACOS_EPERM_GRACE (100 ms).
-        std::fs::write(&spec, "deliver:1").unwrap();
+        // Timeout: EPERM is injected without delivering SIGTERM; the stub stays blocked on
+        // `marker` until signal() fails its immediate exited() check and writes `marker`, then
+        // exits within MACOS_EPERM_GRACE (100 ms).
+        std::fs::write(&spec, "withhold:1").unwrap();
         server.start_call(
             2,
             "antigravity",
@@ -1114,10 +1122,12 @@ mod unix_eperm_tests {
         let timed: Value = serde_json::from_str(common::text(&server.response(2))).unwrap();
         assert_observed_failure(&timed, "timeout", "exceeded the call's deadline");
         assert_eq!(timed["observed"]["attempts"][0]["exit_code"], 0, "{timed}");
+        assert!(marker.exists(), "signal() did not write waitid marker");
         assert!(!timeout_log.exists(), "timed-out call still owns its log");
+        std::fs::remove_file(&marker).unwrap();
 
-        // Cancellation: same race through close_input cancellation.
-        std::fs::write(&spec, "deliver:1").unwrap();
+        // Cancellation: same handshake through close_input cancellation.
+        std::fs::write(&spec, "withhold:1").unwrap();
         server.start_call(3, "antigravity", json!({"prompt": "cancel"}));
         wait_until("cancelled stub did not start", || cancel_ready.exists());
         let cancel_log = log_for(&fleet, 2);
@@ -1129,6 +1139,7 @@ mod unix_eperm_tests {
             cancelled["observed"]["attempts"][0]["exit_code"], 0,
             "{cancelled}"
         );
+        assert!(marker.exists(), "signal() did not write waitid marker");
         assert!(!cancel_log.exists(), "cancelled call still owns its log");
         fleet.assert_steps_remaining("agy", 0);
         assert!(server.wait_for_exit(common::EXIT_WAIT).0.success());
