@@ -73,3 +73,71 @@ removed as appropriate.
 Record the machine and OS release, the Proxenos build commit and toolchain, the baseline
 checkout commit and dependency lock, and the Node version alongside it. A launcher hash alone
 does not identify all installed JavaScript dependencies.
+
+## Results: Windows, 2026-11-27
+
+Measured by the Windows verifier on Windows 11 Pro 10.0.26300 x86_64. The host was shared with
+a WSL session that carried a light load, a code review, during the runs. Inputs, by SHA-256:
+
+| input | identity |
+|---|---|
+| Proxenos | v0.1.0 release `proxenos.exe`, `b798a30e83dca7c878631120142fb3d55a35430bb3e2d78f1462f4e309eba6bf` |
+| claude-delegator | 3.5.1, git `56975da` (`d12_baseline_version_matches: false`; D12 names 3.5.0); `server/codex/index.js` `50118f6a298f1918f2eb5834622b4cdeec98b6df3ee8006d0f20c6cc0bb48610`; `package.json` `3feb4f57be7453a2afe9d3c94c95cff60679ed7d8299cd1ae05aa130ccf9d05a` |
+| Node | v26.12.1, `1c63f1417e2e26d83ca9a9ec1d548524ab1305bc7209d90ebca56257ff0d84ed` |
+| harness and stub | built from main `16bd004`; `proxenos-stub` `ce10b551e197674753dc510a96673ca35a074d20cc4747e92fcc1cde90b3a58b` |
+
+**Summary.**
+- Proxenos returns `initialize` about 9× sooner, using one process for six providers where
+  the baseline runs one Node process per provider. Each process has a working set about 7×
+  smaller and private memory about 4.5× smaller.
+- Process-tree cleanup left no survivors in every scenario tried.
+- The **first `tools/list` is slower**: 721 ms against 163 ms at p50. The client waits for that
+  list before it can call a tool, so this is a regression to fix, tracked in #57.
+
+### Initialize
+
+`compare_init` with 100 pairs at revision `2024-11-05`, as described above. Latency runs from
+spawn to the complete initialize response, in milliseconds.
+
+| target | ok / failed | min | p10 | p50 | p90 | max | p50 run first / second |
+|---|---|---|---|---|---|---|---|
+| Proxenos 0.1.0 | 100 / 0 | 10.2 | 10.5 | 11.1 | 12.1 | 34.7 | 11.1 / 11.2 |
+| claude-delegator 3.5.1 (Codex bridge, Node) | 100 / 0 | 94.1 | 96.8 | 101.2 | 112.4 | 157.1 | 101.5 / 100.9 |
+
+### Process cleanup (Proxenos only)
+
+The verifier used a stub `agy` that starts a grandchild process, then counted descendants
+before the event and the survivors afterwards. These runs used the verifier's own scripts,
+which are not part of this repository, so this table cannot be reproduced from the checkout
+alone.
+
+| scenario | descendants before | response | survivors after 2 s | after 10 s |
+|---|---|---|---|---|
+| `cancel` of a background handle | 3 (agy, conhost, grandchild) | cancel answered in 3 ms | 0 | 0 |
+| shutdown by closing standard input | 3 | server exited after 9 ms, code 0 | 0 | 0 |
+| `TerminateProcess` of the server alone | 3 | killed after 3 ms | 0 | 0 |
+
+The D6 Job Object kills its whole tree when its last handle closes. That covers a hard kill of
+the server too.
+
+### Footprint
+
+The verifier ran 21 sessions per target (1 cold, 20 warm), with the real `PATH` and user profile,
+then took 3 samples after 60 s idle. Same caveat as above: the verifier's own scripts.
+
+| target | tools | processes | initialize p50 / p95 | first `tools/list` p50 / p95 | private p50 | working set p50 | idle 60 s private / working set |
+|---|---|---|---|---|---|---|---|
+| Proxenos 0.1.0 | 13 | 1 | 14.4 / 16.4 ms | **721 / 758 ms** | 5.9 MiB | 8.7 MiB | 5.1 / 8.4 MiB |
+| claude-delegator Codex server | 2 | 1 (node) | 162 / 223 ms | 163 / 224 ms | 26.5 MiB | 59.4 MiB | 24.0 / 57.5 MiB |
+| claude-delegator Antigravity server | 2 | 1 (node) | 322 / 378 ms | 323 / 378 ms | 26.6 MiB | 59.4 MiB | 23.5 / 57.2 MiB |
+
+claude-delegator registers one server per provider, so seven providers mean seven Node
+processes, about 7 × 59 MiB of working set. One Proxenos process serves six providers.
+
+The first `tools/list` in Proxenos waits for D7 discovery of every installed CLI. On the same
+host, an earlier measurement on 2026-11-25, with four tools, gave about 223 ms. See #57.
+
+### What these results do not measure
+
+Provider turns, result quality, token cost, steady-state throughput, or the cost of running
+several providers at once. The cleanup and footprint tables cover Windows only.
