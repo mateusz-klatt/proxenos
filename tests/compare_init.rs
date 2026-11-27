@@ -17,10 +17,22 @@ struct Baseline(PathBuf);
 
 impl Baseline {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("comparison fixture {}", Uuid::new_v4()));
-        fs::create_dir_all(root.join("server/codex")).unwrap();
-        fs::write(root.join("package.json"), r#"{"version":"3.5.0"}"#).unwrap();
-        Self(root)
+        let root = Path::new(STUB)
+            .parent()
+            .unwrap()
+            .join(format!("comparison fixture {}", Uuid::new_v4()));
+        let baseline = Self(root);
+        fs::create_dir_all(baseline.0.join("server/codex")).unwrap();
+        fs::write(baseline.0.join("package.json"), r#"{"version":"3.5.0"}"#).unwrap();
+        // Keep the fixture peer on the build filesystem, where executables can run.
+        // Each trial hard-links STUB under a different name. macOS can kill a process
+        // at exec when Gatekeeper evaluates an executable with hard-link aliases.
+        fs::copy(STUB, baseline.node()).unwrap();
+        baseline
+    }
+
+    fn node(&self) -> PathBuf {
+        self.0.join(format!("node{}", std::env::consts::EXE_SUFFIX))
     }
 
     fn script(&self) -> PathBuf {
@@ -41,7 +53,11 @@ impl Baseline {
 
     fn command(&self) -> Command {
         let mut cmd = Command::new(BENCH);
-        cmd.arg(SERVER).arg(STUB).arg(&self.0).arg(STUB).arg("2");
+        cmd.arg(SERVER)
+            .arg(self.node())
+            .arg(&self.0)
+            .arg(STUB)
+            .arg("2");
         cmd
     }
 
@@ -88,6 +104,18 @@ fn paired_run_records_order_artifacts_and_the_initialize_only_conversation() {
         let hash = item["sha256"].as_str().unwrap();
         assert_eq!(hash.len(), 64);
         assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+    let node = &report["inputs"]["node"];
+    let stub = &report["inputs"]["stub"];
+    assert_eq!(node["sha256"], stub["sha256"]);
+    assert_ne!(node["path"], stub["path"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let node = fs::metadata(node["path"].as_str().unwrap()).unwrap();
+        let stub = fs::metadata(stub["path"].as_str().unwrap()).unwrap();
+        assert_ne!((node.dev(), node.ino()), (stub.dev(), stub.ino()));
     }
     let trials = report["trials"].as_array().unwrap();
     assert_eq!(trials.len(), 4);
@@ -264,7 +292,7 @@ fn invalid_setup_is_reported_before_a_trial_starts() {
     for pairs in ["abc", "0", "3", "1002"] {
         let out = Command::new(BENCH)
             .arg(SERVER)
-            .arg(STUB)
+            .arg(baseline.node())
             .arg(&baseline.0)
             .arg(STUB)
             .arg(pairs)
@@ -282,7 +310,7 @@ fn invalid_setup_is_reported_before_a_trial_starts() {
 fn fixture_peer_replays_wire_bytes_until_eof() {
     let baseline = Baseline::new();
     baseline.set(json!({"reply":"response\n","after_eof_bytes":3,"exit_code":7}));
-    let mut child = Command::new(STUB)
+    let mut child = Command::new(baseline.node())
         .arg(baseline.script())
         .env("HOME", &baseline.0)
         .current_dir(&baseline.0)
