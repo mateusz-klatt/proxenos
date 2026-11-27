@@ -2569,10 +2569,9 @@ mod with_stubs {
             "{with_cli_report}"
         );
 
-        // 1c. After a successful tools/list, doctor closes stdin first and waits for a server
-        // that exits 0 on EOF without sending any signal. The stub keeps default signal handling,
-        // blocks on `stdin` until EOF, sleeps briefly, and creates a marker dir before exiting 0;
-        // any premature SIGTERM/SIGKILL/job termination would kill it before the marker exists.
+        // 1c. After tools/list, doctor closes stdin and drains enough shutdown output to let
+        // the server exit on its own. The stub writes more than a pipe can buffer and creates
+        // the marker only after the write completes.
         let list_one =
             json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"codex"}]}}).to_string();
         let eof_marker = sb.root.join("exited-cleanly-on-eof");
@@ -2580,6 +2579,7 @@ mod with_stubs {
             format!("out:{init_ok}"),
             format!("out:{list_one}"),
             "stdin",
+            "flood:2097152",
             "sleep:150",
             format!("mkdir:{}", eof_marker.display()),
             "exit:0"
