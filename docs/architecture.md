@@ -315,7 +315,11 @@ What the `mcp` module has to do itself, because the library does not:
   waits on that token.
 - **Panics.** A handler that panics is never answered. Proxenos catches the panic and answers
   with an error.
-- **Identity.** The server name and version are set; the default is the library's own.
+- **Identity.** The server name, version and `icons` are set; the default is the library's own.
+  `serverInfo.icons` embeds two compact offline base64 data URIs (~1.2 KiB combined, generated at
+  build time from `assets/proxenos.svg` and the 64×64 PNG frame inside `assets/proxenos.ico`):
+  `image/svg+xml` (`sizes: ["any"]`) and `image/png` (`sizes: ["64x64"]`). Whether any of the
+  seven clients renders `serverInfo.icons` has not been measured.
 - **Batches.** The revision of 2025-03-26 requires a server to accept JSON-RPC batches, and the
   library refuses them. Proxenos does not offer that revision: a client that asks for it is
   offered 2025-11-25, which it may accept or not.
@@ -902,7 +906,12 @@ alias `auditablezigbuild` (`cargo auditable zigbuild --release --locked`, withou
 so handler panic catching (D4) stays intact. On `aarch64-pc-windows-gnullvm`, `libunwind` is linked
 explicitly for that unwind runtime. `cargo-auditable` embeds each target's linked crate graph inside
 the binary so that Syft 1.54.0 catalogs target-specific Rust crates into each archive's SPDX JSON
-SBOM. Each archive holds `proxenos` (or `proxenos.exe`), `LICENSE` and `NOTICE` with fixed
+SBOM. On Windows targets (`windows-msvc`, `windows-gnu` and `windows-gnullvm`), `build.rs` uses
+the pure-Rust COFF writer in `src/winres.rs` (no `rc.exe`, `windres`, or C compiler) to link a
+deterministic `.rsrc` object into `proxenos.exe` only (`RT_ICON` and `RT_GROUP_ICON` from
+`assets/proxenos.ico`, plus `RT_VERSION` `VS_VERSION_INFO` derived from `Cargo.toml`) before
+Authenticode signing; `proxenos-stub` and `compare_init` do not receive it. Each archive holds
+`proxenos` (or `proxenos.exe`), `LICENSE` and `NOTICE` with fixed
 `root:root` ownership and the commit timestamp. `.goreleaser.yaml` sets `release: disable: true` and
 defines no `signs:` block so a local `goreleaser release` with a personal token cannot create a
 release or sign outside the workflow.
@@ -1073,11 +1082,15 @@ Proxenos never updates itself.
 
 What this cannot do:
 
-- The macOS binary is notarized but cannot be stapled: `stapler` accepts only `.app`, `.pkg` and
-  `.dmg`, not a bare Mach-O executable. A first launch of a quarantined binary while offline may
-  therefore be unable to confirm the notarization. On a real Mac `spctl -t install` reported
-  "accepted, source=Notarized Developer ID"; `spctl -t exec` rejects any bare command-line tool as
-  "not an app", which is expected and says nothing about the signature.
+- The macOS binary is a bare Mach-O command-line executable, not an `.app` bundle: Finder shows
+  the default Unix executable icon rather than a custom Proxenos icon (custom `com.apple.ResourceFork`
+  extended attributes cannot travel inside D11's strict `ustar` tarballs and interfere with
+  bare-binary `codesign` seals). For the same reason, the macOS binary is notarized but cannot be
+  stapled: `stapler` accepts only `.app`, `.pkg` and `.dmg`, not a bare Mach-O executable. A first
+  launch of a quarantined binary while offline may therefore be unable to confirm the notarization.
+  On a real Mac `spctl -t install` reported "accepted, source=Notarized Developer ID";
+  `spctl -t exec` rejects any bare command-line tool as "not an app", which is expected and says
+  nothing about the signature.
 - Ruleset `28030033` on `main` requires a pull request and the four CI checks, but
   `required_approving_review_count` is `0`. A session holding the owner's token can open a pull
   request, wait for green checks, merge it into `main` and dispatch `release.yml`. Saying `main` is
