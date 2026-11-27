@@ -558,7 +558,7 @@ fn codex_requires_a_matching_rpc_response_and_keeps_account_errors_private() {
         ]),
     );
     let mut server = fleet.server("cursor");
-    for reason in [
+    for (i, reason) in [
         "authentication",
         "unavailable",
         "invalid_report",
@@ -568,10 +568,14 @@ fn codex_requires_a_matching_rpc_response_and_keeps_account_errors_private() {
         "capture",
         "unavailable",
         "capture",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         assert_eq!(
             usage(&mut server, json!({"providers":["codex"]})),
-            json!({"codex":{"status":"unavailable","reason":reason}})
+            json!({"codex":{"status":"unavailable","reason":reason}}),
+            "{i}: {reason}"
         );
     }
 }
