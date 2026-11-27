@@ -220,6 +220,10 @@ fn claude_starts_and_resumes_with_captured_fixtures_settings_effort_and_caveats(
         not_claimed.contains("user and managed settings or permission allow-lists"),
         "{not_claimed}"
     );
+    assert!(
+        not_claimed.contains("restricted the tools of MCP servers"),
+        "{not_claimed}"
+    );
     fleet.assert_steps_remaining("claude", 2);
 
     let reply = call(

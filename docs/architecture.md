@@ -171,10 +171,12 @@ zero-exit version-probe output are decided as single fields):
     withheld because it may contain sign-in material; run the CLI directly to see it."`;
   - `reported.failure.reset_at` (and top-level `failure.reset_at`) is removed when it was derived
     from provider free text (such as `"resets at ..."` or `"try again at ..."` suffixes); Codex
-    keeps a structured `error.resets_at` only when it validates as an epoch of at least ten digits
-    (a JSON number or an all-digit string, because six to nine digits have the shape of a numeric
-    device code) or a string up to 40 bytes that is a strict RFC 3339 datetime made only
-    of digits, `-`, `:`, `T`, `Z`, `.`, and `+` (invalid `error.resets_at` values are dropped
+    keeps a structured `error.resets_at` only when it passes a shape check, which is not a calendar
+    validation: a JSON number or an all-digit string of 10 to 40 digits, read as an epoch (six to
+    nine digits have the shape of a numeric device code), or a string of at most 40 bytes shaped as
+    an RFC 3339 datetime `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, whose month is checked as 1–12,
+    day as 1–31, hour as 0–23, minute as 0–59 and second as 0–60. An impossible date such as
+    February 31 passes that check (invalid `error.resets_at` values are dropped
     unconditionally at parse time so token-like strings never survive even in untainted reports);
   - `failure.kind`, `reported.thread_id`, `reported.model`, `reported.usage`,
     `reported.session_cost_usd`, and all `observed` metadata are kept;
@@ -403,8 +405,8 @@ managed settings, hooks, or permission allow-lists from interacting with plan mo
 under `read-only` only that plan mode enforced an OS sandbox, applied project or local sandbox
 settings, or prevented user and managed settings or permission allow-lists from interacting with
 it—and in the tool schema.
-Self-delegation and recursive delegation across all providers are stopped by D1 (a client never
-sees its own provider tools) and the D13 depth guard: for every provider turn and discovery
+Self-delegation is stopped by D1 (a client never sees its own provider tools), and recursive
+delegation by the D13 depth guard, as far as the guard's variables reach the nested server: for every provider turn and discovery
 `--version` probe, Proxenos sets `PROXENOS_DEPTH=1` and all seven `CLAUDE_DELEGATOR_*_DEPTH=1`
 variables, strips `CLAUDECODE`, `IRIS_EXECUTION`, and `CODEX_DELEGATOR_CODEX_BIN`
 case-insensitively from those children, and refuses before discovery when any of the eight depth
@@ -529,8 +531,9 @@ documented custom-model configuration and an isolated local endpoint. Its single
 must report `stopReason: "end_turn"`, a positive turn count, a canonical session ID, nonblank
 answer text and a successful process exit. The ID on reply must match the requested ID.
 Grok also accepts titles on resume; the return check happens after the CLI runs.
-Proxenos exposes per-invocation token counters and a model only when one model-usage entry
-reports a positive call count. The adapter passes full access through `--always-approve`;
+Proxenos exposes per-invocation token counters whenever the result carries them, and a model
+only when exactly one model-usage entry reports a positive call count. With several models,
+`reported.usage` can be set while `reported.model` is `null`. The adapter passes full access through `--always-approve`;
 enforcement of read-only access across Grok tools is unverified. The
 [Grok fixtures](../tests/fixtures/grok/README.md) record the local measurement and its limits.
 
@@ -541,10 +544,10 @@ Across the seven providers, `reported.model`, `reported.usage`, and `reported.se
 |---|---|---|
 | `codex` | Never set (`null`). | On `turn.completed`: allowlisted non-negative integer (`u64`) fields from `usage` (`input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`), or `null` if none match. Cumulative across the thread on resume in Codex CLI 0.172.0. |
 | `antigravity` | Validated trimmed `model` string when the conversation ID matches (or is unrequested); otherwise `null`. | Never set (`null`). |
-| `claude` | Sole valid key in `modelUsage` when `session_id` matches (or is unrequested); `null` if zero, multiple, or invalid keys. Also populates `reported.session_cost_usd` from finite non-negative `total_cost_usd` (cumulative for the session). | When `session_id` matches: allowlisted `u64` fields from `usage` (`input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`, plus `output_tokens_details.thinking_tokens` as `thinking_tokens`), or `null` if none match. |
+| `claude` | Sole valid key in `modelUsage` when `session_id` matches (or is unrequested); `null` if zero, multiple, or invalid keys. Also populates `reported.session_cost_usd` from finite non-negative `total_cost_usd` (cumulative for the session). | When `session_id` matches or no session was requested (a start): allowlisted `u64` fields from `usage` (`input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`, plus `output_tokens_details.thinking_tokens` as `thinking_tokens`), or `null` if none match. |
 | `kimi` | Never set (`null`). (`kimi 2.8.0` emits none in `stream-json`.) | Never set (`null`). (`kimi 2.8.0` emits none in `stream-json`.) |
 | `copilot` | On a completed turn: validated `data.model` from the final main `assistant.message`; otherwise `null`. | On a completed turn: `{"premium_requests": <number>}` when terminal `result.usage.premiumRequests` is a non-negative number; otherwise `null` (no token counters). |
-| `grok` | On a completed turn: sole valid key in `modelUsage` with `modelCalls > 0`; otherwise `null`. | On a completed turn: allowlisted per-invocation `u64` fields from `usage` (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`, `reasoning_tokens`, `total_tokens`), or `null` if none match. |
+| `grok` | On a completed turn: sole valid key in `modelUsage` with `modelCalls > 0`; otherwise `null` (also when several models contributed). | On a completed turn, independently of `reported.model`: allowlisted per-invocation `u64` fields from `usage` (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`, `reasoning_tokens`, `total_tokens`), or `null` if none match. |
 | `cursor` | Not yet implemented as a delegation provider (D13 milestone 2 remaining work). | Not yet implemented for delegation (`usage` MCP tool reads subscription tier only; D9). |
 
 ### D6. Children are supervised to the end
@@ -1418,17 +1421,24 @@ scope of Iris claims.
 - Some CLIs load instruction files from the working directory with no way to turn that off.
   Delegating into a repository you do not trust exposes the provider to what is written there.
 - A delegated CLI keeps the MCP servers from the user's own configuration. This is intended: a
-  delegate can then open a browser or report progress through Iris. No `access` mode limits the
-  tools those servers offer. A `read-only` mode, where a provider has one, covers that CLI's
-  built-in tools at most, so a browser, Iris or another delegator stays reachable under
-  `read-only` too. `observed.access_mechanism` describes the CLI's own permission flags only. On
+  delegate can then open a browser or report progress through Iris. Proxenos leaves that
+  configuration in place and applies no blanket restriction to MCP tools. Whether a given MCP tool
+  is reachable depends on the provider's own policy: a `read-only` mode, where a provider has one,
+  is built for that CLI's built-in tools, so a browser, Iris or another delegator generally stays
+  reachable under `read-only` too. A deny rule can still block one. Claude's `read-only`, for
+  example, forwards project and local `permissions.deny` entries as `--disallowedTools`, which
+  can name an MCP tool. `not_claimed` carries this caveat in every result. `observed.access_mechanism` describes the CLI's own permission flags only. On
   2026-11-27, Grok launched by Proxenos on Windows started every server from the user's Claude Code
   configuration, including one that drives a signed-in browser and one that can start further
   agents. Which configuration each of the six CLIs loads has not been measured yet (issue #46).
 - If the user's MCP configuration includes Proxenos or another delegator, a delegated agent can
-  delegate further. The depth guard (D5, D13) stops nested Proxenos calls through
-  `PROXENOS_DEPTH`. It cannot stop a nested call made through a different delegator that does not
-  check that variable.
+  delegate further. The depth guard (D5, D13) refuses a nested Proxenos call only when
+  `PROXENOS_DEPTH` reaches that nested server. A CLI does not necessarily pass its environment on
+  to the MCP servers it starts. Codex 0.172.0, for one, leaves these variables out of a stdio MCP
+  server's environment by default, and `proxenos integrate codex` registers only the command and
+  its arguments. A nested Proxenos started that way sees no marker and accepts the call. Nor can
+  the guard stop a nested call made through a different delegator that does not check these
+  variables.
 - On a start, when neither the call nor the user's overlay names a model, Proxenos passes none
   (D8); replies follow D19. The provider's CLI then runs its own default or refuses to start. Proxenos does not choose that
   default, and it can change with a release of the CLI or with the user's configuration of it. A

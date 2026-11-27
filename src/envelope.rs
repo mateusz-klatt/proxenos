@@ -23,6 +23,7 @@ const BASE_NOT_CLAIMED: &[&str] = &[
     "The CLI loaded particular instruction files.",
     "A review established a verdict.",
     "A git snapshot identifies the author of a change or captures every edit.",
+    "Proxenos restricted the tools of MCP servers that the CLI loaded from the user's configuration.",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
