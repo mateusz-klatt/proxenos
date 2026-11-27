@@ -114,32 +114,50 @@ in `error.data`, while other protocol-level errors carry no D2 summary.
 
 Before any envelope is serialized (and before `reported.failure.message` is excerpted or archived
 to `observed.failure_file`), a shared redaction pass (`envelope::redact`) runs centrally over the
-result:
+result (with captured stderr and version-probe diagnostics filtered before their 2 KiB truncation,
+and `observed.session_save_failure` filtered before recording and writing Proxenos's stderr line):
 
 - When `reported.failure.kind` is `authentication`, both `reported.failure.message` and top-level
   `failure.message` (when `source` is `"reported"`) become the fixed sentence `"The provider
-  reported that it is not signed in."`, the raw stderr fallback into `reported.diagnostic` is
-  skipped, and `reported.diagnostic` becomes the unified provider-neutral sentence `"The provider
-  CLI is not signed in. Its sign-in output was omitted because it can contain one-time login URLs
-  or codes."` (replacing Antigravity's earlier provider-specific sign-in diagnostic).
-- For every other failure kind, a pure-Rust heuristic filter replaces matches in
-  `reported.failure.message`, `reported.failure.reset_at`, `reported.diagnostic` (including failed
-  version-probe diagnostics), and `observed.failure.message` with `"[redacted]"`:
-  - `http://` and `https://` URLs whose path or query contains `auth`, `login`, `oauth`, `device`,
-    `token`, `code`, `session`, or `verify` (case-insensitive), or that carry any query string;
+  reported that it is not signed in."`, `reported.content` is omitted (failed turns across all six
+  providers, including Antigravity `ERROR` records, omit `reported.content`), the raw stderr
+  fallback into `reported.diagnostic` is skipped, and `reported.diagnostic` becomes the unified
+  provider-neutral sentence `"The provider CLI is not signed in. Its sign-in output was omitted
+  because it can contain one-time login URLs or codes."` (replacing Antigravity's earlier
+  provider-specific sign-in diagnostic).
+- For every other failure kind (and on session-save failures), a linear-time pure-Rust heuristic
+  filter replaces matches with `"[redacted]"` across `reported.failure.message`,
+  `reported.failure.reset_at`, `reported.diagnostic` (including failed version-probe diagnostics),
+  `observed.failure.message`, `observed.session_save_failure`, the top-level `failure.message`
+  (and `failure.reset_at`), the failure archive file (`observed.failure_file`), and Proxenos's
+  stderr session-save lines (`could not save session settings: ...`), as well as `doctor`
+  zero-exit version-probe text:
+  - `http://` and `https://` URLs (including non-ASCII bytes in the URL body) whose path or query
+    contains `auth`, `login`, `oauth`, `device`, `token`, `code`, `session`, or `verify`
+    (case-insensitive), or that carry any query string;
   - device-code shapes (`XXXX-XXXX` 4-4 uppercase alphanumeric groups and 6–9 character uppercase
-    alphanumeric codes) adjacent to the words `code` or `enter`;
-  - well-known secret prefixes (`sk-`, `sk-ant-`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `github_pat_`,
-    `xai-`, `AIza`) and `Bearer <token>`.
-- `observed.redacted` records whether any text was omitted or replaced (`true` or `false`), and
-  removed text is never emitted anywhere by Proxenos, including its own standard-error diagnostics.
+    alphanumeric codes) when `code` or `enter` appears within one short paragraph (up to 160 bytes
+    before or after, across line breaks and sentence punctuation, stopping at blank lines);
+  - well-known secret prefixes (`sk-`, `sk-ant-`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
+    `github_pat_`, `xai-`, `AIza`) and `Bearer <token>` (including any opaque token of 16 or more
+    characters regardless of case).
+- `observed.redacted` records whether any text was omitted or replaced (`true` or `false`) in the
+  covered fields (`reported.failure.message`, `reported.failure.reset_at`, `reported.diagnostic`,
+  `observed.failure.message`, `observed.session_save_failure`, top-level `failure.message`,
+  `observed.failure_file`, and Proxenos's stderr session-save lines).
 
-What this cannot do: diagnostic redaction is a heuristic filter, not a guarantee. Unknown token
-formats, login URLs without query strings or the listed path words, wrapped or encoded secrets,
-and sign-in prompts phrased outside these patterns pass through unchanged. `reported.content` (the
-provider's answer, and any `observed.content_file` archive of a long answer) is not filtered, and
-provider output files on disk (including logs or session files written by the provider CLI itself,
-as well as `observed.content_file`) are unchanged.
+What this cannot do: diagnostic redaction is a heuristic filter, not a guarantee:
+- `reported.content` of successful turns (and any `observed.content_file` archive of a long
+  successful answer) is not filtered;
+- `doctor` runs the same heuristic filter on version-probe output when a provider exits 0, so
+  unknown sign-in prompts outside those patterns still pass through;
+- heuristics miss unknown token formats, login URLs without query strings or the listed path
+  words, wrapped or encoded secrets, and sign-in prompts phrased outside these patterns;
+- over-redaction is possible (for example, `"error code EACCES"`, error codes near `"code"` or
+  `"enter"` within a short paragraph, or non-auth URLs carrying query strings can be replaced with
+  `"[redacted]"`);
+- provider output files on disk (including logs or session files written by the provider CLI itself,
+  as well as `observed.content_file` for successful turns) remain untouched.
 
 A long answer is returned as an excerpt with the path of a file that holds what was captured, up
 to the capture limit. That file is kept apart from the child's temporary files, which D6 removes
@@ -369,13 +387,14 @@ URL) to standard error, and writes a single JSON object to standard output with 
 
 For a failed Antigravity turn, a classified top-level JSON `error` takes precedence. Standard
 error can establish an authentication failure when that field is absent, blank or unclassified
-and a line starts with the exact `agy` sign-in prompt above. When both the JSON error and the
-sign-in prompt are absent, Proxenos reads other failure kinds from standard error. It never
-classifies agent-authored `response` text. On a non-zero exit or incomplete turn, up to 2 KiB of
-standard error normally goes into `reported.diagnostic` (omitted when the turn classifies as
-`authentication`). An authentication failure uses the unified fixed `reported.failure.message` and
-provider-neutral `reported.diagnostic` text from D2 that omits the CLI's sign-in output. The
-observed byte counts still include the captured output.
+and a line starts with the exact `agy` sign-in prompt above. When both the JSON error and the sign-in prompt are absent, Proxenos reads other failure kinds
+from standard error. It never classifies agent-authored `response` text, and every failed
+Antigravity turn (`status != "SUCCESS"`, including `authentication`) omits `reported.content`
+(matching the other five providers). On a non-zero exit or incomplete turn, captured standard error
+is redacted before truncating up to 2 KiB into `reported.diagnostic` (omitted when the turn
+classifies as `authentication`). An authentication failure uses the unified fixed
+`reported.failure.message` and provider-neutral `reported.diagnostic` text from D2 that omits the
+CLI's sign-in output. The observed byte counts still include the captured output.
 
 Two offline failures were captured with Codex CLI 0.172.0 on Linux x86_64. With a missing
 credential for a local custom provider, `codex exec --json` emitted a thread ID and
@@ -1311,9 +1330,11 @@ scope of Iris claims.
   reports it.
 - A call with `wait: true` lasts as long as its delegation. A client that limits the time of one
   call may end it first and leave the caller without a handle (D17).
-- Diagnostic redaction (D2) is a heuristic filter over failure messages and diagnostics, not a
-  guarantee: unknown token formats and unrecognised sign-in prompts pass through, `reported.content`
-  (the answer, including `observed.content_file`) is not filtered, and files written on disk by
+- Diagnostic redaction (D2) is a heuristic filter over failure messages, diagnostics,
+  `observed.session_save_failure`, failure archives, session-save stderr lines, and `doctor`
+  version-probe text, never a guarantee: unknown token formats and unrecognised sign-in prompts pass
+  through, over-redaction is possible (such as `"error code EACCES"`), `reported.content` (of
+  successful turns, including `observed.content_file`) is not filtered, and files written on disk by
   provider CLIs remain unchanged.
 
 ## 5. Not yet known

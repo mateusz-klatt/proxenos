@@ -31,6 +31,7 @@ pub struct Executable {
 pub struct DiscoveryError {
     pub failure: Failure,
     pub diagnostic: Option<String>,
+    pub redacted: bool,
 }
 
 pub enum CliStatus {
@@ -82,6 +83,7 @@ impl From<Failure> for DiscoveryError {
         Self {
             failure,
             diagnostic: None,
+            redacted: false,
         }
     }
 }
@@ -320,7 +322,7 @@ async fn probe(
         env_remove: crate::delegation::env_remove(),
         deadline: deadline.map_or(limit, |call| call.min(limit)),
         memory_limit_bytes: None,
-        capture_limit: 2048,
+        capture_limit: crate::envelope::CAPTURE_LIMIT,
         temporary_files: Vec::new(),
     };
     let outcome = supervise::run(launch, cancel, activity)
@@ -350,11 +352,12 @@ async fn probe(
             let version = [&outcome.stdout.bytes, &outcome.stderr.bytes]
                 .into_iter()
                 .filter_map(|bytes| {
-                    let text = String::from_utf8_lossy(bytes);
+                    let raw = String::from_utf8_lossy(bytes);
+                    let text = crate::envelope::redact_text(&raw);
                     text.lines()
                         .map(str::trim)
                         .find(|line| !line.is_empty())
-                        .map(str::to_owned)
+                        .map(|line| line[..line.floor_char_boundary(2048)].to_owned())
                 })
                 .next()
                 .unwrap_or_default();
@@ -366,7 +369,8 @@ async fn probe(
             } else {
                 &outcome.stderr.bytes
             };
-            let diagnostic = String::from_utf8_lossy(detail).trim().to_owned();
+            let raw = String::from_utf8_lossy(detail);
+            let (diagnostic, redacted) = crate::envelope::redact_excerpt(raw.trim(), 2048);
             let status = exit_description(outcome.code, outcome.signal);
             Err(DiscoveryError {
                 failure: Failure::new(
@@ -377,6 +381,7 @@ async fn probe(
                     ),
                 ),
                 diagnostic: (!diagnostic.is_empty()).then_some(diagnostic),
+                redacted,
             })
         }
     }

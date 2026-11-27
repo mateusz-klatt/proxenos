@@ -219,7 +219,6 @@ fn parse_report(value: Option<Value>, stderr: &str, expected: Option<&str>) -> R
         return report;
     }
     if id_matches {
-        report.content = text("response").map(String::from);
         report.model = text("model")
             .filter(|s| is_valid_model(s))
             .map(|s| s.trim().to_owned());
@@ -235,15 +234,20 @@ fn parse_report(value: Option<Value>, stderr: &str, expected: Option<&str>) -> R
             };
             Failure::new(FailureKind::Unknown, reason)
         }));
-    } else if report.content.is_none() {
-        report.failure = Some(turn_failure(None, stderr).unwrap_or_else(|| {
-            Failure::new(
-                FailureKind::Unknown,
-                "Antigravity returned an empty response",
-            )
-        }));
     } else {
-        report.completed = true;
+        // Failed Antigravity turns omit `reported.content` (matching the other providers) so
+        // `ERROR` records carrying sign-in prompts in `response` never surface or archive.
+        report.content = text("response").map(String::from);
+        if report.content.is_none() {
+            report.failure = Some(turn_failure(None, stderr).unwrap_or_else(|| {
+                Failure::new(
+                    FailureKind::Unknown,
+                    "Antigravity returned an empty response",
+                )
+            }));
+        } else {
+            report.completed = true;
+        }
     }
     report
 }

@@ -4,6 +4,7 @@ mod content;
 mod redact;
 
 pub use content::{AnswerArchive, CAPTURE_LIMIT};
+pub(crate) use redact::{redact_excerpt, redact_text};
 
 use std::time::Instant;
 
@@ -224,8 +225,12 @@ impl Envelope {
         self.observed["git"][when] = value;
     }
 
-    pub fn session_save_failure(&mut self, failure: &Failure) {
-        self.observed["session_save_failure"] = json!(failure);
+    pub fn session_save_failure(&mut self, mut failure: Failure) -> String {
+        if redact::redact_failure(&mut failure) {
+            self.redacted = true;
+        }
+        self.observed["session_save_failure"] = json!(&failure);
+        failure.message
     }
 
     pub fn fail(&mut self, failure: Failure) {

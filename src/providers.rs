@@ -194,6 +194,8 @@ pub struct Report {
     pub failure: Option<Failure>,
     pub diagnostic: Option<String>,
     #[serde(skip)]
+    pub diagnostic_redacted: bool,
+    #[serde(skip)]
     pub completed: bool,
     #[serde(skip)]
     pub retry_missing_final: bool,

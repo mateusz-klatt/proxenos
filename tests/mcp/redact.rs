@@ -2,7 +2,8 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -287,24 +288,30 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
         "error": {
             "message": concat!(
                 "Prefix context: visit https://auth.example.invalid/oauth/start?client_id=abc ",
-                "and http://127.0.0.1:8080/login. ",
+                "and http://127.0.0.1:8080/login and https://example.invalid/café?code=NA1 ",
+                "and https://exämple.invalid/login and https://example.invalid/üser/auth. ",
                 "Check (https://example.invalid/Device/Verify) or [https://example.invalid/session#step1] ",
                 "or https://example.invalid/token or https://example.invalid/code ",
-                "or https://example.invalid/foo_(bar)?x=1 or https://example.invalid/v1/status?q=1. ",
+                "or https://example.invalid/foo_(bar)?x=1 or https://example.invalid/foo_[bar]?x=1 ",
+                "or https://example.invalid/v1/status?q=1. ",
                 "Copy one-time code: ABCD-1234, enter A1B2C3D4, use code 123456, ",
                 "device_code=WXYZ-9876; ZYXW-4321 (enter this code), ",
-                "copy code:\n  QWER9876Z. ",
+                "copy code:\n  QWER9876Z.\n",
+                "Open the link above and enter your one-time verification code when prompted by the browser.\n  BNMK-4567\n",
+                "HJKL-8910\nPlease paste this verification code in your browser before it expires.\n",
+                "Documented trade-off: error code EACCES.\n",
                 "Tokens: sk-proj-secret1, sk-ant-api03-secret2, ghp_secret3, gho_secret4, ",
-                "ghu_secret5, ghs_secret6, github_pat_11AAA_bbb, xai-secret7, AIzaSyDemoKey8, ",
+                "ghu_secret5, ghs_secret6, ghr_secret9, github_pat_11AAA_bbb, xai-secret7, AIzaSyDemoKey8, ",
                 "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig., ",
-                "Bearer dGVzdA==, Bearer aBcDeF, Bearer MYSECRET, Bearer\ttok-123. Suffix context."
+                "Bearer dGVzdA==, Bearer aBcDeF, Bearer MYSECRET, Bearer\ttok-123, ",
+                "Bearer abcdefghijklmnop. Suffix context."
             )
         }
     })
     .to_string();
 
     let synthetic_stderr = concat!(
-        "Stderr lead: open https://example.invalid/auth?code=999, ",
+        "Stderr lead (café): open https://example.invalid/auth?code=999, ",
         "enter code EFGH-5678, key sk-stderr-secret. Stderr tail.\n"
     );
 
@@ -312,8 +319,8 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
         "status": "ERROR",
         "response": "",
         "error": format!(
-            "Long failure lead: sk-long-secret-123 and https://example.invalid/device?k=1. {} Tail.",
-            "p".repeat(16 << 10)
+            "Long failure lead: sk-long-secret-123 and https://example.invalid/device?k=1. {} Archive secret: sk-archive-only-secret and https://archive.example.invalid/oauth?code=ARCH-1 and enter code: ARCH-9999. Tail.",
+            "p".repeat(17 << 10)
         )
     })
     .to_string();
@@ -369,43 +376,64 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
         "{fg_msg}"
     );
     assert!(
-        fg_msg
-            .contains("Authorization: [redacted]., [redacted], [redacted], [redacted], [redacted]"),
+        fg_msg.contains("when prompted by the browser.\n  [redacted]\n"),
+        "{fg_msg}"
+    );
+    assert!(
+        fg_msg.contains("\n[redacted]\nPlease paste this verification code"),
+        "{fg_msg}"
+    );
+    assert!(
+        fg_msg.contains("Documented trade-off: error code [redacted]."),
+        "{fg_msg}"
+    );
+    assert!(
+        fg_msg.contains(
+            "Authorization: [redacted]., [redacted], [redacted], [redacted], [redacted], [redacted]."
+        ),
         "{fg_msg}"
     );
     assert_eq!(
         fg_diag,
-        "Stderr lead: open [redacted], enter code [redacted], key [redacted]. Stderr tail.\n"
+        "Stderr lead (café): open [redacted], enter code [redacted], key [redacted]. Stderr tail.\n"
     );
 
-    // 2. Background wait:false + await redacts non-auth failures identically.
+    // 2. Background wait:false + await redacts non-auth failures identically across whole envelope.
     let started = server.call(20, "codex", json!({"prompt": "non-auth bg", "wait": false}));
     let handle = serde_json::from_str::<Value>(text(&started)).unwrap()["handle"]
         .as_str()
         .unwrap()
         .to_owned();
     let awaited = server.call(21, "await", json!({"handles": [handle]}));
-    let bg_item = &serde_json::from_str::<Value>(text(&awaited)).unwrap()["results"][0]["result"];
+    let awaited_raw = text(&awaited);
+    let bg_item = &serde_json::from_str::<Value>(awaited_raw).unwrap()["results"][0]["result"];
     assert_eq!(bg_item["observed"]["redacted"], true, "{bg_item}");
     assert_eq!(bg_item["reported"]["failure"]["message"], fg_msg);
     assert_eq!(bg_item["reported"]["diagnostic"], fg_diag);
 
     let fg_raw = fg.to_string();
-    for leaked in [
+    let leaked_tokens = [
         "auth.example.invalid",
         "127.0.0.1",
+        "café?code=NA1",
+        "exämple.invalid",
+        "üser/auth",
         "ABCD-1234",
         "A1B2C3D4",
         "123456",
         "WXYZ-9876",
         "ZYXW-4321",
         "QWER9876Z",
+        "BNMK-4567",
+        "HJKL-8910",
+        "EACCES",
         "sk-proj-secret1",
         "sk-ant-api03-secret2",
         "ghp_secret3",
         "gho_secret4",
         "ghu_secret5",
         "ghs_secret6",
+        "ghr_secret9",
         "github_pat_11AAA_bbb",
         "xai-secret7",
         "AIzaSyDemoKey8",
@@ -414,28 +442,65 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
         "aBcDeF",
         "MYSECRET",
         "tok-123",
+        "abcdefghijklmnop",
         "EFGH-5678",
         "sk-stderr-secret",
-    ] {
+    ];
+    for leaked in leaked_tokens {
         assert!(!fg_raw.contains(leaked), "leaked {leaked:?} in {fg_raw}");
+        assert!(
+            !awaited_raw.contains(leaked),
+            "leaked {leaked:?} in await envelope: {awaited_raw}"
+        );
     }
 
-    // 3. Oversized (>16 KiB) non-auth failure redacts BEFORE archiving to failure_file.
+    // 3. Oversized (>16 KiB) non-auth failure redacts BEFORE archiving to failure_file, including
+    // archive-only secrets beyond the 16 KiB inline excerpt.
     let long_err = call(
         &mut server,
         "antigravity",
         json!({"prompt": "long non-auth"}),
     );
     assert_eq!(long_err["observed"]["redacted"], true, "{long_err}");
+    let long_raw = long_err.to_string();
+    for leaked in [
+        "sk-long-secret-123",
+        "example.invalid/device",
+        "sk-archive-only-secret",
+        "archive.example.invalid",
+        "ARCH-1",
+        "ARCH-9999",
+    ] {
+        assert!(
+            !long_raw.contains(leaked),
+            "leaked {leaked:?} in {long_raw}"
+        );
+    }
     let failure_file = PathBuf::from(long_err["observed"]["failure_file"].as_str().unwrap());
     let archived = fs::read_to_string(&failure_file).unwrap();
     assert!(
         archived.starts_with("Long failure lead: [redacted] and [redacted]. "),
         "{archived}"
     );
-    assert!(archived.ends_with(" Tail."), "{archived}");
-    assert!(!archived.contains("sk-long-secret-123"));
-    assert!(!archived.contains("example.invalid/device"));
+    assert!(
+        archived.ends_with(
+            " Archive secret: [redacted] and [redacted] and enter code: [redacted]. Tail."
+        ),
+        "{archived}"
+    );
+    for leaked in [
+        "sk-long-secret-123",
+        "example.invalid/device",
+        "sk-archive-only-secret",
+        "archive.example.invalid",
+        "ARCH-1",
+        "ARCH-9999",
+    ] {
+        assert!(
+            !archived.contains(leaked),
+            "leaked {leaked:?} in archive: {archived}"
+        );
+    }
 
     // 4. Unclassified stderr-only non-zero exit redacts reported.diagnostic.
     let stderr_only = call(&mut server, "antigravity", json!({"prompt": "stderr only"}));
@@ -520,6 +585,15 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
         "Probe failed: [redacted] [redacted]"
     );
 
+    assert!(server.finish().0.success());
+    let server_stderr = server.stderr();
+    for leaked in leaked_tokens {
+        assert!(
+            !server_stderr.contains(leaked),
+            "server stderr leaked {leaked:?}: {server_stderr}"
+        );
+    }
+
     for cli in ["agy", "codex", "kimi"] {
         fleet.assert_steps_remaining(cli, 0);
     }
@@ -528,14 +602,20 @@ fn non_auth_failures_redact_urls_device_codes_and_secret_prefixes_while_preservi
 #[test]
 fn clean_diagnostics_and_non_auth_urls_are_not_over_redacted() {
     let fleet = Fleet::new(&["agy"]);
-    let clean_stderr = concat!(
-        "See https://example.invalid/support and https://docs.example.com/guide#overview.\n",
-        "Ignore foohttps://example.com/auth, bare https://, and http:///local.\n",
-        "Words: task-1234 disk-5678 bare sk- xai- AIza.\n",
-        "Bearer prose: Invalid Bearer token; Bearer Token; bearer-only; the bearer of news; Bearer realm=\"example\".\n",
-        "Non-codes: Exit code 1. ID ABCDEFGH; code? UVWX9999; code! QRST8888; encode ABCD-1234; ",
-        "code: read-only; code: FOO-ABCD-1234; code: TOO1234567; status 2026-11-27; ",
-        "code: AB12 and more than thirty-six bytes of filler words before NOTACODE followed by enough words before code.\n"
+    let far = "f".repeat(156);
+    let clean_stderr = format!(
+        concat!(
+            "See https://example.invalid/support, https://example.invalid/café, and https://docs.example.com/guide#overview.\n",
+            "Ignore foohttps://example.com/auth, bare https://, and http:///local.\n",
+            "Words: task-1234 disk-5678 bare sk- xai- AIza.\n",
+            "Bearer prose: Invalid Bearer token; Bearer Token; Bearer abcdefghijklmno; bearer-only; the bearer of news; Bearer realm=\"example\".\n",
+            "Non-codes: Exit code 1.\n\n",
+            "ID ABCDEFGH.\n\n",
+            "encode ABCD-1234.\n\n",
+            "code: read-only; code: FOO-ABCD-1234; code: TOO1234567; status 2026-11-27.\n\n",
+            "encode {far} NOTACODE {far} codex\n"
+        ),
+        far = far,
     );
     let clean_json = json!({
         "status": "ERROR",
@@ -628,4 +708,350 @@ fn answer_content_containing_urls_codes_and_secrets_is_unchanged() {
     assert_eq!(bg["reported"]["content"], short_answer);
 
     fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn adversarial_four_mib_diagnostics_complete_in_linear_time() {
+    let fleet = Fleet::new(&["agy"]);
+    let rejected_parens_url = format!(
+        "https://example.invalid/{}{}",
+        "a".repeat((2 << 20) - 32),
+        ")]".repeat(1 << 20)
+    );
+    let auth_parens_url = format!(
+        "https://example.invalid/login?{}{}",
+        "a".repeat((2 << 20) - 128),
+        ")]".repeat((1 << 20) - 64)
+    );
+    let http_fragments = format!(
+        "{}{} https://auth.example.invalid/login",
+        "http://".repeat(550_000),
+        "http://a#".repeat(10_000),
+    );
+    assert!(rejected_parens_url.len() > 3_900_000);
+    assert!(auth_parens_url.len() > 3_900_000);
+    assert!(http_fragments.len() > 3_900_000);
+
+    let auth_json_err = json!({
+        "status": "ERROR",
+        "response": "",
+        "error": auth_parens_url
+    })
+    .to_string();
+
+    fleet.script(
+        "agy",
+        json!([
+            {"stderr": rejected_parens_url, "code": 2},
+            {"stdout": auth_json_err, "code": 1},
+            {"stderr": http_fragments, "code": 2},
+        ]),
+    );
+    let mut server = fleet.server("claude");
+
+    for (label, expect_redacted) in [
+        ("rejected URL with 2M parens/brackets", false),
+        ("auth URL with 2M parens/brackets", true),
+        ("4 MiB http:// and fragment runs", false),
+    ] {
+        let started = Instant::now();
+        let result = call(&mut server, "antigravity", json!({"prompt": label}));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "{label} took {:?} (expected < 2s)",
+            elapsed
+        );
+        assert_eq!(result["observed"]["redacted"], expect_redacted, "{label}");
+        if expect_redacted {
+            let msg = result["reported"]["failure"]["message"].as_str().unwrap();
+            assert!(msg.starts_with("[redacted])]"), "{msg}");
+            let archive = PathBuf::from(result["observed"]["failure_file"].as_str().unwrap());
+            let archived = fs::read_to_string(&archive).unwrap();
+            assert!(archived.starts_with("[redacted])]"));
+            assert!(!archived.contains("login?"));
+        }
+    }
+
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn truncation_redacts_larger_captured_stderr_and_probe_text_first() {
+    let fleet = Fleet::new(&["agy", "codex"]);
+
+    let stderr_cut_ascii = format!("{} ABCD-1234\nEnter this code", "x".repeat(2037));
+    let stderr_cut_multibyte = format!("{}é ABCD-1234\nEnter this code", "x".repeat(2035));
+    let stderr_secret_past_limit = format!("{}ésk-past-2k-secret", "x".repeat(2047));
+    fleet.script(
+        "agy",
+        json!([
+            {"stderr": stderr_cut_ascii, "code": 2},
+            {"stderr": stderr_cut_multibyte, "code": 2},
+            {"stderr": stderr_secret_past_limit, "code": 2}
+        ]),
+    );
+
+    let probe_cut = format!("{} WXYZ-5678\nEnter this code", "p".repeat(2037));
+    fs::write(
+        fleet.root.join("codex.version"),
+        json!({"stderr": probe_cut, "code": 3}).to_string(),
+    )
+    .unwrap();
+
+    let mut server = fleet.server("claude");
+
+    for (label, forbidden) in [
+        ("ascii boundary", "ABCD-1234"),
+        ("multibyte boundary", "ABCD-1234"),
+    ] {
+        let result = call(&mut server, "antigravity", json!({"prompt": label}));
+        assert_observed_failure(&result, "abnormal_exit", "exit code 2");
+        assert_eq!(result["observed"]["redacted"], true, "{label}: {result}");
+        let diag = result["reported"]["diagnostic"].as_str().unwrap();
+        assert!(diag.len() <= 2048, "{label}: len {}", diag.len());
+        assert!(diag.contains("[redacted]"), "{label}: {diag}");
+        assert!(
+            !result.to_string().contains(forbidden),
+            "{label} leaked {forbidden}: {result}"
+        );
+    }
+
+    let past = call(&mut server, "antigravity", json!({"prompt": "past 2k"}));
+    assert_eq!(past["observed"]["redacted"], false, "{past}");
+    let past_diag = past["reported"]["diagnostic"].as_str().unwrap();
+    assert_eq!(past_diag.len(), 2047);
+    assert!(!past.to_string().contains("sk-past-2k-secret"), "{past}");
+
+    let probe_failed = call(&mut server, "codex", json!({"prompt": "probe cut"}));
+    assert_observed_failure(&probe_failed, "launch", "exit code 3");
+    assert_eq!(probe_failed["observed"]["redacted"], true, "{probe_failed}");
+    let probe_diag = probe_failed["reported"]["diagnostic"].as_str().unwrap();
+    assert!(probe_diag.len() <= 2048, "len {}", probe_diag.len());
+    assert!(probe_diag.contains("[redacted]"), "{probe_diag}");
+    assert!(
+        !probe_failed.to_string().contains("WXYZ-5678"),
+        "{probe_failed}"
+    );
+
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn session_save_serde_errors_redact_in_envelope_and_server_stderr() {
+    let fleet = Fleet::new(&["agy"]);
+    let agy_finished = json!({
+        "status": "SUCCESS",
+        "conversation_id": AGY_ID,
+        "response": "ok"
+    })
+    .to_string();
+    fleet.script(
+        "agy",
+        json!([
+            {"stdout": agy_finished},
+            {"stdout": agy_finished},
+            {"stdout": agy_finished}
+        ]),
+    );
+
+    let mut server = fleet.server("claude");
+    let seed = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "seed session", "model": "m"}),
+    );
+    assert_eq!(seed["observed"]["state"], "finished", "{seed}");
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let sessions_dir = fleet
+        .root
+        .join(".local/state/proxenos/sessions/antigravity");
+    #[cfg(target_os = "macos")]
+    let sessions_dir = fleet
+        .root
+        .join("Library/Application Support/proxenos/sessions/antigravity");
+    #[cfg(windows)]
+    let sessions_dir = fleet.root.join("proxenos/sessions/antigravity");
+
+    let session_file = fs::read_dir(&sessions_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .expect("session JSON file");
+
+    let corrupt_payloads = [
+        (
+            r#"{"schema_version":1,"sk-session-save-secret":1}"#,
+            "sk-session-save-secret",
+        ),
+        (
+            r#"{"schema_version":"https://save.example.invalid/oauth?code=SAVE-1"}"#,
+            "save.example.invalid",
+        ),
+    ];
+
+    for (index, (corrupt, forbidden)) in corrupt_payloads.into_iter().enumerate() {
+        fs::write(&session_file, corrupt).unwrap();
+        let saved = call(
+            &mut server,
+            "antigravity",
+            json!({"prompt": format!("save fail {index}"), "model": "m"}),
+        );
+        assert_eq!(saved["observed"]["state"], "finished", "{saved}");
+        assert_eq!(saved["observed"]["redacted"], true, "{saved}");
+        let save_msg = saved["observed"]["session_save_failure"]["message"]
+            .as_str()
+            .unwrap();
+        assert!(save_msg.contains("[redacted]"), "{save_msg}");
+        assert!(
+            !saved.to_string().contains(forbidden),
+            "envelope leaked {forbidden}: {saved}"
+        );
+        server.wait_for_stderr_count("could not save session settings:", index + 1);
+    }
+
+    assert!(server.finish().0.success());
+    let server_stderr = server.stderr();
+    for forbidden in ["sk-session-save-secret", "save.example.invalid", "SAVE-1"] {
+        assert!(
+            !server_stderr.contains(forbidden),
+            "server stderr leaked {forbidden}: {server_stderr}"
+        );
+    }
+    assert!(
+        server_stderr.contains("could not save session settings:")
+            && server_stderr.contains("[redacted]"),
+        "{server_stderr}"
+    );
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn antigravity_error_record_drops_response_content_and_urls() {
+    let fleet = Fleet::new(&["agy"]);
+    let short_auth_with_response = json!({
+        "conversation_id": AGY_ID,
+        "status": "ERROR",
+        "response": "Please open https://agy.example.invalid/oauth?code=RESP-AUTH to sign in.",
+        "error": "authentication failed or timed out"
+    })
+    .to_string();
+    let long_auth_with_response = json!({
+        "conversation_id": AGY_ID,
+        "status": "ERROR",
+        "response": format!(
+            "Sign in at https://agy.example.invalid/oauth?code=RESP-LONG {}",
+            "r".repeat(16 << 10)
+        ),
+        "error": "authentication failed or timed out"
+    })
+    .to_string();
+    let non_auth_with_response = json!({
+        "conversation_id": AGY_ID,
+        "status": "ERROR",
+        "response": "Draft with https://agy.example.invalid/oauth?code=RESP-QUOTA",
+        "error": "Quota exhausted. Quota resets at 2030-04-02T15:00:00Z."
+    })
+    .to_string();
+
+    fleet.script(
+        "agy",
+        json!([
+            {"stdout": short_auth_with_response, "code": 1},
+            {"stdout": long_auth_with_response, "code": 1},
+            {"stdout": non_auth_with_response, "code": 1}
+        ]),
+    );
+    let mut server = fleet.server("claude");
+
+    for (label, forbidden) in [("short auth", "RESP-AUTH"), ("long auth", "RESP-LONG")] {
+        let res = call(&mut server, "antigravity", json!({"prompt": label}));
+        assert_reported_failure(
+            &res,
+            Some(("abnormal_exit", "exit code 1")),
+            "authentication",
+            AUTHENTICATION_FAILURE_MESSAGE,
+        );
+        assert!(res["reported"]["content"].is_null(), "{label}: {res}");
+        assert!(res["observed"]["content_file"].is_null(), "{label}: {res}");
+        assert!(
+            res["observed"]["content_captured_bytes"].is_null(),
+            "{label}: {res}"
+        );
+        assert!(
+            !res.to_string().contains(forbidden)
+                && !res.to_string().contains("agy.example.invalid"),
+            "{label} leaked response URL: {res}"
+        );
+    }
+
+    let quota = call(&mut server, "antigravity", json!({"prompt": "quota error"}));
+    assert_reported_failure(
+        &quota,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        "Quota exhausted",
+    );
+    assert!(quota["reported"]["content"].is_null(), "{quota}");
+    assert!(quota["observed"]["content_file"].is_null(), "{quota}");
+    assert!(!quota.to_string().contains("RESP-QUOTA"), "{quota}");
+    assert!(
+        !quota.to_string().contains("agy.example.invalid"),
+        "{quota}"
+    );
+
+    fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn doctor_filters_sign_in_prompts_from_zero_exit_probes() {
+    let fleet = Fleet::new(&["codex", "agy"]);
+    fs::write(
+        fleet.root.join("codex.version"),
+        json!({
+            "stdout": "Visit https://doctor.example.invalid/oauth?code=DOC-1 and enter code: DOCX-1234\n",
+            "code": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        fleet.root.join("agy.version"),
+        json!({
+            "stderr": "DOCX-9999\nEnter this code with sk-doctor-secret\n",
+            "code": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    for args in [&["doctor", "--json"][..], &["doctor"][..]] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_proxenos"));
+        cmd.args(args)
+            .current_dir(&fleet.root)
+            .env("PATH", fleet.root.join("bin"))
+            .env("PROXENOS_STUB_DIR", &fleet.root)
+            .env("HOME", &fleet.root)
+            .env("USERPROFILE", &fleet.root)
+            .env("LOCALAPPDATA", &fleet.root)
+            .env("APPDATA", &fleet.root)
+            .env_remove("XDG_STATE_HOME");
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for forbidden in [
+            "doctor.example.invalid",
+            "DOC-1",
+            "DOCX-1234",
+            "DOCX-9999",
+            "sk-doctor-secret",
+        ] {
+            assert!(
+                !stdout.contains(forbidden) && !stderr.contains(forbidden),
+                "doctor ({args:?}) leaked {forbidden:?}:\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+        assert!(stdout.contains("[redacted]"), "{stdout}");
+    }
 }

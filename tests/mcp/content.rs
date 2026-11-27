@@ -69,7 +69,7 @@ fn the_archive_bounds_disk_use_and_preserves_the_turn_outcome_on_eviction_failur
     let fleet = Fleet::new(&["agy"]);
     let long = "a".repeat((16 << 10) + 1);
     let ok = turn(&long);
-    let failed = json!({"status":"ERROR","error":"Quota exceeded","response":long});
+    let failed = json!({"status":"ERROR","error":format!("Quota exceeded: {long}"),"response":""});
     let mut steps = vec![ok.clone(); 10];
     steps.extend([json!({"stdout":failed.to_string(), "code":1}), ok]);
     fleet.script("agy", Value::Array(steps));
@@ -123,7 +123,7 @@ fn the_archive_bounds_disk_use_and_preserves_the_turn_outcome_on_eviction_failur
         failed_turn["observed"]["capture_error"]["message"]
             .as_str()
             .unwrap_or_else(|| panic!("missing capture_error message: {failed_turn}"))
-            .contains("Could not retain the captured content"),
+            .contains("Could not retain the captured failure"),
         "{failed_turn}"
     );
     fleet.assert_steps_remaining("agy", 1);
