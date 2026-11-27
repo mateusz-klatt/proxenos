@@ -971,3 +971,180 @@ fn stop_and_reap_tolerate_immediate_exit_on_sigterm_through_delegation() {
     fleet.assert_steps_remaining("agy", 0);
     assert!(server.wait_for_exit(common::EXIT_WAIT).0.success());
 }
+
+#[cfg(unix)]
+mod unix_eperm_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn wait_until(description: &str, mut ready: impl FnMut() -> bool) {
+        let until = Instant::now() + common::WAIT;
+        while !ready() {
+            assert!(Instant::now() < until, "{description}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn log_for(fleet: &Fleet, index: usize) -> std::path::PathBuf {
+        let record = fleet.records().into_iter().nth(index).unwrap();
+        let args = record["args"].as_array().unwrap();
+        let flag = args.iter().position(|arg| arg == "--log-file").unwrap();
+        std::path::PathBuf::from(args[flag + 1].as_str().unwrap())
+    }
+
+    fn lock_is_free(path: &Path) -> bool {
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        if file.try_lock().is_ok() {
+            file.unlock().unwrap();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn server_with_eperm_spec(fleet: &Fleet, spec: &Path) -> common::Server {
+        let mut command = fleet.command("claude");
+        command.env("PROXENOS_TEST_KILL_GROUP_EPERM", spec);
+        let mut server = common::Server::start_command(command);
+        server.initialize("2025-11-25");
+        server.request(1, "tools/list", json!({}));
+        server
+    }
+
+    fn assert_persisting_eperm_fails_cleanup_and_kills_group(
+        spec_text: &str,
+        ignore_term_with_exit_on_term: bool,
+        expected_signal: Option<i32>,
+    ) {
+        let fleet = Fleet::new(&["agy"]);
+        let spec = fleet.root.join("eperm.spec");
+        let leader_lock = fleet.root.join("leader.lock");
+        let ready = fleet.root.join("ready");
+        let mut step = json!({
+            "hold_file": leader_lock,
+            "sleep_ms": 60_000
+        });
+        if ignore_term_with_exit_on_term {
+            step["exit_on_term"] = json!(ready);
+        } else {
+            step["ready"] = json!(ready);
+        }
+        fleet.script("agy", json!([step]));
+        let mut server = server_with_eperm_spec(&fleet, &spec);
+        std::fs::write(&spec, spec_text).unwrap();
+        server.start_call(2, "antigravity", json!({"prompt": "persist-eperm"}));
+        wait_until("stub did not start", || ready.exists());
+        assert!(!lock_is_free(&leader_lock), "leader must hold its lock");
+        let log = log_for(&fleet, 1);
+        assert!(log.exists(), "live call should own its log");
+
+        let stopped = Instant::now();
+        server.close_input();
+        let failed: Value = serde_json::from_str(common::text(&server.response(2))).unwrap();
+        let elapsed = stopped.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "EPERM stop should not wait the 3 s SIGTERM grace plus drain: {elapsed:?}"
+        );
+        assert_observed_failure(&failed, "unknown", "os error 1");
+        assert!(
+            failed["observed"]["failure"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Supervision failed"),
+            "{failed}"
+        );
+        assert!(failed["observed"]["passed"].is_object(), "{failed}");
+        assert!(
+            failed["observed"]["access_mechanism"].is_string(),
+            "{failed}"
+        );
+        assert_eq!(
+            failed["observed"]["attempts"].as_array().unwrap().len(),
+            1,
+            "{failed}"
+        );
+        assert!(
+            failed["observed"]["attempts"][0]["exit_code"].is_null(),
+            "{failed}"
+        );
+        assert_eq!(
+            failed["observed"]["attempts"][0]["signal"],
+            json!(expected_signal),
+            "{failed}"
+        );
+        wait_until("leader survived SIGKILL cleanup", || {
+            lock_is_free(&leader_lock)
+        });
+        wait_until("provider scratch was not removed", || !log.exists());
+        fleet.assert_steps_remaining("agy", 0);
+        assert!(server.wait_for_exit(common::EXIT_WAIT).0.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn injected_eperm_during_stop_recovers_when_leader_exits_within_macos_grace() {
+        let fleet = Fleet::new(&["agy"]);
+        let spec = fleet.root.join("eperm.spec");
+        let timeout_ready = fleet.root.join("timeout.ready");
+        let cancel_ready = fleet.root.join("cancel.ready");
+        fleet.script(
+            "agy",
+            json!([
+                {"exit_on_term": timeout_ready, "sleep_ms": 20},
+                {"exit_on_term": cancel_ready, "sleep_ms": 20}
+            ]),
+        );
+        let mut server = server_with_eperm_spec(&fleet, &spec);
+
+        // Timeout: EPERM is injected on SIGTERM while the leader sleeps 20 ms after receiving it
+        // (cannot be waited on immediately), then exits within MACOS_EPERM_GRACE (100 ms).
+        std::fs::write(&spec, "deliver:1").unwrap();
+        server.start_call(
+            2,
+            "antigravity",
+            json!({"prompt": "timeout", "timeout_ms": 2_000}),
+        );
+        wait_until("timed stub did not start", || timeout_ready.exists());
+        let timeout_log = log_for(&fleet, 1);
+        let timed: Value = serde_json::from_str(common::text(&server.response(2))).unwrap();
+        assert_observed_failure(&timed, "timeout", "exceeded the call's deadline");
+        assert_eq!(timed["observed"]["attempts"][0]["exit_code"], 0, "{timed}");
+        assert!(!timeout_log.exists(), "timed-out call still owns its log");
+
+        // Cancellation: same race through close_input cancellation.
+        std::fs::write(&spec, "deliver:1").unwrap();
+        server.start_call(3, "antigravity", json!({"prompt": "cancel"}));
+        wait_until("cancelled stub did not start", || cancel_ready.exists());
+        let cancel_log = log_for(&fleet, 2);
+        assert!(cancel_log.exists(), "live call should own its log");
+        server.close_input();
+        let cancelled: Value = serde_json::from_str(common::text(&server.response(3))).unwrap();
+        assert_observed_failure(&cancelled, "cancellation", "was cancelled");
+        assert_eq!(
+            cancelled["observed"]["attempts"][0]["exit_code"], 0,
+            "{cancelled}"
+        );
+        assert!(!cancel_log.exists(), "cancelled call still owns its log");
+        fleet.assert_steps_remaining("agy", 0);
+        assert!(server.wait_for_exit(common::EXIT_WAIT).0.success());
+    }
+
+    #[test]
+    fn injected_eperm_persisting_past_grace_fails_cleanup_and_escalates_sigkill() {
+        assert_persisting_eperm_fails_cleanup_and_kills_group(
+            "deliver:1",
+            true,
+            Some(libc::SIGKILL),
+        );
+    }
+
+    #[test]
+    fn injected_eperm_through_reap_fails_cleanup_and_drops_group_with_sigkill() {
+        assert_persisting_eperm_fails_cleanup_and_kills_group("withhold:2", false, None);
+    }
+}

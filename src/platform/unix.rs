@@ -142,6 +142,37 @@ struct Leader {
     temporary_files: Vec<TemporaryFile>,
 }
 
+#[cfg(feature = "test-tools")]
+struct EpermInjection {
+    deliver: bool,
+    remaining: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "test-tools")]
+impl EpermInjection {
+    fn load() -> Option<Self> {
+        let path = std::env::var_os("PROXENOS_TEST_KILL_GROUP_EPERM")?;
+        let spec = std::fs::read_to_string(&path).ok()?;
+        let _ = std::fs::remove_file(path);
+        let (mode, count) = spec.trim().split_once(':')?;
+        let remaining = count.parse::<usize>().ok()?;
+        Some(Self {
+            deliver: mode == "deliver",
+            remaining: std::sync::atomic::AtomicUsize::new(remaining),
+        })
+    }
+
+    fn take(&self) -> bool {
+        self.remaining
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+    }
+}
+
 pub struct Child {
     pid: libc::pid_t,
     changes: Signal,
@@ -150,6 +181,8 @@ pub struct Child {
     status: oneshot::Receiver<io::Result<ExitStatus>>,
     cleaned: oneshot::Receiver<()>,
     accounting: Arc<Mutex<UnixAccounting>>,
+    #[cfg(feature = "test-tools")]
+    eperm_injection: Option<EpermInjection>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
 }
@@ -223,6 +256,8 @@ pub fn spawn(
         status,
         cleaned,
         accounting: Arc::new(Mutex::new(UnixAccounting::new(memory_limit_bytes))),
+        #[cfg(feature = "test-tools")]
+        eperm_injection: EpermInjection::load(),
         stdout: Some(stdout),
         stderr: Some(stderr),
     })
@@ -277,9 +312,16 @@ impl Child {
     }
 
     fn kill_group(&self, signal: libc::c_int) -> (libc::c_int, io::Error) {
-        // SAFETY: until the leader is handed to the reaper its PID reserves the group ID.
-        let result = unsafe { libc::kill(-self.pid, signal) };
-        (result, io::Error::last_os_error())
+        #[cfg(feature = "test-tools")]
+        if let Some(inject) = &self.eperm_injection
+            && inject.take()
+        {
+            if inject.deliver {
+                let _ = send_group_signal(self.pid, signal);
+            }
+            return (-1, io::Error::from_raw_os_error(libc::EPERM));
+        }
+        send_group_signal(self.pid, signal)
     }
 
     async fn signal(&mut self, signal: libc::c_int) -> io::Result<()> {
@@ -368,6 +410,12 @@ impl Drop for Child {
             self.release();
         }
     }
+}
+
+fn send_group_signal(pid: libc::pid_t, signal: libc::c_int) -> (libc::c_int, io::Error) {
+    // SAFETY: until the leader is handed to the reaper its PID reserves the group ID.
+    let result = unsafe { libc::kill(-pid, signal) };
+    (result, io::Error::last_os_error())
 }
 
 pub fn exit_signal(status: &ExitStatus) -> Option<i32> {
