@@ -1459,9 +1459,11 @@ scope of Iris claims.
 
 ## 5. Not yet known
 
-- Whether naming the depth markers in the Codex registration (`proxenos integrate codex`) makes
-  Codex pass them to the Proxenos it starts. Codex 0.172.0 leaves them out of a stdio MCP server's
-  environment by default (section 4), so today a Proxenos nested under Codex does not see them.
+- An end-to-end check of the depth markers under Codex. Codex 0.172.0 passes a variable to a
+  local stdio MCP server when the server's registration lists it in `env_vars` and the variable
+  is set. The registration that `proxenos integrate codex` writes today lists none, so a Proxenos
+  nested under Codex does not see the markers (section 4). Listing them in that registration should
+  close the gap; this has not been verified end to end.
 - How Grok and Cursor treat a Claude Code plugin they load by themselves, and whether that offers
   them their own provider.
 - How the seven clients run several tool calls from one message, and how long each lets one call
