@@ -321,7 +321,6 @@ impl Registry {
             }
             if (finished.code != Some(0) || !result.report.completed)
                 && !finished.stderr.bytes.is_empty()
-                && result.report.diagnostic.is_none()
                 && !result
                     .report
                     .failure

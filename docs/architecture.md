@@ -134,10 +134,11 @@ zero-exit version-probe output are decided as single fields):
 - Otherwise, `redact_report` makes one all-or-nothing taint decision per `Report`. A `Report` is
   tainted if **any** of the following holds:
   - the linear-time heuristic detector matches anywhere in `reported.failure.message` (cue
-    required), anywhere in `reported.failure.reset_at` (`no-cue mode`), or within the kept 2 KiB
-    prefix of `reported.diagnostic` (cue required; failed version-probe diagnostics are checked on
-    the full captured stream before 2 KiB truncation and marked `diagnostic_scanned` so cut
-    clean identifiers are never rescanned at finalization); or
+    required), anywhere in a text-derived `reported.failure.reset_at` (`no-cue mode`), or anywhere
+    in the full captured `reported.diagnostic` source before 2 KiB truncation (cue required;
+    failed version-probe diagnostics are checked on the full captured stream by
+    `diagnostic_excerpt` before 2 KiB truncation and marked `diagnostic_scanned` so cut clean
+    identifiers are never rescanned at finalization); or
   - `from_truncated_capture` is `true` — set by delegation whenever `stdout` or `stderr` was cut at
     the 4 MiB capture limit (`total > captured`) and the turn failed (`finished.code != Some(0)`,
     `!report.completed`, or `report.failure.is_some()`) — or a failed version-probe stream was
@@ -150,7 +151,7 @@ zero-exit version-probe output are decided as single fields):
   - device-code shapes (`XXXX-XXXX` 4-4 uppercase alphanumeric groups and 6–9 character uppercase
     alphanumeric codes) when `code` or `enter` appears within one short paragraph (up to 160 bytes
     before or after, across line breaks and sentence punctuation, stopping at blank lines), or
-    without requiring a cue (`no-cue mode`) in `reported.failure.reset_at`;
+    without requiring a cue (`no-cue mode`) in text-derived `reported.failure.reset_at`;
   - well-known secret prefixes (`sk-`, `sk-ant-`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
     `github_pat_`, `xai-`, `AIza`) and `Bearer <token>` (including any opaque token of 16 or more
     characters regardless of case).
@@ -161,9 +162,11 @@ zero-exit version-probe output are decided as single fields):
   - `reported.diagnostic` (when present) becomes `"The provider CLI's diagnostic output was
     withheld because it may contain sign-in material; run the CLI directly to see it."`;
   - `reported.failure.reset_at` (and top-level `failure.reset_at`) is removed when it was derived
-    from provider free text (such as `"resets at ..."` or `"try again at ..."` suffixes) or when
-    `reset_at` itself matched the detector; a clean structured `reset_at` from a JSON field
-    (`error.resets_at`) is preserved so clients keep structured quota metadata;
+    from provider free text (such as `"resets at ..."` or `"try again at ..."` suffixes); Codex
+    keeps a structured `error.resets_at` only when it validates as a JSON number (epoch seconds)
+    or a string up to 40 bytes that is either all digits or a strict RFC 3339 datetime made only
+    of digits, `-`, `:`, `T`, `Z`, `.`, and `+` (invalid `error.resets_at` values are dropped
+    unconditionally at parse time so token-like strings never survive even in untainted reports);
   - `failure.kind`, `reported.thread_id`, `reported.model`, `reported.usage`,
     `reported.session_cost_usd`, and all `observed` metadata are kept;
   - `observed.redacted` becomes `true` (when any failure or diagnostic field was withheld);

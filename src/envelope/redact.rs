@@ -47,18 +47,19 @@ pub(super) fn redact_report(report: &mut Report) -> bool {
     let failure_matched = report
         .failure
         .as_ref()
-        .is_some_and(|failure| first_match_start(&failure.message, true).is_some());
+        .is_some_and(|failure| matches_detector(&failure.message, true));
     let reset_at_matched = report.failure.as_ref().is_some_and(|failure| {
-        failure
-            .reset_at
-            .as_deref()
-            .is_some_and(|reset| first_match_start(reset, false).is_some())
+        failure.reset_at_from_text
+            && failure
+                .reset_at
+                .as_deref()
+                .is_some_and(|reset| matches_detector(reset, false))
     });
     let diagnostic_matched = !report.diagnostic_scanned
-        && report.diagnostic.as_deref().is_some_and(|diag| {
-            let kept = diag.floor_char_boundary(DIAGNOSTIC_LIMIT);
-            first_match_start(diag, true).is_some_and(|start| start < kept)
-        });
+        && report
+            .diagnostic
+            .as_deref()
+            .is_some_and(|diag| matches_detector(diag, true));
     let tainted = report.from_truncated_capture
         || report.diagnostic_redacted
         || failure_matched
@@ -68,7 +69,7 @@ pub(super) fn redact_report(report: &mut Report) -> bool {
         let mut omitted = false;
         if let Some(failure) = &mut report.failure {
             failure.message = WITHHELD_FAILURE_MESSAGE.to_owned();
-            if failure.reset_at_from_text || reset_at_matched {
+            if failure.reset_at_from_text {
                 failure.reset_at = None;
             }
             omitted = true;
@@ -95,15 +96,15 @@ pub(super) fn redact_session_save_failure(failure: &mut Failure) -> bool {
 }
 
 fn redact_single_failure(failure: &mut Failure, replacement: &str) -> bool {
-    if first_match_start(&failure.message, true).is_none() {
+    if !matches_detector(&failure.message, true) {
         return false;
     }
     failure.message = replacement.to_owned();
     true
 }
 
-/// Inspects `input` before truncating to at most `max_bytes` on a UTF-8 char boundary.
-/// When `capture_truncated` is `true` or any heuristic match begins within the kept prefix,
+/// Inspects the full `input` before truncating to at most `max_bytes` on a UTF-8 char boundary.
+/// When `capture_truncated` is `true` or the heuristic detector matches anywhere in `input`,
 /// returns the fixed diagnostic withholding notice and `true`; otherwise returns the clean
 /// bounded excerpt and `false`.
 pub(crate) fn diagnostic_excerpt(
@@ -111,11 +112,13 @@ pub(crate) fn diagnostic_excerpt(
     max_bytes: usize,
     capture_truncated: bool,
 ) -> (String, bool) {
-    let kept = input.floor_char_boundary(max_bytes);
-    if capture_truncated || first_match_start(input, true).is_some_and(|start| start < kept) {
+    if capture_truncated || matches_detector(input, true) {
         (WITHHELD_DIAGNOSTIC.to_owned(), true)
     } else {
-        (input[..kept].to_owned(), false)
+        (
+            input[..input.floor_char_boundary(max_bytes)].to_owned(),
+            false,
+        )
     }
 }
 
@@ -127,14 +130,14 @@ pub(crate) fn probe_version_excerpt(
     capture_truncated: bool,
 ) -> Option<String> {
     let line = input.lines().map(str::trim).find(|line| !line.is_empty())?;
-    if capture_truncated || first_match_start(input, true).is_some() {
+    if capture_truncated || matches_detector(input, true) {
         Some(WITHHELD_PROBE_VERSION.to_owned())
     } else {
         Some(line[..line.floor_char_boundary(max_bytes)].to_owned())
     }
 }
 
-fn first_match_start(input: &str, require_code_cue: bool) -> Option<usize> {
+fn matches_detector(input: &str, require_code_cue: bool) -> bool {
     let bytes = input.as_bytes();
     let mut url_reject_until = 0;
     for (i, &b) in bytes.iter().enumerate() {
@@ -152,10 +155,10 @@ fn first_match_start(input: &str, require_code_cue: bool) -> Option<usize> {
             _ => None,
         };
         if matched.is_some() {
-            return Some(i);
+            return true;
         }
     }
-    None
+    false
 }
 
 fn is_token_start(bytes: &[u8], i: usize) -> bool {

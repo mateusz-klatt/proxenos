@@ -632,48 +632,62 @@ fn all_six_providers_withhold_on_hit_and_preserve_verbatim_on_no_hit() {
     })
     .to_string();
 
-    let codex_structured_quota_hit = json!({
-        "type": "turn.failed",
-        "error": {
-            "message": json!({
-                "error": {
-                    "type": "insufficient_quota",
-                    "resets_at": "2030-01-01T00:00:00Z",
-                    "message": "Quota exceeded; visit https://codex.example.invalid/login?code=CDX-1."
-                }
-            })
-            .to_string()
-        }
-    })
-    .to_string();
-    let codex_structured_reset_code_hit = json!({
-        "type": "turn.failed",
-        "error": {
-            "message": json!({
-                "error": {
-                    "type": "insufficient_quota",
-                    "resets_at": "ABCD-1234",
-                    "message": "Quota exceeded."
-                }
-            })
-            .to_string()
-        }
-    })
-    .to_string();
-    let codex_clean = json!({
-        "type": "turn.failed",
-        "error": {
-            "message": json!({
-                "error": {
-                    "type": "insufficient_quota",
-                    "resets_at": "2030-01-01T00:00:00Z",
-                    "message": "Monthly budget reached."
-                }
-            })
-            .to_string()
-        }
-    })
-    .to_string();
+    let codex_error_with_reset = |resets_at: Value, message: &str| {
+        json!({
+            "type": "turn.failed",
+            "error": {
+                "message": json!({
+                    "error": {
+                        "type": "insufficient_quota",
+                        "resets_at": resets_at,
+                        "message": message
+                    }
+                })
+                .to_string()
+            }
+        })
+        .to_string()
+    };
+    let codex_structured_quota_hit = codex_error_with_reset(
+        json!("2030-01-01T00:00:00Z"),
+        "Quota exceeded; visit https://codex.example.invalid/login?code=CDX-1.",
+    );
+    let codex_structured_frac_offset_hit = codex_error_with_reset(
+        json!("2030-01-01T00:00:00.123456+02:00"),
+        "Quota exceeded; Authorization: Bearer tok-frac-secret-1",
+    );
+    let codex_structured_digits_hit = codex_error_with_reset(
+        json!("123456"),
+        "Quota exceeded; Authorization: Bearer tok-digits-secret-2",
+    );
+    let codex_structured_number_hit = codex_error_with_reset(
+        json!(1_735_689_600),
+        "Quota exceeded; Authorization: Bearer tok-num-secret-3",
+    );
+    let codex_structured_tainted_token_reset = codex_error_with_reset(
+        json!("bare-bearer-token-999"),
+        "Quota exceeded; Authorization: Bearer bare-bearer-token-999",
+    );
+    let codex_structured_minus_offset_clean = codex_error_with_reset(
+        json!("2030-01-01T00:00:00-05:00"),
+        "Monthly budget reached.",
+    );
+    let codex_invalid_resets = [
+        ("ABCD-1234", "ABCD-1234"),
+        ("bare-token-reset", "bare-clean-token-888"),
+        (
+            "too-long-timestamp",
+            "2030-01-01T00:00:00.123456789012345678901Z",
+        ),
+        ("non-digit-month", "2030-aa-01T00:00:00Z"),
+        ("out-of-range-month", "2030-13-01T00:00:00Z"),
+        ("empty-fraction", "2030-01-01T00:00:00.Z"),
+        ("missing-timezone", "2030-01-01T00:00:00"),
+        ("bad-timezone", "2030-01-01T00:00:00X"),
+        ("fraction-without-tz", "2030-01-01T00:00:00.123"),
+    ];
+    let codex_clean =
+        codex_error_with_reset(json!("2030-01-01T00:00:00Z"), "Monthly budget reached.");
 
     fleet.script(
         "agy",
@@ -717,14 +731,23 @@ fn all_six_providers_withhold_on_hit_and_preserve_verbatim_on_no_hit() {
             }
         ]),
     );
-    fleet.script(
-        "codex",
-        json!([
-            {"stdout": codex_structured_quota_hit, "stderr": "Clean codex stderr\n", "code": 1},
-            {"stdout": codex_structured_reset_code_hit, "code": 1},
-            {"stdout": codex_clean, "stderr": "Clean codex diagnostic\n", "code": 1}
-        ]),
-    );
+    let mut codex_steps = vec![
+        json!({"stdout": codex_structured_quota_hit, "stderr": "Clean codex stderr\n", "code": 1}),
+        json!({"stdout": codex_structured_frac_offset_hit, "code": 1}),
+        json!({"stdout": codex_structured_digits_hit, "code": 1}),
+        json!({"stdout": codex_structured_number_hit, "code": 1}),
+        json!({"stdout": codex_structured_tainted_token_reset, "code": 1}),
+        json!({"stdout": codex_structured_minus_offset_clean, "code": 1}),
+    ];
+    for &(_, invalid_reset) in &codex_invalid_resets {
+        codex_steps.push(json!({
+            "stdout": codex_error_with_reset(json!(invalid_reset), "Quota exceeded."),
+            "code": 1
+        }));
+    }
+    codex_steps
+        .push(json!({"stdout": codex_clean, "stderr": "Clean codex diagnostic\n", "code": 1}));
+    fleet.script("codex", json!(codex_steps));
     fleet.script(
         "copilot",
         json!([
@@ -862,8 +885,8 @@ fn all_six_providers_withhold_on_hit_and_preserve_verbatim_on_no_hit() {
     );
     assert_eq!(claude_ok_res["observed"]["redacted"], false);
 
-    // 3. Codex: structured JSON resets_at stays on a tainted report when clean, is removed when it
-    // carries a code itself, and clean reports pass verbatim.
+    // 3. Codex: valid structured JSON resets_at stays on tainted and clean reports, invalid
+    // non-timestamp values are dropped unconditionally, and clean reports pass verbatim.
     let codex_hit_res = call(&mut server, "codex", json!({"prompt": "codex hit"}));
     assert_reported_failure(
         &codex_hit_res,
@@ -880,17 +903,82 @@ fn all_six_providers_withhold_on_hit_and_preserve_verbatim_on_no_hit() {
     assert_eq!(codex_hit_res["observed"]["redacted"], true);
     assert!(!codex_hit_res.to_string().contains("codex.example.invalid"));
 
-    let codex_reset_code = call(&mut server, "codex", json!({"prompt": "codex reset code"}));
+    for (label, expected_reset, forbidden) in [
+        (
+            "codex frac offset",
+            "2030-01-01T00:00:00.123456+02:00",
+            "tok-frac-secret-1",
+        ),
+        ("codex digit string", "123456", "tok-digits-secret-2"),
+        ("codex epoch number", "1735689600", "tok-num-secret-3"),
+    ] {
+        let res = call(&mut server, "codex", json!({"prompt": label}));
+        assert_reported_failure(
+            &res,
+            Some(("abnormal_exit", "exit code 1")),
+            "quota",
+            WITHHELD_FAILURE_MESSAGE,
+        );
+        assert_eq!(res["reported"]["failure"]["reset_at"], expected_reset);
+        assert_eq!(res["failure"]["reset_at"], expected_reset);
+        assert_eq!(res["observed"]["redacted"], true, "{label}: {res}");
+        assert!(!res.to_string().contains(forbidden), "{label}: {res}");
+    }
+
+    let codex_tainted_bad_reset = call(
+        &mut server,
+        "codex",
+        json!({"prompt": "codex tainted bad reset"}),
+    );
     assert_reported_failure(
-        &codex_reset_code,
+        &codex_tainted_bad_reset,
         Some(("abnormal_exit", "exit code 1")),
         "quota",
         WITHHELD_FAILURE_MESSAGE,
     );
-    assert!(codex_reset_code["reported"]["failure"]["reset_at"].is_null());
-    assert!(codex_reset_code["failure"]["reset_at"].is_null());
-    assert_eq!(codex_reset_code["observed"]["redacted"], true);
-    assert!(!codex_reset_code.to_string().contains("ABCD-1234"));
+    assert!(codex_tainted_bad_reset["reported"]["failure"]["reset_at"].is_null());
+    assert!(codex_tainted_bad_reset["failure"]["reset_at"].is_null());
+    assert_eq!(codex_tainted_bad_reset["observed"]["redacted"], true);
+    assert!(
+        !codex_tainted_bad_reset
+            .to_string()
+            .contains("bare-bearer-token-999"),
+        "{codex_tainted_bad_reset}"
+    );
+
+    let codex_minus_offset = call(
+        &mut server,
+        "codex",
+        json!({"prompt": "codex minus offset"}),
+    );
+    assert_reported_failure(
+        &codex_minus_offset,
+        Some(("abnormal_exit", "exit code 1")),
+        "quota",
+        "Monthly budget reached.",
+    );
+    assert_eq!(
+        codex_minus_offset["reported"]["failure"]["reset_at"],
+        "2030-01-01T00:00:00-05:00"
+    );
+    assert_eq!(codex_minus_offset["observed"]["redacted"], false);
+
+    for (label, invalid_reset) in codex_invalid_resets {
+        let res = call(&mut server, "codex", json!({"prompt": label}));
+        assert_reported_failure(
+            &res,
+            Some(("abnormal_exit", "exit code 1")),
+            "quota",
+            "Quota exceeded.",
+        );
+        assert!(
+            res["reported"]["failure"]["reset_at"].is_null(),
+            "{label}: {res}"
+        );
+        assert!(res["failure"]["reset_at"].is_null(), "{label}: {res}");
+        assert_eq!(res["observed"]["redacted"], false, "{label}: {res}");
+        assert!(!res.to_string().contains(invalid_reset), "{label}: {res}");
+    }
 
     let codex_ok_res = call(&mut server, "codex", json!({"prompt": "codex clean"}));
     assert_reported_failure(
@@ -1240,7 +1328,7 @@ fn adversarial_four_mib_diagnostics_complete_in_linear_time() {
     for (label, expect_redacted) in [
         ("rejected URL with 2M parens/brackets", false),
         ("auth URL with 2M parens/brackets", true),
-        ("4 MiB http:// and fragment runs", false),
+        ("4 MiB http:// and fragment runs", true),
     ] {
         let started = Instant::now();
         let result = call(&mut server, "antigravity", json!({"prompt": label}));
@@ -1252,12 +1340,23 @@ fn adversarial_four_mib_diagnostics_complete_in_linear_time() {
         );
         assert_eq!(result["observed"]["redacted"], expect_redacted, "{label}");
         if expect_redacted {
-            assert_eq!(
-                result["reported"]["failure"]["message"], WITHHELD_FAILURE_MESSAGE,
-                "{result}"
-            );
-            assert!(result["observed"]["failure_file"].is_null(), "{result}");
-            assert!(!result.to_string().contains("login?"), "{result}");
+            if result["reported"]["failure"].is_object() {
+                assert_eq!(
+                    result["reported"]["failure"]["message"], WITHHELD_FAILURE_MESSAGE,
+                    "{result}"
+                );
+                assert!(result["observed"]["failure_file"].is_null(), "{result}");
+                assert!(!result.to_string().contains("login?"), "{result}");
+            } else {
+                assert_eq!(
+                    result["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC,
+                    "{result}"
+                );
+                assert!(
+                    !result.to_string().contains("auth.example.invalid"),
+                    "{result}"
+                );
+            }
         }
     }
 
@@ -1265,12 +1364,13 @@ fn adversarial_four_mib_diagnostics_complete_in_linear_time() {
 }
 
 #[test]
-fn truncation_withholds_when_matched_before_2k_or_cut_at_capture_limit() {
+fn truncation_withholds_when_matched_anywhere_or_cut_at_capture_limit() {
     let fleet = Fleet::new(&["agy", "codex"]);
 
     let stderr_cut_ascii = format!("{} ABCD-1234\nEnter this code", "x".repeat(2037));
     let stderr_cut_multibyte = format!("{}é ABCD-1234\nEnter this code", "x".repeat(2035));
     let stderr_secret_past_limit = format!("{}ésk-past-2k-secret", "x".repeat(2047));
+    let stderr_clean_multibyte_past_limit = format!("{}éclean tail", "x".repeat(2047));
     // Capture-truncated (>4 MiB) stderr even with the cue cut past 4 MiB triggers conservative
     // withholding on failed turns and failed probes.
     let capture_cut_stderr = format!(
@@ -1285,6 +1385,7 @@ fn truncation_withholds_when_matched_before_2k_or_cut_at_capture_limit() {
             {"stderr": stderr_cut_ascii, "code": 2},
             {"stderr": stderr_cut_multibyte, "code": 2},
             {"stderr": stderr_secret_past_limit, "code": 2},
+            {"stderr": stderr_clean_multibyte_past_limit, "code": 2},
             {"stderr": capture_cut_stderr, "code": 2}
         ]),
     );
@@ -1301,6 +1402,7 @@ fn truncation_withholds_when_matched_before_2k_or_cut_at_capture_limit() {
     for (label, forbidden) in [
         ("ascii boundary", "ABCD-1234"),
         ("multibyte boundary", "ABCD-1234"),
+        ("secret past 2k", "sk-past-2k-secret"),
     ] {
         let result = call(&mut server, "antigravity", json!({"prompt": label}));
         assert_observed_failure(&result, "abnormal_exit", "exit code 2");
@@ -1315,11 +1417,18 @@ fn truncation_withholds_when_matched_before_2k_or_cut_at_capture_limit() {
         );
     }
 
-    let past = call(&mut server, "antigravity", json!({"prompt": "past 2k"}));
-    assert_eq!(past["observed"]["redacted"], false, "{past}");
-    let past_diag = past["reported"]["diagnostic"].as_str().unwrap();
-    assert_eq!(past_diag.len(), 2047);
-    assert!(!past.to_string().contains("sk-past-2k-secret"), "{past}");
+    let clean_past = call(
+        &mut server,
+        "antigravity",
+        json!({"prompt": "clean past 2k"}),
+    );
+    assert_eq!(clean_past["observed"]["redacted"], false, "{clean_past}");
+    let clean_past_diag = clean_past["reported"]["diagnostic"].as_str().unwrap();
+    assert_eq!(clean_past_diag.len(), 2047);
+    assert!(
+        !clean_past.to_string().contains("clean tail"),
+        "{clean_past}"
+    );
 
     let capture_cut = call(&mut server, "antigravity", json!({"prompt": "capture cut"}));
     assert_observed_failure(&capture_cut, "abnormal_exit", "exit code 2");
@@ -1338,6 +1447,24 @@ fn truncation_withholds_when_matched_before_2k_or_cut_at_capture_limit() {
         !probe_failed.to_string().contains("WXYZ-5678"),
         "{probe_failed}"
     );
+
+    // Match beyond 2 KiB in a failed version probe is also withheld by diagnostic_excerpt.
+    let probe_past_limit = format!("{}ésk-probe-past-2k", "p".repeat(2047));
+    fs::write(
+        fleet.root.join("codex.version"),
+        json!({"stderr": probe_past_limit, "code": 3}).to_string(),
+    )
+    .unwrap();
+    let mut probe_past_server = fleet.server("claude");
+    let probe_past = call(
+        &mut probe_past_server,
+        "codex",
+        json!({"prompt": "probe past 2k"}),
+    );
+    assert_observed_failure(&probe_past, "launch", "exit code 3");
+    assert_eq!(probe_past["observed"]["redacted"], true);
+    assert_eq!(probe_past["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC);
+    assert!(!probe_past.to_string().contains("sk-probe-past-2k"));
 
     // Capture-truncated probe stderr is also withheld on ProbeFailed.
     fs::write(
@@ -1360,6 +1487,70 @@ fn truncation_withholds_when_matched_before_2k_or_cut_at_capture_limit() {
     assert!(!probe_capture_cut.to_string().contains("ABCD-1234"));
 
     fleet.assert_steps_remaining("agy", 0);
+}
+
+#[test]
+fn kimi_withholds_code_in_error_line_past_2k_from_envelope_and_archive() {
+    let fleet = Fleet::new(&["kimi"]);
+    let preamble = "verbose initialization log line\n".repeat(80);
+    assert!(preamble.len() > 2048);
+
+    let short_promoted = format!(
+        "{preamble}To authenticate, enter this verification code:\nerror: failed to run prompt: insufficient_quota for KIMI-2048\n"
+    );
+    let oversized_promoted = format!(
+        "{preamble}To authenticate, enter this verification code:\nerror: failed to run prompt: insufficient_quota for KIMI-9001 {}\n",
+        "z".repeat(17 << 10)
+    );
+
+    fleet.script(
+        "kimi",
+        json!([
+            {"stderr": short_promoted, "code": 1},
+            {"stderr": oversized_promoted, "code": 1}
+        ]),
+    );
+    let mut server = fleet.server("claude");
+
+    for (label, code) in [("short", "KIMI-2048"), ("oversized", "KIMI-9001")] {
+        let res = call(&mut server, "kimi", json!({"prompt": label}));
+        assert_reported_failure(
+            &res,
+            Some(("abnormal_exit", "exit code 1")),
+            "quota",
+            WITHHELD_FAILURE_MESSAGE,
+        );
+        assert_eq!(res["observed"]["redacted"], true, "{label}: {res}");
+        assert_eq!(
+            res["reported"]["diagnostic"], WITHHELD_DIAGNOSTIC,
+            "{label}: {res}"
+        );
+        assert!(
+            res["observed"]["failure_file"].is_null(),
+            "{label} must not archive withheld failure text: {res}"
+        );
+        assert!(
+            !res.to_string().contains(code),
+            "{label} leaked {code}: {res}"
+        );
+    }
+
+    assert!(server.finish().0.success());
+    let has_answer_archives = fs::read_dir(&fleet.root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("proxenos-answers-"))
+        });
+    assert!(
+        !has_answer_archives,
+        "withheld Kimi failures must not create any answer archive under {}",
+        fleet.root.display()
+    );
+    fleet.assert_steps_remaining("kimi", 0);
 }
 
 #[test]
