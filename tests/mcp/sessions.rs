@@ -14,6 +14,9 @@ const CODEX_THREAD: &str = "eeb3a731-d53a-4444-8a6a-4d9d89e76073";
 const AGY_FINISHED: &str = include_str!("../fixtures/antigravity/finished.json");
 const AGY_ID: &str = "paper-crane";
 const SAVE_LOCK_ACQUIRED: &str = "proxenos test session save: acquired key lock";
+const SAVE_LOCK_RELEASING: &str = "proxenos test session save: releasing key lock";
+const REPLY_LOCK_WAITING: &str = "proxenos test session reply: waiting for key lock";
+const REPLY_LOCK_ACQUIRED: &str = "proxenos test session reply: acquired key lock";
 
 fn server_with_save_lock_markers(fleet: &Fleet) -> Server {
     let mut command = fleet.command("claude");
@@ -21,6 +24,10 @@ fn server_with_save_lock_markers(fleet: &Fleet) -> Server {
     let mut server = Server::start_command(command);
     server.initialize("2025-11-25");
     server
+}
+
+fn marker_positions(stderr: &str, marker: &str) -> Vec<usize> {
+    stderr.match_indices(marker).map(|(idx, _)| idx).collect()
 }
 
 fn sessions_root(base: &Path) -> PathBuf {
@@ -1011,7 +1018,10 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
         "codex-reply",
         json!({"thread_id": CODEX_THREAD, "prompt": "must see tombstone"}),
     );
-    assert_eq!(reply_a["observed"]["failure"]["kind"], "invalid_request");
+    assert_eq!(
+        reply_a["observed"]["failure"]["kind"], "invalid_request",
+        "{reply_a}"
+    );
     assert!(
         reply_a["observed"]["failure"]["message"]
             .as_str()
@@ -1061,12 +1071,7 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
         "codex-reply",
         json!({"thread_id": CODEX_THREAD, "prompt": "must wait for save"}),
     );
-    assert!(
-        server_b
-            .next_frame(Instant::now() + Duration::from_millis(150))
-            .is_none(),
-        "reply must wait while save is in flight"
-    );
+    server_b.wait_for_stderr(REPLY_LOCK_WAITING);
     assert_eq!(
         fleet_b
             .records()
@@ -1085,8 +1090,11 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
     assert_eq!(reply_frame["id"], 21);
     let start_body: Value = serde_json::from_str(crate::common::text(&start_frame)).unwrap();
     let reply_body: Value = serde_json::from_str(crate::common::text(&reply_frame)).unwrap();
-    assert_eq!(start_body["observed"]["state"], "finished");
-    assert_eq!(reply_body["observed"]["failure"]["kind"], "invalid_request");
+    assert_eq!(start_body["observed"]["state"], "finished", "{start_body}");
+    assert_eq!(
+        reply_body["observed"]["failure"]["kind"], "invalid_request",
+        "{reply_body}"
+    );
     assert!(
         reply_body["observed"]["failure"]["message"]
             .as_str()
@@ -1104,6 +1112,19 @@ fn concurrent_save_preserves_sticky_tombstone_and_serializes_replies() {
         "ambiguous reply must never dispatch"
     );
     assert!(server_b.finish().0.success());
+
+    let stderr = server_b.stderr();
+    let save_acquired = marker_positions(&stderr, SAVE_LOCK_ACQUIRED);
+    let save_releasing = marker_positions(&stderr, SAVE_LOCK_RELEASING);
+    let reply_waiting = marker_positions(&stderr, REPLY_LOCK_WAITING);
+    let reply_acquired = marker_positions(&stderr, REPLY_LOCK_ACQUIRED);
+    assert_eq!(save_acquired.len(), 2, "{stderr}");
+    assert_eq!(save_releasing.len(), 2, "{stderr}");
+    assert_eq!(reply_waiting.len(), 1, "{stderr}");
+    assert_eq!(reply_acquired.len(), 1, "{stderr}");
+    assert!(save_acquired[1] < reply_waiting[0], "{stderr}");
+    assert!(reply_waiting[0] < save_releasing[1], "{stderr}");
+    assert!(save_releasing[1] < reply_acquired[0], "{stderr}");
 }
 
 #[test]
@@ -1853,14 +1874,12 @@ fn pre_spawn_save_timeout_and_cancellation_fail_closed_on_conflict() {
         ]),
     );
     let mut seed_c = fleet_c.server("claude");
-    assert_eq!(
-        call(
-            &mut seed_c,
-            "codex",
-            json!({"prompt": "locate lock", "access": "full"})
-        )["observed"]["state"],
-        "finished"
+    let seeded_c = call(
+        &mut seed_c,
+        "codex",
+        json!({"prompt": "locate lock", "access": "full"}),
     );
+    assert_eq!(seeded_c["observed"]["state"], "finished", "{seeded_c}");
     assert!(seed_c.finish().0.success());
 
     let session_c = single_session_file(&sessions_root(&fleet_c.root).join("codex"));

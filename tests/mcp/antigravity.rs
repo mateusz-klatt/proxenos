@@ -748,6 +748,7 @@ fn only_authentication_replaces_stderr_with_fixed_sign_in_diagnostic() {
     let mut server = fleet.server("claude");
 
     let authentication = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
+    assert_sign_in_failure(&authentication);
     let other_failure = call(&mut server, "antigravity", json!({"prompt": "Reply OK"}));
     assert_reported_failure(
         &other_failure,
@@ -758,14 +759,6 @@ fn only_authentication_replaces_stderr_with_fixed_sign_in_diagnostic() {
     assert_eq!(
         other_failure["reported"]["diagnostic"], stderr,
         "{other_failure}"
-    );
-    assert_eq!(
-        authentication["reported"]["diagnostic"], SIGN_IN_DIAGNOSTIC,
-        "{authentication}"
-    );
-    assert_eq!(
-        authentication["reported"]["failure"]["kind"],
-        "authentication"
     );
     fleet.assert_steps_remaining("agy", 0);
 }

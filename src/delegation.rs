@@ -159,7 +159,7 @@ impl Registry {
             let key_lock = self.session_locks.for_key(p.name, id);
             let lookup = await_bounded(
                 async {
-                    let _key_guard = key_lock.lock().await;
+                    let _key_guard = acquire_reply_key_lock(&key_lock).await;
                     let prior_unverified =
                         match self.starts.lock().unwrap().get(p.name, id).cloned() {
                             Some(StartEntry::Known(remembered)) => {
@@ -410,12 +410,7 @@ impl Registry {
                         let save_activity = activity.clone();
                         tokio::task::spawn_blocking(move || {
                             #[cfg(feature = "test-tools")]
-                            if std::env::var_os("PROXENOS_TEST_SAVE_LOCK_MARKERS").is_some() {
-                                let _ = writeln!(
-                                    std::io::stderr().lock(),
-                                    "proxenos test session save: acquired key lock"
-                                );
-                            }
+                            emit_lock_marker("proxenos test session save: acquired key lock");
                             let desired = (!starts.lock().unwrap().conflicts_with(
                                 p.name,
                                 &saved_id,
@@ -443,6 +438,8 @@ impl Registry {
                                     Err(Failure::new(FailureKind::Unknown, error.to_string()))
                                 }
                             };
+                            #[cfg(feature = "test-tools")]
+                            emit_lock_marker("proxenos test session save: releasing key lock");
                             drop(key_guard);
                             drop(save_activity);
                             reconciled
@@ -499,6 +496,49 @@ async fn write_diagnostic(message: String) {
         let _ = writeln!(std::io::stderr().lock(), "proxenos: {message}");
     });
     let _ = tokio::time::timeout(Duration::from_millis(500), write).await;
+}
+
+#[cfg(feature = "test-tools")]
+fn save_lock_markers_enabled() -> bool {
+    std::env::var_os("PROXENOS_TEST_SAVE_LOCK_MARKERS").is_some()
+}
+
+#[cfg(feature = "test-tools")]
+fn write_lock_marker(marker: &str) {
+    let _ = writeln!(std::io::stderr().lock(), "{marker}");
+}
+
+#[cfg(feature = "test-tools")]
+fn emit_lock_marker(marker: &str) {
+    if save_lock_markers_enabled() {
+        write_lock_marker(marker);
+    }
+}
+
+#[cfg(feature = "test-tools")]
+async fn acquire_reply_key_lock(
+    key_lock: &tokio::sync::Mutex<()>,
+) -> tokio::sync::MutexGuard<'_, ()> {
+    if save_lock_markers_enabled() {
+        match key_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                write_lock_marker("proxenos test session reply: waiting for key lock");
+                let guard = key_lock.lock().await;
+                write_lock_marker("proxenos test session reply: acquired key lock");
+                guard
+            }
+        }
+    } else {
+        key_lock.lock().await
+    }
+}
+
+#[cfg(not(feature = "test-tools"))]
+async fn acquire_reply_key_lock(
+    key_lock: &tokio::sync::Mutex<()>,
+) -> tokio::sync::MutexGuard<'_, ()> {
+    key_lock.lock().await
 }
 
 fn ambiguous_thread_failure() -> Failure {
