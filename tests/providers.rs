@@ -903,3 +903,71 @@ fn explicitly_cancelling_an_mcp_request_releases_its_provider_files() {
     server.start_call(5, "test_echo", json!({}));
     assert_eq!(server.exact_next_frame()["id"], 5);
 }
+
+#[cfg(unix)]
+#[test]
+fn stop_and_reap_tolerate_immediate_exit_on_sigterm_through_delegation() {
+    let fleet = Fleet::new(&["agy"]);
+    let timeout_ready = fleet.root.join("timeout.ready");
+    let cancel_ready = fleet.root.join("cancel.ready");
+    fleet.script(
+        "agy",
+        json!([
+            provider_support::turn("clean"),
+            {"exit_on_term": timeout_ready},
+            {"exit_on_term": cancel_ready}
+        ]),
+    );
+    let mut server = fleet.server("claude");
+    server.request(1, "tools/list", json!({}));
+
+    let log_for = |index: usize| {
+        let record = fleet.records().into_iter().nth(index).unwrap();
+        let args = record["args"].as_array().unwrap();
+        let flag = args.iter().position(|arg| arg == "--log-file").unwrap();
+        std::path::PathBuf::from(args[flag + 1].as_str().unwrap())
+    };
+
+    // Normal exit skips stop() and reaches reap() via finish() on the exited leader.
+    let finished = call(&mut server, "antigravity", json!({"prompt": "normal"}));
+    assert_eq!(finished["observed"]["state"], "finished", "{finished}");
+    assert_eq!(finished["observed"]["attempts"][0]["exit_code"], 0);
+    assert!(!log_for(1).exists());
+
+    // Timeout stop() sends SIGTERM while the stub exits 0 immediately upon receiving it.
+    server.start_call(
+        2,
+        "antigravity",
+        json!({"prompt": "timeout", "timeout_ms": 2_000}),
+    );
+    let until = Instant::now() + common::WAIT;
+    while !timeout_ready.exists() {
+        assert!(Instant::now() < until, "timed stub did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let timeout_log = log_for(2);
+    let timed: Value = serde_json::from_str(common::text(&server.response(2))).unwrap();
+    assert_observed_failure(&timed, "timeout", "exceeded the call's deadline");
+    assert_eq!(timed["observed"]["attempts"][0]["exit_code"], 0, "{timed}");
+    assert!(!timeout_log.exists(), "timed-out call still owns its log");
+
+    // Cancellation stop() sends SIGTERM while the stub exits 0 immediately upon receiving it.
+    server.start_call(3, "antigravity", json!({"prompt": "cancel"}));
+    let until = Instant::now() + common::WAIT;
+    while !cancel_ready.exists() {
+        assert!(Instant::now() < until, "cancelled stub did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let cancel_log = log_for(3);
+    assert!(cancel_log.exists(), "live call should own its log");
+    server.close_input();
+    let cancelled: Value = serde_json::from_str(common::text(&server.response(3))).unwrap();
+    assert_observed_failure(&cancelled, "cancellation", "was cancelled");
+    assert_eq!(
+        cancelled["observed"]["attempts"][0]["exit_code"], 0,
+        "{cancelled}"
+    );
+    assert!(!cancel_log.exists(), "cancelled call still owns its log");
+    fleet.assert_steps_remaining("agy", 0);
+    assert!(server.wait_for_exit(common::EXIT_WAIT).0.success());
+}

@@ -24,6 +24,10 @@ use crate::supervise::{Accounting, Ending, StartError, finish_reap};
 
 const GRACE: Duration = Duration::from_secs(3);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(target_os = "macos")]
+// Bound the SIGCHLD wait when XNU returns EPERM during leader teardown: long enough for the
+// exiting leader to become observable to waitid, short enough to return real EPERM quickly.
+const MACOS_EPERM_GRACE: Duration = Duration::from_millis(100);
 const MAX_TRACKED_PIDS: usize = 4096;
 static SPAWNING: Mutex<()> = Mutex::new(());
 
@@ -225,17 +229,19 @@ pub fn spawn(
 }
 
 impl Child {
+    async fn wait_for_leader_exit(&mut self) -> io::Result<()> {
+        while !self.exited()? {
+            self.changes.recv().await;
+        }
+        Ok(())
+    }
+
     /// Observe exit without reaping so that the final group signal still targets our group,
     /// while periodically sampling the supervised process group for D18.
     pub async fn wait_for_exit(&mut self) -> io::Result<Ending> {
         let pid = self.pid;
         let accounting = Arc::clone(&self.accounting);
-        let mut exit = pin!(async {
-            while !self.exited()? {
-                self.changes.recv().await;
-            }
-            Ok::<Ending, io::Error>(Ending::Exited)
-        });
+        let mut exit = pin!(self.wait_for_leader_exit());
         let mut monitor = pin!(async move {
             loop {
                 if sample_once(pid, &accounting, true).await {
@@ -246,7 +252,7 @@ impl Child {
         });
         tokio::select! {
             biased;
-            result = &mut exit => result,
+            result = &mut exit => result.map(|()| Ending::Exited),
             ending = &mut monitor => Ok(ending),
         }
     }
@@ -270,23 +276,37 @@ impl Child {
         Ok(unsafe { info.assume_init_ref().si_pid() } != 0)
     }
 
-    fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+    fn kill_group(&self, signal: libc::c_int) -> (libc::c_int, io::Error) {
         // SAFETY: until the leader is handed to the reaper its PID reserves the group ID.
         let result = unsafe { libc::kill(-self.pid, signal) };
-        let error = io::Error::last_os_error();
-        // XNU returns EPERM when only the zombie remains. Keep the PID reserved while
-        // checking the leader. An unsignalable descendant beside that zombie looks the same.
+        (result, io::Error::last_os_error())
+    }
+
+    async fn signal(&mut self, signal: libc::c_int) -> io::Result<()> {
+        let (result, error) = self.kill_group(signal);
+        // XNU can return EPERM while the leader is still tearing down before waitid reports
+        // the zombie, as well as once only the zombie remains. Wait briefly for SIGCHLD/waitid
+        // while keeping the PID reserved; an unsignalable descendant beside that zombie looks
+        // the same.
         #[cfg(target_os = "macos")]
-        if result != 0 && error.raw_os_error() == Some(libc::EPERM) && self.exited()? {
-            return Ok(());
-        }
-        (result == 0 || error.raw_os_error() == Some(libc::ESRCH))
+        let eperm_exited = if result != 0 && error.raw_os_error() == Some(libc::EPERM) {
+            let _ = tokio::time::timeout(MACOS_EPERM_GRACE, self.wait_for_leader_exit())
+                .await
+                .ok()
+                .transpose()?;
+            self.exited()?
+        } else {
+            false
+        };
+        #[cfg(not(target_os = "macos"))]
+        let eperm_exited = false;
+        (result == 0 || error.raw_os_error() == Some(libc::ESRCH) || eperm_exited)
             .then_some(())
             .ok_or(error)
     }
 
-    pub async fn stop(&self) -> io::Result<()> {
-        self.signal(libc::SIGTERM)?;
+    pub async fn stop(&mut self) -> io::Result<()> {
+        self.signal(libc::SIGTERM).await?;
         // A descendant may need up to GRACE even after the leader exits, while a group whose
         // members have already exited should not pay the full 3 s wait. Because the zombie leader
         // keeps its PID reserved until the final signal and enumeration is not atomic, require two
@@ -312,7 +332,7 @@ impl Child {
             }
             tokio::time::sleep(remaining.min(SAMPLE_INTERVAL)).await;
         }
-        self.signal(libc::SIGKILL)
+        self.signal(libc::SIGKILL).await
     }
 
     fn release(&mut self) {
@@ -324,7 +344,7 @@ impl Child {
     }
 
     async fn reap(&mut self) -> io::Result<ExitStatus> {
-        self.signal(libc::SIGKILL)?;
+        self.signal(libc::SIGKILL).await?;
         self.release();
         finish_reap(&mut self.status, &mut self.cleaned).await
     }
@@ -344,7 +364,7 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         if self.leader.is_some() {
-            let _ = self.signal(libc::SIGKILL);
+            let _ = self.kill_group(libc::SIGKILL);
             self.release();
         }
     }

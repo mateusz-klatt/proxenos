@@ -467,9 +467,12 @@ requiring two consecutive confirmed-empty scans makes a miss unlikely but cannot
 descendant that forks and exits between them, in which case that descendant is killed early by
 SIGKILL instead of receiving the full grace (the same outcome as a descendant that outlives the
 grace; the grace is a courtesy, not a guarantee). If the OS denies a group signal,
-Proxenos reports the error. On macOS a group containing only its zombie leader also returns
-`EPERM`. Once `waitid` confirms the leader has exited, Proxenos accepts that result. A live
-descendant that Proxenos lacks permission to signal can go undetected in that case.
+Proxenos reports the error. On macOS, a group whose leader is exiting or contains only its zombie
+leader also returns `EPERM`. When `kill` returns `EPERM` on macOS, Proxenos waits up to 100 ms
+for the leader's exit notification and rechecks `waitid`: if `waitid` confirms the leader has
+exited, Proxenos accepts that result; if the leader does not exit within the bound, `EPERM` is
+reported as a cleanup failure. A live descendant that Proxenos lacks permission to signal beside
+an exited leader can still go undetected in that case.
 The reaper retains the child's files until the leader exits. If the reaper is still running
 when D4's shutdown deadline expires, the server exits with a failure. An abrupt exit can leave
 the temporary input and its reservation directory behind.
