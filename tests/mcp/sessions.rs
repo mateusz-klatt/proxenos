@@ -199,6 +199,33 @@ fn reply_after_server_restart_uses_persisted_file_and_stores_no_secrets() {
         bad_instructions["observed"]["failure"]["kind"],
         "invalid_request"
     );
+    assert!(
+        bad_instructions["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Omit instructions on a reply"),
+        "{bad_instructions}"
+    );
+    let repeated_instructions = call(
+        &mut server2,
+        "codex-reply",
+        json!({
+            "thread_id": CODEX_THREAD,
+            "prompt": "act",
+            "instructions": "SECRET_INSTRUCTIONS_MARKER"
+        }),
+    );
+    assert_eq!(
+        repeated_instructions["observed"]["failure"]["kind"],
+        "invalid_request"
+    );
+    assert!(
+        repeated_instructions["observed"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Omit instructions on a reply"),
+        "{repeated_instructions}"
+    );
     assert!(server2.finish().0.success());
 
     let execs: Vec<Value> = fleet

@@ -23,6 +23,7 @@ const BASE_NOT_CLAIMED: &[&str] = &[
     "The CLI loaded particular instruction files.",
     "A review established a verdict.",
     "A git snapshot identifies the author of a change or captures every edit.",
+    "Proxenos restricted the tools of MCP servers that the CLI loaded from the user's configuration.",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -310,7 +311,8 @@ impl Envelope {
 /// Builds the compact D2 `failure` summary placed in `error.data` when a foreground
 /// delegation panics before returning a tool result.
 pub fn panic_summary(message: &str) -> Value {
-    let failure = Failure::new(FailureKind::Unknown, message);
+    let mut failure = Failure::new(FailureKind::Unknown, panic_text(message.to_owned()));
+    redact::redact_observed_failure(&mut failure);
     let top_failure = TopLevelFailure::new(&failure, FailureSource::Observed);
     json!({
         "schema_version": 1,
@@ -318,9 +320,20 @@ pub fn panic_summary(message: &str) -> Value {
     })
 }
 
+/// The message a panic envelope or summary carries. Today every caller passes a fixed Proxenos
+/// sentence. Tests can substitute text with sign-in material to prove that it is withheld.
+fn panic_text(message: String) -> String {
+    #[cfg(feature = "test-tools")]
+    if let Some(text) = std::env::var_os("PROXENOS_TEST_PANIC_MESSAGE") {
+        return text.to_string_lossy().into_owned();
+    }
+    message
+}
+
 /// Builds a D2 failure envelope when a background delegation task unwinds on panic.
 pub fn panic_envelope(provider: &str, message: String) -> Value {
-    let failure = Failure::new(FailureKind::Unknown, message);
+    let mut failure = Failure::new(FailureKind::Unknown, panic_text(message));
+    let redacted = redact::redact_observed_failure(&mut failure);
     let top_failure = TopLevelFailure::new(&failure, FailureSource::Observed);
     json!({
         "schema_version": 1,
@@ -332,7 +345,7 @@ pub fn panic_envelope(provider: &str, message: String) -> Value {
             "passed": null,
             "access_mechanism": null,
             "accounting": null,
-            "redacted": false,
+            "redacted": redacted,
             "attempts": [],
         },
         "reported": Report::default(),

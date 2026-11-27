@@ -9,9 +9,14 @@ taken, and [votes.md](votes.md) records who proposed and who supported each one.
 Codex, Antigravity, Kimi, Claude Code, GitHub Copilot CLI and Grok Build run through the D6
 supervisor. They support D17 background delegations (`wait: false`, `await`,
 `cancel`, at most three concurrent delegations), D18 resource accounting and optional memory
-limits, and D19 persisted session settings. Behavioural tests install the crate’s stub in a
-private search path. Cursor Agent and the comparison with claude-delegator are the remaining
-work in this milestone. Releases and the rollout to the four hosts are later D13 milestones.
+limits, and D19 persisted session settings. The shared `usage` MCP tool (D9) is implemented for
+`codex` and `cursor` (no `proxenos usage` CLI subcommand or other providers yet). `proxenos
+integrate` (currently `claude-code` and `codex`) and `proxenos doctor` (D10) are implemented.
+`catalog` (D8, D13) and `expert` (D15: v0.1 ships no role texts) are not yet implemented.
+Behavioural tests install the crate’s stub in a private search path. Cursor Agent delegation and
+the full comparison with claude-delegator (beyond the `compare_init` initialization benchmark) are
+remaining work in this milestone; remaining client integrations, releases (workflows in D11) and
+the rollout to the four hosts are later D13 work.
 
 ## 1. Terms
 
@@ -32,8 +37,11 @@ provider, as each is ported, and stays the reason for most of the rules below.
 ### D1. One binary, and one MCP server for each client
 
 `proxenos mcp --client <client>` serves every provider's tools to that client from one process.
-The other roles of the binary are subcommands of the same file: `integrate`, `doctor`, `catalog`
-and `usage`.
+The binary currently implements `--version` (`version`), `mcp --client <client>`, `integrate`
+(currently `claude-code` and `codex`; the remaining five clients belong to D13), and
+`doctor [--json]`. Two planned D13 items sit outside CLI subcommands today: `usage` (D9) is
+implemented as a shared MCP tool for `codex` and `cursor` with no `proxenos usage` CLI subcommand
+yet, and `catalog` (D8, D13) is not yet implemented.
 
 - The server leaves out the client's own provider, so no client delegates to itself.
 - It lists a provider only when that provider's CLI is found. A CLI that is found but fails its
@@ -54,15 +62,15 @@ and turned into that call's error (see D4).
 ### D2. The tool surface uses Proxenos's own names
 
 Each provider has two tools, `<provider>` to start a delegation and `<provider>-reply` to continue
-one. Three tools are shared: `await` and `cancel` (D17), and `usage` (D9). Parameters are in
-snake_case:
+one. Three tools are shared: `await` and `cancel` (D17), and `usage` (D9, currently supporting
+`codex` and `cursor`). Parameters are in snake_case:
 
 | Parameter | Meaning |
 |---|---|
 | `prompt` | The task. |
-| `expert` | Optional: the name of a role. The server supplies the role's text. |
+| `expert` | Not yet implemented (D15): v0.1 ships no role texts and exposes no `expert` parameter. Planned for v0.2 as an optional role name whose text the server supplies. |
 | `mode` | `advisory` or `implementation`. It adds a sentence of instruction. It is advice to the provider, never a permission. |
-| `instructions` | Free text from the caller, added after the role. |
+| `instructions` | Free text from the caller, added after the `mode` sentence (and after the role text once roles ship in D15). |
 | `access` | `full` or `read-only`. What `read-only` enforces differs by provider and is stated in each tool's schema. |
 | `cwd`, `model`, `effort`, `timeout_ms`, `memory_limit_bytes` | As named. Which of `cwd`, `model` and `effort` a provider accepts differs. `memory_limit_bytes` is optional, with no limit by default (D18). |
 | `thread_id` | On a reply: the session to continue. The reply inherits the settings of its start (D19). |
@@ -163,9 +171,12 @@ zero-exit version-probe output are decided as single fields):
     withheld because it may contain sign-in material; run the CLI directly to see it."`;
   - `reported.failure.reset_at` (and top-level `failure.reset_at`) is removed when it was derived
     from provider free text (such as `"resets at ..."` or `"try again at ..."` suffixes); Codex
-    keeps a structured `error.resets_at` only when it validates as a JSON number (epoch seconds)
-    or a string up to 40 bytes that is either all digits or a strict RFC 3339 datetime made only
-    of digits, `-`, `:`, `T`, `Z`, `.`, and `+` (invalid `error.resets_at` values are dropped
+    keeps a structured `error.resets_at` only when it passes a shape check, which is not a calendar
+    validation: a JSON number or an all-digit string of 10 to 40 digits, read as an epoch (six to
+    nine digits have the shape of a numeric device code), or a string of at most 40 bytes shaped as
+    an RFC 3339 datetime `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, whose month is checked as 1–12,
+    day as 1–31, hour as 0–23, minute as 0–59 and second as 0–60. An impossible date such as
+    February 31 passes that check (invalid `error.resets_at` values are dropped
     unconditionally at parse time so token-like strings never survive even in untainted reports);
   - `failure.kind`, `reported.thread_id`, `reported.model`, `reported.usage`,
     `reported.session_cost_usd`, and all `observed` metadata are kept;
@@ -349,7 +360,15 @@ does not repeat the original task. On explicit resume, Codex CLI 0.172.0 reporte
 thread token counts. Proxenos returns the CLI's counters in `reported.usage`.
 See the [measured Codex start and resume](../tests/fixtures/codex/README.md#captured-start-and-resume).
 
-Antigravity's print command can direct an unknown ID to a
+For Antigravity, Proxenos invokes `agy --output-format json --disable-slash-commands
+--print-timeout <print_ms>ms --log-file <path>` (plus `--conversation <id>` on reply, optional
+`--model`, `--dangerously-skip-permissions` under `access: full`, and `--print <guidance>\n\n<prompt>`).
+The Antigravity print timer `print_ms` is `timeout_ms − 30 s` with a `5 s` floor
+(`timeout_ms.saturating_sub(30_000).max(5_000)`), recorded in `observed.attempts[].cli_timeout_ms`.
+Because `agy` starts that timer after sending the turn, subtracting 30 s leaves room for startup
+under the supervisor's deadline so `agy` can emit a resumable timeout result; when `timeout_ms`
+is below 35 s the 5 s floor shrinks that margin (and at or below 5 s the supervisor's deadline
+fires first), and startup slower than 30 s can still exhaust it. Antigravity's print command can direct an unknown ID to a
 different conversation. The server requires an exact regular `<id>.db` or `<id>.pb` entry,
 checks again after discovery and the initial git snapshot, and compares the ID the CLI reports
 before accepting or archiving any response content (returning no content on a mismatch).
@@ -381,13 +400,20 @@ without `--setting-sources user`, project `.claude/settings.json` and `.claude/s
 `--setting-sources user` under `read-only` excludes project and local settings sources (including
 project and local sandbox settings), does not create an OS sandbox, and does not prevent user or
 managed settings, hooks, or permission allow-lists from interacting with plan mode (and under
-`full`, project settings still load). Both non-claims are stated in `not_claimed` (with the
-plan-mode and project-sandbox non-claim added only under `read-only`) and in the tool schema.
-Self-delegation and recursive delegation are stopped by D1 (`--client claude` omits `claude` and
-`claude-reply`) and the D13 depth guard (`PROXENOS_DEPTH=1` and `CLAUDE_DELEGATOR_*_DEPTH=1` set on
-child processes and refused before discovery when present, with `CLAUDECODE` stripped from
-delegated children); a provider with full access can still invoke another CLI directly or clear
-environment variables. The JSON result object is mapped into `reported` (`thread_id`, `content`,
+`full`, project settings still load). Both non-claims are stated in `not_claimed`—that project settings in the working directory
+(hooks, env, MCP servers) were withheld (with `--print` Claude Code skips workspace trust), plus
+under `read-only` only that plan mode enforced an OS sandbox, applied project or local sandbox
+settings, or prevented user and managed settings or permission allow-lists from interacting with
+it—and in the tool schema.
+Self-delegation is stopped by D1 (a client never sees its own provider tools), and recursive
+delegation by the D13 depth guard, as far as the guard's variables reach the nested server: for every provider turn and discovery
+`--version` probe, Proxenos sets `PROXENOS_DEPTH=1` and all seven `CLAUDE_DELEGATOR_*_DEPTH=1`
+variables, strips `CLAUDECODE`, `IRIS_EXECUTION`, and `CODEX_DELEGATOR_CODEX_BIN`
+case-insensitively from those children, and refuses before discovery when any of the eight depth
+variables has a present, non-empty value other than `"0"` (unset, `""`, and `"0"` are treated as
+depth 0 and allowed; any other value, including `"yes"`, `"00"`, whitespace, or non-UTF-8 bytes,
+fails closed as `depth_limit`). A provider with full access can still invoke another CLI directly
+or clear environment variables. The JSON result object is mapped into `reported` (`thread_id`, `content`,
 single-entry `modelUsage` model, allowlisted `usage` token counters, and `session_cost_usd` from
 `total_cost_usd`, which is cumulative for the session rather than per-turn). `is_error: true`
 (emitted even alongside `subtype: "success"` on API and login errors), non-`"success"` subtypes
@@ -489,12 +515,15 @@ Measured for Kimi (`kimi 2.8.0` on Linux x86_64, 2026-11-26):
 GitHub Copilot CLI 1.0.116 was measured on Linux with its documented local-provider mode.
 A deterministic loopback endpoint answered one start and one explicit UUID resume. Copilot
 emitted a completed assistant turn, the answer's model and a terminal session result for both.
-Proxenos requires matching turn IDs, a canonical session UUID and success in both the terminal
-record and the process status. It passes a named model and reasoning effort again on reply.
-It requests full access with `--allow-all`; Copilot's deny rules and organization policy still
-apply. The adapter offers no read-only mode because we have not verified restrictions across
-all Copilot tools. The CLI also accepts names and prefixes in its resume option; checking the
-returned UUID can detect a different session only after the CLI runs. The capture method and its limits are recorded with the
+Proxenos runs Copilot with `--output-format json --stream off --no-custom-instructions --allow-all`
+(plus `--resume=<uuid>` on reply, optional `--model` and `--reasoning-effort`, and `-p`), requires
+matching turn IDs, a canonical session UUID and success in both the terminal record and the process
+status, and passes a named model and reasoning effort again on reply. `--no-custom-instructions`
+disables custom instruction files; `--allow-all` requests full access, though Copilot's deny rules
+and organization policy still apply. The adapter offers no read-only mode because we have not
+verified restrictions across all Copilot tools. The CLI also accepts names and prefixes in its
+resume option; checking the returned UUID can detect a different session only after the CLI runs.
+The capture method and its limits are recorded with the
 [Copilot fixtures](../tests/fixtures/copilot/README.md).
 
 Grok Build 1.0.92 completed a Linux headless start and an explicit UUID resume using its
@@ -502,10 +531,24 @@ documented custom-model configuration and an isolated local endpoint. Its single
 must report `stopReason: "end_turn"`, a positive turn count, a canonical session ID, nonblank
 answer text and a successful process exit. The ID on reply must match the requested ID.
 Grok also accepts titles on resume; the return check happens after the CLI runs.
-Proxenos exposes per-invocation token counters and a model only when one model-usage entry
-reports a positive call count. The adapter passes full access through `--always-approve`;
+Proxenos exposes per-invocation token counters whenever the result carries them, and a model
+only when exactly one model-usage entry reports a positive call count. With several models,
+`reported.usage` can be set while `reported.model` is `null`. The adapter passes full access through `--always-approve`;
 enforcement of read-only access across Grok tools is unverified. The
 [Grok fixtures](../tests/fixtures/grok/README.md) record the local measurement and its limits.
+
+Across the seven providers, `reported.model`, `reported.usage`, and `reported.session_cost_usd`
+(omitted on every provider except Claude when present) are populated as follows:
+
+| Provider | `reported.model` | `reported.usage` |
+|---|---|---|
+| `codex` | Never set (`null`). | On `turn.completed`: allowlisted non-negative integer (`u64`) fields from `usage` (`input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`), or `null` if none match. Cumulative across the thread on resume in Codex CLI 0.172.0. |
+| `antigravity` | Validated trimmed `model` string when the conversation ID matches (or is unrequested); otherwise `null`. | Never set (`null`). |
+| `claude` | Sole valid key in `modelUsage` when `session_id` matches (or is unrequested); `null` if zero, multiple, or invalid keys. Also populates `reported.session_cost_usd` from finite non-negative `total_cost_usd` (cumulative for the session). | When `session_id` matches or no session was requested (a start): allowlisted `u64` fields from `usage` (`input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`, plus `output_tokens_details.thinking_tokens` as `thinking_tokens`), or `null` if none match. |
+| `kimi` | Never set (`null`). (`kimi 2.8.0` emits none in `stream-json`.) | Never set (`null`). (`kimi 2.8.0` emits none in `stream-json`.) |
+| `copilot` | On a completed turn: validated `data.model` from the final main `assistant.message`; otherwise `null`. | On a completed turn: `{"premium_requests": <number>}` when terminal `result.usage.premiumRequests` is a non-negative number; otherwise `null` (no token counters). |
+| `grok` | On a completed turn: sole valid key in `modelUsage` with `modelCalls > 0`; otherwise `null` (also when several models contributed). | On a completed turn, independently of `reported.model`: allowlisted per-invocation `u64` fields from `usage` (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`, `reasoning_tokens`, `total_tokens`), or `null` if none match. |
+| `cursor` | Not yet implemented as a delegation provider (D13 milestone 2 remaining work). | Not yet implemented for delegation (`usage` MCP tool reads subscription tier only; D9). |
 
 ### D6. Children are supervised to the end
 
@@ -608,8 +651,10 @@ roster therefore needs no release. A user adds a role by adding a file.
 - What `refresh` generated and what the user wrote are kept apart, and `refresh` replaces only
   the first. An overlay carries a schema version and the time it was generated, so that an old
   one does not hide a newer catalogue in the binary without `doctor` saying so.
-- Proxenos chooses no model. On a start it passes the model that the call names, or else the one
-  that the user's own overlay sets for that provider, and otherwise none. A CLI that is given no
+- Proxenos chooses no model. On a start it passes the model that the call names, and otherwise
+  none. The catalogue overlay is not implemented yet (`catalog` is listed as unimplemented in the
+  status banner). Once it exists, a model that the user's own overlay sets for a provider will be
+  passed when the call names none. A CLI that is given no
   model runs its own default or refuses to start, and Proxenos chooses for it in neither case. A
   reply follows D19. The result shows what was passed and, where the provider reports it, which
   model ran (D2).
@@ -634,8 +679,9 @@ stdio for Codex, standard output JSON for Cursor), with no loopback HTTP request
 in Proxenos. The Moonshot API-key balance that claude-delegator read is not supported: Kimi is used
 through its subscription.
 
-The shared MCP tool currently accepts `providers: ["codex", "cursor"]` or either name alone.
-It can read the calling client's own subscription. Each provider has its own status and a
+The shared MCP tool currently accepts `providers: ["codex", "cursor"]` or either name alone (the
+other five providers are not yet supported in `usage`, and there is no `proxenos usage` CLI
+subcommand yet). It can read the calling client's own subscription. Each provider has its own status and a
 ten-second deadline including CLI lookup, followed by D6 process cleanup. Failure to read one
 account leaves the other result available. If the OS stalls while creating a process, the
 account read can return while the launch worker still waits for a handle. D6 cleans up a handle
@@ -1278,8 +1324,8 @@ The settings of a session are kept in a file in the user's state directory, with
 limited time (7 days in milestone 1 step 4). When a session is not found there or has expired,
 Proxenos asks for the settings and supplies no defaults of its own. It cannot check that the
 settings a caller then gives match the forgotten start. A reply may change the mode where the CLI
-accepts it. Codex keeps the start's developer instructions, including its mode, for the session.
-Proxenos refuses a change before dispatch.
+accepts it. Codex and Claude keep the start's developer instructions, including its mode, for the
+session. Proxenos refuses a change before dispatch.
 
 In milestone 1 step 4, the server pairs its bounded in-memory `StartStore` cache (at most 1024
 entries, evicting the oldest entry first) with durable session files on disk. Both record only
@@ -1336,9 +1382,13 @@ reapply start `instructions` text; within the same server process while cached i
 start instructions remain available in memory only.
 
 What this cannot do: Proxenos cannot verify explicit reply settings supplied for a forgotten or
-expired start. Parent-directory checks cover the directories Proxenos creates under the state base
-(`proxenos`, `sessions`, `<provider>`) and cannot prevent symlinks or permissive permissions on
-ancestor directories outside that base (such as `$HOME`, `$XDG_STATE_HOME`, or `%LOCALAPPDATA%`),
+expired start. Because the session file does not store `instructions` text, a reply to Codex or
+Claude (`fixed_instructions: true`) served from disk after a server restart or `StartStore` cache
+eviction is refused with `invalid_request` before dispatch if it supplies `instructions` again;
+the caller should omit `instructions` on such a reply, because the CLI keeps the start's
+instructions for the session (issue #36; ADR 003, deferred). Parent-directory checks cover the
+directories Proxenos creates under the state base (`proxenos`, `sessions`, `<provider>`) and cannot
+prevent symlinks or permissive permissions on ancestor directories outside that base (such as `$HOME`, `$XDG_STATE_HOME`, or `%LOCALAPPDATA%`),
 nor close a path-swap race on those parent directories by another process running as the same user
 without descriptor-relative traversal. The per-session lock file is an advisory lock and relies on
 cooperating Proxenos processes. When a load or save times out or is cancelled while blocked on an
@@ -1372,8 +1422,28 @@ scope of Iris claims.
   another CLI by itself.
 - Some CLIs load instruction files from the working directory with no way to turn that off.
   Delegating into a repository you do not trust exposes the provider to what is written there.
-- On a start, when neither the call nor the user's overlay names a model, Proxenos passes none
-  (D8); replies follow D19. The provider's CLI then runs its own default or refuses to start. Proxenos does not choose that
+- A delegated CLI keeps the MCP servers from the user's own configuration. This is intended: a
+  delegate can then open a browser or report progress through Iris. Proxenos leaves that
+  configuration in place and applies no blanket restriction to MCP tools. Whether a given MCP tool
+  is reachable depends on the provider's own policy: a `read-only` mode, where a provider has one,
+  is built for that CLI's built-in tools, so a browser, Iris or another delegator generally stays
+  reachable under `read-only` too. A deny rule can still block one. Claude's `read-only`, for
+  example, forwards project and local `permissions.deny` entries as `--disallowedTools`, which
+  can name an MCP tool. `not_claimed` carries this caveat in every result. `observed.access_mechanism` describes the CLI's own permission flags only. On
+  2026-11-27, Grok launched by Proxenos on Windows started every server from the user's Claude Code
+  configuration, including one that drives a signed-in browser and one that can start further
+  agents. Which configuration each of the six CLIs loads has not been measured yet (issue #46).
+- If the user's MCP configuration includes Proxenos or another delegator, a delegated agent can
+  delegate further. The depth guard (D5, D13) refuses a nested Proxenos call only when
+  one of its eight markers (`PROXENOS_DEPTH` or a `CLAUDE_DELEGATOR_*_DEPTH` variable, set to any
+  non-empty value other than `"0"`) reaches that nested server. A CLI does not necessarily pass its environment on
+  to the MCP servers it starts. Codex 0.172.0, for one, leaves these variables out of a stdio MCP
+  server's environment by default, and `proxenos integrate codex` registers only the command and
+  its arguments. A nested Proxenos started that way sees no marker and accepts the call. Nor can
+  the guard stop a nested call made through a different delegator that does not check these
+  variables.
+- On a start, when the call names no model, Proxenos passes none (D8; the catalogue overlay
+  is not implemented yet); replies follow D19. The provider's CLI then runs its own default or refuses to start. Proxenos does not choose that
   default, and it can change with a release of the CLI or with the user's configuration of it. A
   model that is named is a request: the result names the one that ran only where the provider
   reports it.
@@ -1389,8 +1459,11 @@ scope of Iris claims.
 
 ## 5. Not yet known
 
-- Whether Codex passes Proxenos's environment variables to the MCP servers it starts. If it
-  filters them, the depth guard needs them named in its registration.
+- An end-to-end check of the depth markers under Codex. Codex 0.172.0 passes a variable to a
+  local stdio MCP server when the server's registration lists it in `env_vars` and the variable
+  is set. The registration that `proxenos integrate codex` writes today lists none, so a Proxenos
+  nested under Codex does not see the markers (section 4). Listing them in that registration should
+  close the gap; this has not been verified end to end.
 - How Grok and Cursor treat a Claude Code plugin they load by themselves, and whether that offers
   them their own provider.
 - How the seven clients run several tool calls from one message, and how long each lets one call

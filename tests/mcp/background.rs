@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::common::{Server, WAIT, text};
-use crate::provider_support::{Fleet, call, turn};
+use crate::provider_support::{Fleet, WITHHELD_OBSERVED_FAILURE_MESSAGE, call, turn};
 
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + WAIT;
@@ -564,6 +564,45 @@ fn retained_background_results_evict_the_oldest_when_they_exceed_the_byte_limit(
 }
 
 #[test]
+fn a_background_panic_carrying_sign_in_material_is_withheld() {
+    // Synthetic panic text, substituted through the test-tools hook because every real panic
+    // message is a fixed Proxenos sentence.
+    let fleet = Fleet::new(&["agy"]);
+    let mut command = fleet.command("claude");
+    command.env(
+        "PROXENOS_TEST_PANIC_MESSAGE",
+        "Sign in at https://login.example.invalid/device?code=ABCD-1234 to continue.",
+    );
+    let mut server = Server::start_command(command);
+    server.initialize("2025-11-25");
+
+    let (started, is_error) = raw_call(&mut server, 1, "test_panic", json!({"background": true}));
+    assert!(!is_error, "{started}");
+    let handle = started["handle"].as_str().unwrap().to_owned();
+    let (awaited, is_error) = raw_call(
+        &mut server,
+        2,
+        "await",
+        json!({"handles": [handle], "condition": "all"}),
+    );
+    assert!(!is_error, "{awaited}");
+    let result = &awaited["results"][0]["result"];
+    assert_eq!(result["observed"]["redacted"], true, "{awaited}");
+    assert_eq!(
+        result["observed"]["failure"]["message"], WITHHELD_OBSERVED_FAILURE_MESSAGE,
+        "{awaited}"
+    );
+    assert_eq!(
+        result["failure"]["message"], WITHHELD_OBSERVED_FAILURE_MESSAGE,
+        "{awaited}"
+    );
+    assert!(
+        !awaited.to_string().contains("login.example.invalid"),
+        "{awaited}"
+    );
+}
+
+#[test]
 fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
     let fleet = Fleet::new(&["agy"]);
     let release = fleet.root.join("after-panic.go");
@@ -608,6 +647,8 @@ fn panicking_background_task_completes_handle_as_failed_and_frees_slot() {
     assert!(panic_result["reported"].is_object(), "{awaited}");
     assert!(panic_result["not_claimed"].is_array(), "{awaited}");
     assert!(panic_result["observed"]["attempts"].is_array(), "{awaited}");
+    // The panic text is Proxenos's own fixed sentence, so the detector finds nothing to withhold.
+    assert_eq!(panic_result["observed"]["redacted"], false, "{awaited}");
     assert_eq!(
         panic_result["observed"]["failure"]["kind"], "unknown",
         "{awaited}"

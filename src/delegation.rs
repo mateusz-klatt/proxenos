@@ -135,9 +135,10 @@ impl Registry {
         activity: Activity,
         started: Instant,
     ) -> Result<(Turn, Instant), Failure> {
-        if DEPTH.iter().any(|key| {
-            std::env::var(key).is_ok_and(|s| s.trim().parse::<u64>().is_ok_and(|n| n > 0))
-        }) {
+        if DEPTH
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty() && v != "0"))
+        {
             return Err(Failure::new(
                 FailureKind::DepthLimit,
                 "A delegated CLI cannot start another Proxenos delegation.",
