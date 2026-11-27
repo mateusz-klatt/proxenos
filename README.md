@@ -17,7 +17,7 @@ looks after other agents.
 - a result envelope with one top-level `failure`;
 - withholding of sign-in material from failure text;
 - `integrate` and `doctor` for Claude Code and Codex CLI;
-- `usage` for Codex and Cursor subscription limits.
+- `usage` for Codex subscription windows and the Cursor plan tier (Cursor reports no windows).
 
 **Not in v0.1 yet:**
 - Cursor Agent as a provider;
